@@ -9,7 +9,8 @@ if [ ! -d ".venv" ]; then
     .venv/bin/python -m pip install -r requirements.txt
 fi
 
-HOST="${HOST:-127.0.0.1}"
+HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8090}"
+
 
 exec .venv/bin/uvicorn app.main:app --host "$HOST" --port "$PORT"

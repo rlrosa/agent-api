@@ -6,8 +6,11 @@ from pydantic import BaseModel, Field
 
 class Settings(BaseModel):
     api_key: str = Field(..., description="Shared secret for API key authentication")
-    host: str = Field(default="127.0.0.1")
+    host: str = Field(default="0.0.0.0")
     port: int = Field(default=8090)
+    trusted_networks: List[str] = Field(
+        default_factory=lambda: ["192.168.87.0/24", "100.64.0.0/10"]
+    )
     max_concurrency: int = Field(default=3)
     job_timeout: int = Field(default=120)
     wait_default: int = Field(default=60)
@@ -51,10 +54,14 @@ def get_settings() -> Settings:
     if not api_key:
         raise ValueError("API_KEY environment variable is required and cannot be empty")
 
+    trusted_nets_raw = os.environ.get("TRUSTED_NETWORKS", "192.168.87.0/24,100.64.0.0/10")
+    trusted_networks = [net.strip() for net in trusted_nets_raw.split(",") if net.strip()]
+
     return Settings(
         api_key=api_key,
-        host=os.environ.get("HOST", "127.0.0.1"),
+        host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", "8090")),
+        trusted_networks=trusted_networks,
         max_concurrency=int(os.environ.get("MAX_CONCURRENCY", "3")),
         job_timeout=int(os.environ.get("JOB_TIMEOUT", "120")),
         wait_default=int(os.environ.get("WAIT_DEFAULT", "60")),
@@ -78,6 +85,7 @@ def get_settings() -> Settings:
         allow_mock_agent=os.environ.get("ALLOW_MOCK_AGENT", "0").lower() in ("1", "true", "yes"),
         bwrap_enabled=os.environ.get("BWRAP_ENABLED", "1").lower() in ("1", "true", "yes"),
     )
+
 
 
 

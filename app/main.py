@@ -61,14 +61,56 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="agent-api", version="0.1.0", lifespan=lifespan)
 
 
-def verify_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+import ipaddress
+import logging
+
+logger = logging.getLogger("agent_api.auth")
+
+
+def is_trusted_peer(client_ip: str, trusted_networks: List[str]) -> bool:
+    try:
+        ip = ipaddress.ip_address(client_ip)
+        for net_str in trusted_networks:
+            try:
+                net = ipaddress.ip_network(net_str, strict=False)
+                if ip in net:
+                    return True
+            except ValueError:
+                pass
+    except ValueError:
+        pass
+    return False
+
+
+def verify_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
     settings = get_settings()
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Cloudflare / Tunnel Header Trap: If any Cloudflare header is present, ALWAYS require API key!
+    has_cf_header = any(
+        k.lower() in ("cf-connecting-ip", "cf-ray", "cf-visitor")
+        for k in request.headers.keys()
+    )
+
+    trusted = (not has_cf_header) and is_trusted_peer(client_ip, settings.trusted_networks)
+
+    if trusted:
+        logger.info(f"Auth BYPASS (trusted peer IP: {client_ip}) for {request.url.path}")
+        return "bypass"
+
     if not x_api_key or not secrets.compare_digest(x_api_key, settings.api_key):
+        logger.warning(f"Auth DENIED (peer IP: {client_ip}, CF header: {has_cf_header}) for {request.url.path}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized: Missing or invalid X-API-Key header",
         )
+
+    logger.info(f"Auth OK (API Key provided by {client_ip}) for {request.url.path}")
     return x_api_key
+
 
 
 @app.get("/healthz", response_model=HealthResponse)

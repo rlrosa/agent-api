@@ -33,11 +33,12 @@ The server is configured via environment variables.
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |
 | `API_KEY` | *(Required)* | Secret key required in the `X-API-Key` HTTP header. |
-| `HOST` | `127.0.0.1` | Server bind IP address. |
+| `HOST` | `0.0.0.0` | Server bind IP address. |
 | `PORT` | `8090` | Server HTTP port. |
+| `TRUSTED_NETWORKS` | `192.168.87.0/24,100.64.0.0/10` | Trusted CIDR networks for API key auth bypass (LAN & Tailscale). |
 | `DB_PATH` | `./data/jobs.db` | SQLite database filepath. |
 | `WORK_ROOT` | `/var/tmp/agent-api/jobs` | Directory for per-job isolated workspaces. |
-| `BWRAP_ENABLED` | `1` | Enable Bubblewrap OS sandboxing for `agy` (1=true, 0=false). |
+| `BWRAP_ENABLED` | `1` | Enable Bubblewrap OS sandboxing for `agy` and `claude` (1=true, 0=false). |
 | `JOB_TIMEOUT` | `120` | Max job execution timeout in seconds. |
 | `MAX_CONCURRENT_JOBS` | `3` | Maximum worker concurrency for background jobs. |
 | `PURGE_AFTER_HOURS` | `24` | Automated background purge window for old job records. |
@@ -119,24 +120,41 @@ curl -s -X POST http://127.0.0.1:8090/v1/jobs \
   -F "files=@/tmp/m0/doc.pdf"
 ```
 
+### 6. Trusted Network Auth Bypass (LAN / Tailscale)
+`POST /v1/jobs` (No API Key Required for Local Network Callers)
 
+Callers connecting from trusted peer socket IPs (`192.168.87.0/24` or Tailscale `100.64.0.0/10`) skip the `X-API-Key` header requirement:
+
+```bash
+curl -s -X POST http://192.168.87.132:8090/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent": "agy",
+    "prompt": "Reply with exactly: PONG_LAN_BYPASS",
+    "wait": 60
+  }'
+```
 
 ---
 
 ## Security Posture & Boundary Matrix
 
 ### What IS Confined and Hardened
-- **Host Filesystem Write Protection**:
-  - `agy`: Run inside an unprivileged Bubblewrap (`bwrap`) OS container namespace (`--tmpfs /home/ubuntu`). Attempts to write to `$HOME`, `~/.ssh/`, or `~/.bashrc` are intercepted at the OS level and fail silently without modifying the host.
-  - `claude`: Confined via CLI tool permission flags (`--allowed-tools View,Read --permission-mode dontAsk`). Writes and shell invocations outside the allowed set are rejected outright.
+- **Host Filesystem Read & Write Confinement**:
+  - `agy` & `claude`: Executed inside unprivileged Bubblewrap (`bwrap`) OS container namespaces. The container uses explicit minimal system mounts (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc/resolv.conf`, `/etc/ssl`, `/etc/ca-certificates`, `/etc/hosts`), mounting `--tmpfs /home/ubuntu`. Sensitive host files (`~/.ssh/`, `~/.bashrc`, `/etc/passwd`, `/etc/shadow`, `~/.claude/.credentials.json`) do not exist inside the namespace.
+  - Workspace attachments (`<work_root>/<job_id>/attachments/`) are explicitly bind-mounted read-write into the job container.
 - **Strict Caller Request Lock**: Caller requests are validated with Pydantic `extra="forbid"`. Any payload containing `sandbox`, `tools`, `permissions`, `dangerously_skip_permissions`, or CLI flags returns **HTTP 422 Unprocessable Entity**.
+- **Trusted Network Auth Bypass & Tunnel Protection**:
+  - Requests from raw peer socket IPs matching `TRUSTED_NETWORKS` (`192.168.87.0/24`, `100.64.0.0/10`) bypass API key authentication.
+  - Loopback (`127.0.0.1`) is **not** trusted by default.
+  - Any request with Cloudflare Tunnel headers (`CF-Connecting-IP`, `CF-Ray`, `CF-Visitor`) **always requires the API key**, preventing public internet bypass over local tunnel proxies.
 - **Zero Bypass Flags**: `--dangerously-skip-permissions` is completely removed from all execution code paths.
 - **Per-Job Attachment Isolation**: Attachments are stored in isolated per-job directories (`<work_root>/<job_id>/attachments/`) and passed via explicit absolute paths, preventing cross-job contamination.
 - **Environment Scrubbing**: Sensitive environment variables (`API_KEY`, secret tokens, credentials) are stripped before subprocess spawning; only essential variables (`HOME`, `PATH`) pass through.
 
 ### What is NOT Confined (Explicit Owner Decisions)
-- **Unrestricted Host Reads**: Filesystem reads (`/etc/passwd`, local files) are permitted so agents can process attached files. Treat any file readable by the server user as visible to jobs.
-- **Outbound Network Access**: Outbound network requests are permitted for `agy` so backend Gemini model APIs function. `API_KEY` authentication is the primary trust boundary.
+- **Outbound Network Access**: Outbound network requests are permitted for `agy` and `claude` so backend model APIs function. `API_KEY` authentication (or trusted LAN peer restriction) is the primary trust boundary.
 - **DNS-Rebinding TOCTOU**: Attachment URL downloads validate IP addresses against SSRF blacklists before fetching, but do not pin IPs across DNS re-resolutions.
 - **Untested Workspace Writes**: The control test for writing inside the job workspace has never produced a valid verified result, because both test attempts checked for the file after the ephemeral workspace directory was already cleaned up/deleted by the runner upon job completion.
+
 

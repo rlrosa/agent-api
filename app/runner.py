@@ -56,25 +56,34 @@ def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List
     if not settings.bwrap_enabled:
         return cmd
 
-    # Claude is confined by its CLI permission flags (--allowed-tools View,Read --permission-mode dontAsk).
-    # bwrap causes EROFS on ~/.claude/session-env for claude, so we wrap only agy (or agents needing OS isolation).
-    if agent == "claude":
-        return cmd
-
     bwrap_path = shutil.which("bwrap")
     if not bwrap_path:
         return cmd
 
     bwrap_cmd = [
         bwrap_path,
-        "--ro-bind", "/", "/",
+        "--dir", "/etc",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/bin", "/bin",
+        "--ro-bind", "/sbin", "/sbin",
+        "--ro-bind", "/lib", "/lib",
+    ]
+    if os.path.exists("/lib64"):
+        bwrap_cmd.extend(["--ro-bind", "/lib64", "/lib64"])
+
+    for etc_item in ["resolv.conf", "ssl", "ca-certificates", "hosts", "nsswitch.conf", "gai.conf"]:
+        path = os.path.join("/etc", etc_item)
+        if os.path.exists(path):
+            bwrap_cmd.extend(["--ro-bind", path, path])
+
+    bwrap_cmd.extend([
         "--dev", "/dev",
         "--proc", "/proc",
         "--share-net",
         "--tmpfs", "/tmp",
         "--tmpfs", "/home/ubuntu",
         "--ro-bind", "/home/ubuntu/.local", "/home/ubuntu/.local",
-    ]
+    ])
 
     if agent == "agy":
         if os.path.exists("/home/ubuntu/.gemini"):
@@ -85,6 +94,18 @@ def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List
                 "--tmpfs", "/home/ubuntu/.gemini/antigravity-cli/cache",
                 "--tmpfs", "/home/ubuntu/.gemini/antigravity-cli/log",
             ])
+    elif agent == "claude":
+        if os.path.exists("/home/ubuntu/.claude"):
+            bwrap_cmd.extend([
+                "--ro-bind", "/home/ubuntu/.claude", "/home/ubuntu/.claude",
+                "--tmpfs", "/home/ubuntu/.claude/session-env",
+            ])
+        if os.path.exists("/home/ubuntu/.claude.json"):
+            bwrap_cmd.extend([
+                "--ro-bind", "/home/ubuntu/.claude.json", "/home/ubuntu/.claude.json",
+            ])
+
+
 
     bwrap_cmd.extend([
         "--bind", workspace_path, workspace_path,
