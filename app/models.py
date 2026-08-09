@@ -14,6 +14,8 @@ class HealthResponse(BaseModel):
     running_count: int
     effective_concurrency: int
     agents: Dict[str, AgentAvailability]
+    confinement: Optional[Dict[str, Any]] = None
+
 
 
 class AttachmentSpec(BaseModel):

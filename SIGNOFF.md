@@ -52,11 +52,13 @@ HTTP Status Code: 401
 ---
 
 ## Step 4: Submit Inline Text Job with Completion Wait
-Submit a simple text prompt to `agy` with `wait=60` and verify inline completion response:
+Set your `AGENT_API_KEY` environment variable in your shell session, then submit a prompt to `agy` with `wait=60`:
 
 ```bash
+export AGENT_API_KEY="test-secret-key"
+
 curl -s -X POST http://127.0.0.1:8090/v1/jobs \
-  -H "X-API-Key: test-secret-key" \
+  -H "X-API-Key: $AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "agent": "agy",
@@ -77,7 +79,7 @@ Submit a job to `claude` with an ArXiv PDF URL attachment and verify text extrac
 
 ```bash
 curl -s -X POST http://127.0.0.1:8090/v1/jobs \
-  -H "X-API-Key: test-secret-key" \
+  -H "X-API-Key: $AGENT_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "agent": "claude",
@@ -132,7 +134,7 @@ with open('/tmp/signoff_sample.pdf', 'wb') as f:
 "
 
 curl -s -X POST http://127.0.0.1:8090/v1/jobs \
-  -H "X-API-Key: test-secret-key" \
+  -H "X-API-Key: $AGENT_API_KEY" \
   -F "agent=claude" \
   -F "prompt=Read the attached signoff_sample.pdf file and state its verification code." \
   -F "wait=60" \

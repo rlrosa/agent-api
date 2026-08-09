@@ -12,6 +12,24 @@ class AgentSpec(BaseModel):
     default_model: Optional[str] = None
 
 
+VALID_AGY_MODELS = {
+    "gemini-3.6-flash",
+    "gemini-3.6-flash-low",
+    "gemini-3.6-flash-medium",
+    "gemini-3.6-flash-high",
+}
+
+
+def validate_agent_model(agent: str, model: Optional[str]) -> None:
+    if not model:
+        return
+    if agent == "agy":
+        if model not in VALID_AGY_MODELS:
+            raise ValueError(
+                f"Invalid model '{model}' for agent 'agy'. Allowed model is 'gemini-3.6-flash' (effort: low, medium, high)."
+            )
+
+
 def build_agy_argv(
     prompt: str,
     model: Optional[str] = None,
@@ -21,14 +39,20 @@ def build_agy_argv(
     spec = AGENTS["agy"]["spec"]
     cmd = ["agy", "-p", prompt]
 
+    eff = (effort or "low").lower()
+    if eff not in ("low", "medium", "high"):
+        eff = "low"
 
     settings = get_settings()
-    selected_model = model or settings.agy_default_model or spec.default_model
+    raw_model = model or settings.agy_default_model or spec.default_model
 
-    if selected_model:
-        if not spec.supports_model_flag:
-            raise ValueError("Agent 'agy' does not support model overrides")
-        cmd.extend(["--model", selected_model])
+    if raw_model:
+        validate_agent_model("agy", raw_model)
+        selected_model = f"gemini-3.6-flash-{eff}"
+    else:
+        selected_model = f"gemini-3.6-flash-{eff}"
+
+    cmd.extend(["--model", selected_model])
 
     if effort:
         cmd.extend(["--effort", effort])
@@ -38,12 +62,12 @@ def build_agy_argv(
             if flag:
                 cmd.append(flag)
 
-
     if workspace_path:
         cmd.extend(["--add-dir", workspace_path])
 
-    cmd.extend(["--output-format", "text"])
+    cmd.extend(["--output-format", "json"])
     return cmd
+
 
 
 def build_claude_argv(
@@ -70,7 +94,7 @@ def build_claude_argv(
         cmd.extend(["--allowed-tools", "View,Read"])
         cmd.extend(["--permission-mode", "dontAsk"])
 
-    cmd.extend(["--output-format", "text"])
+    cmd.extend(["--output-format", "json"])
     return cmd
 
 

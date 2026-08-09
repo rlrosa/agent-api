@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>agent-api — Observability Dashboard</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --border-color: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-blue: #38bdf8;
+            --accent-green: #4ade80;
+            --accent-red: #f87171;
+            --accent-purple: #c084fc;
+            --font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: var(--font-family);
+            padding: 24px;
+            line-height: 1.5;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h1 { font-size: 1.5rem; font-weight: 700; color: var(--accent-blue); }
+        .header-actions { display: flex; gap: 12px; align-items: center; }
+        button, select {
+            background-color: var(--card-bg);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            cursor: pointer;
+            outline: none;
+        }
+        button:hover, select:hover { border-color: var(--accent-blue); }
+
+        .grid-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .tile {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .tile-title { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600; margin-bottom: 6px; }
+        .tile-value { font-size: 1.5rem; font-weight: 700; color: var(--text-main); }
+        .tile-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
+
+        .section-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; color: var(--text-main); }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+        @media (max-width: 1024px) { .dashboard-grid { grid-template-columns: 1fr; } }
+
+        .card {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+        }
+
+        /* SVG Timeseries Chart */
+        .chart-container { width: 100%; height: 220px; display: flex; align-items: flex-end; gap: 8px; padding-top: 20px; border-bottom: 1px solid var(--border-color); }
+        .bar-wrapper { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; justify-content: flex-end; }
+        .bar { width: 80%; background-color: var(--accent-blue); border-radius: 4px 4px 0 0; transition: height 0.3s; position: relative; }
+        .bar-err { background-color: var(--accent-red); width: 80%; border-radius: 4px 4px 0 0; }
+        .bar-label { font-size: 0.7rem; color: var(--text-muted); margin-top: 6px; transform: rotate(-30deg); transform-origin: left top; white-space: nowrap; }
+
+        /* 7x24 Heatmap */
+        .heatmap-grid {
+            display: grid;
+            grid-template-columns: 40px repeat(24, 1fr);
+            gap: 4px;
+            margin-top: 12px;
+            overflow-x: auto;
+        }
+        .hm-cell { height: 24px; border-radius: 3px; background-color: #0f172a; font-size: 0.65rem; display: flex; align-items: center; justify-content: center; color: transparent; }
+        .hm-cell:hover { color: #fff; border: 1px solid #fff; }
+        .hm-header { font-size: 0.65rem; color: var(--text-muted); text-align: center; }
+        .hm-row-label { font-size: 0.7rem; color: var(--text-muted); display: flex; align-items: center; }
+
+        /* Tables */
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.875rem; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid var(--border-color); }
+        th { color: var(--text-muted); font-weight: 600; }
+
+        /* Log Viewer */
+        .log-box {
+            background-color: #090d16;
+            font-family: monospace;
+            font-size: 0.8rem;
+            padding: 12px;
+            border-radius: 6px;
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid var(--border-color);
+        }
+        .log-line { margin-bottom: 4px; white-space: pre-wrap; word-break: break-all; }
+        .log-info { color: var(--text-main); }
+        .log-warn { color: #fde047; }
+        .log-error { color: var(--accent-red); }
+        .log-debug { color: var(--text-muted); }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div>
+            <h1>agent-api Observability</h1>
+            <div style="font-size: 0.8rem; color: var(--text-muted);">Real-time System Load & Error Metrics</div>
+        </div>
+        <div class="header-actions">
+            <select id="bucketSelect" onchange="loadTimeseries()">
+                <option value="hour">Hourly</option>
+                <option value="day" selected>Daily</option>
+                <option value="week">Weekly</option>
+                <option value="month">Monthly</option>
+            </select>
+            <button onclick="refreshAll()">Refresh Now</button>
+        </div>
+    </header>
+
+    <!-- Summary Tiles -->
+    <div class="grid-summary">
+        <div class="tile">
+            <div class="tile-title">Total Queries</div>
+            <div class="tile-value" id="valTotalQueries">-</div>
+            <div class="tile-sub" id="subTotalQueries">-</div>
+        </div>
+        <div class="tile">
+            <div class="tile-title">Error Rate</div>
+            <div class="tile-value" id="valErrorRate">-</div>
+            <div class="tile-sub" id="subErrorRate">-</div>
+        </div>
+        <div class="tile">
+            <div class="tile-title">Latency (p50 / p95)</div>
+            <div class="tile-value" id="valLatency">-</div>
+            <div class="tile-sub" id="subLatency">-</div>
+        </div>
+        <div class="tile">
+            <div class="tile-title">Total Tokens</div>
+            <div class="tile-value" id="valTokens">-</div>
+            <div class="tile-sub" id="subTokens">-</div>
+        </div>
+        <div class="tile">
+            <div class="tile-title">Total Cost</div>
+            <div class="tile-value" id="valCost">-</div>
+            <div class="tile-sub">Claude API Usage</div>
+        </div>
+        <div class="tile">
+            <div class="tile-title">Database Size</div>
+            <div class="tile-value" id="valDbSize">-</div>
+            <div class="tile-sub" id="subDbSize">jobs.db on disk</div>
+        </div>
+    </div>
+
+    <div class="dashboard-grid">
+        <!-- Main Timeseries -->
+        <div class="card">
+            <div class="section-title">Query Volume Over Time</div>
+            <div class="chart-container" id="chartContainer"></div>
+        </div>
+
+        <!-- Error Taxonomy -->
+        <div class="card">
+            <div class="section-title">Error Breakdown</div>
+            <table>
+                <thead>
+                    <tr><th>Category</th><th>Count</th></tr>
+                </thead>
+                <tbody id="errorTableBody">
+                    <tr><td colspan="2">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- 7x24 Load Heatmap -->
+    <div class="card" style="margin-bottom: 24px;">
+        <div class="section-title">7 × 24 Load Heatmap (Local Time)</div>
+        <div class="heatmap-grid" id="heatmapGrid"></div>
+    </div>
+
+    <div class="dashboard-grid">
+        <!-- Sources -->
+        <div class="card">
+            <div class="section-title">Traffic Sources</div>
+            <table>
+                <thead>
+                    <tr><th>Client IP</th><th>Auth Mode</th><th>Jobs</th><th>Completed</th><th>Error %</th></tr>
+                </thead>
+                <tbody id="sourcesTableBody">
+                    <tr><td colspan="5">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Logs Viewer -->
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <div class="section-title" style="margin:0;">System Events</div>
+                <select id="logLevelSelect" onchange="loadLogs()" style="padding: 4px 8px; font-size: 0.75rem;">
+                    <option value="">ALL Levels</option>
+                    <option value="INFO">INFO</option>
+                    <option value="WARNING">WARNING</option>
+                    <option value="ERROR">ERROR</option>
+                    <option value="DEBUG">DEBUG</option>
+                </select>
+            </div>
+            <div class="log-box" id="logBox">Loading logs...</div>
+        </div>
+    </div>
+
+    <script>
+        function getApiKey() {
+            let key = sessionStorage.getItem("AGENT_API_KEY");
+            return key || "";
+        }
+
+        async function fetchAPI(url) {
+            let headers = {};
+            let key = getApiKey();
+            if (key) headers["X-API-Key"] = key;
+
+            let res = await fetch(url, { headers });
+            if (res.status === 401) {
+                let promptKey = prompt("API Key Required for tunnel access:");
+                if (promptKey) {
+                    sessionStorage.setItem("AGENT_API_KEY", promptKey);
+                    headers["X-API-Key"] = promptKey;
+                    res = await fetch(url, { headers });
+                }
+            }
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return await res.json();
+        }
+
+        async function loadSummary() {
+            try {
+                let data = await fetchAPI("/v1/stats/summary");
+                document.getElementById("valTotalQueries").innerText = data.total_jobs;
+                document.getElementById("subTotalQueries").innerText = `${data.completed_jobs} completed, ${data.failed_jobs} failed`;
+
+                document.getElementById("valErrorRate").innerText = (data.error_rate * 100).toFixed(1) + "%";
+                document.getElementById("subErrorRate").innerText = `${data.failed_jobs} failed / ${data.total_jobs} total`;
+
+                document.getElementById("valLatency").innerText = `${data.duration_p50_s}s / ${data.duration_p95_s}s`;
+                document.getElementById("subLatency").innerText = `Max duration: ${data.duration_max_s}s`;
+
+                document.getElementById("valTokens").innerText = data.total_tokens.toLocaleString();
+                document.getElementById("subTokens").innerText = `${data.total_input_tokens.toLocaleString()} in / ${data.total_output_tokens.toLocaleString()} out`;
+
+                document.getElementById("valCost").innerText = "$" + data.total_cost_usd.toFixed(4);
+
+                document.getElementById("valDbSize").innerText = data.db_size.mb + " MB";
+                document.getElementById("subDbSize").innerText = `${data.db_size.bytes.toLocaleString()} bytes on disk`;
+            } catch(e) { console.error("Summary error:", e); }
+        }
+
+        async function loadTimeseries() {
+            try {
+                let bucket = document.getElementById("bucketSelect").value;
+                let data = await fetchAPI(`/v1/stats/timeseries?bucket=${bucket}`);
+                let container = document.getElementById("chartContainer");
+                container.innerHTML = "";
+
+                if (!data || data.length === 0) {
+                    container.innerHTML = "<div style='color:var(--text-muted); width:100%; text-align:center;'>No timeseries data</div>";
+                    return;
+                }
+
+                let maxCount = Math.max(...data.map(d => d.count), 1);
+                data.forEach(d => {
+                    let wrapper = document.createElement("div");
+                    wrapper.className = "bar-wrapper";
+
+                    let heightPct = Math.max(10, (d.count / maxCount) * 100);
+                    let bar = document.createElement("div");
+                    bar.className = d.errors > 0 ? "bar bar-err" : "bar";
+                    bar.style.height = heightPct + "%";
+                    bar.title = `${d.time_bucket}: ${d.count} jobs (${d.errors} errors, ${d.total_tokens} tokens)`;
+
+                    let label = document.createElement("div");
+                    label.className = "bar-label";
+                    label.innerText = d.time_bucket.split(" ")[0];
+
+                    wrapper.appendChild(bar);
+                    wrapper.appendChild(label);
+                    container.appendChild(wrapper);
+                });
+            } catch(e) { console.error("Timeseries error:", e); }
+        }
+
+        async function loadHeatmap() {
+            try {
+                let data = await fetchAPI("/v1/stats/load?by=dow_hour");
+                let gridContainer = document.getElementById("heatmapGrid");
+                gridContainer.innerHTML = "";
+
+                // Header hours
+                gridContainer.appendChild(document.createElement("div")); // Top-left empty cell
+                for(let h=0; h<24; h++) {
+                    let hdr = document.createElement("div");
+                    hdr.className = "hm-header";
+                    hdr.innerText = h;
+                    gridContainer.appendChild(hdr);
+                }
+
+                let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                let grid = data.grid || [];
+                let maxVal = 1;
+                for(let r=0; r<7; r++) {
+                    for(let c=0; c<24; c++) {
+                        if (grid[r] && grid[r][c] > maxVal) maxVal = grid[r][c];
+                    }
+                }
+
+                for(let d=0; d<7; d++) {
+                    let lbl = document.createElement("div");
+                    lbl.className = "hm-row-label";
+                    lbl.innerText = days[d];
+                    gridContainer.appendChild(lbl);
+
+                    for(let h=0; h<24; h++) {
+                        let cnt = (grid[d] && grid[d][h]) ? grid[d][h] : 0;
+                        let cell = document.createElement("div");
+                        cell.className = "hm-cell";
+                        let alpha = cnt > 0 ? Math.max(0.2, cnt / maxVal) : 0.05;
+                        cell.style.backgroundColor = cnt > 0 ? `rgba(56, 189, 248, ${alpha})` : "#1e293b";
+                        cell.innerText = cnt;
+                        cell.title = `${days[d]} ${h}:00 - ${cnt} jobs`;
+                        gridContainer.appendChild(cell);
+                    }
+                }
+            } catch(e) { console.error("Heatmap error:", e); }
+        }
+
+        async function loadSources() {
+            try {
+                let data = await fetchAPI("/v1/stats/sources");
+                let tbody = document.getElementById("sourcesTableBody");
+                tbody.innerHTML = "";
+
+                if (!data || data.length === 0) {
+                    tbody.innerHTML = "<tr><td colspan='5'>No source records</td></tr>";
+                    return;
+                }
+
+                data.forEach(s => {
+                    let tr = document.createElement("tr");
+                    tr.innerHTML = `<td>${s.client_ip}</td><td>${s.auth_mode}</td><td>${s.total_jobs}</td><td>${s.completed_jobs}</td><td>${(s.error_rate * 100).toFixed(1)}%</td>`;
+                    tbody.appendChild(tr);
+                });
+            } catch(e) { console.error("Sources error:", e); }
+        }
+
+        async function loadErrors() {
+            try {
+                let data = await fetchAPI("/v1/stats/errors");
+                let tbody = document.getElementById("errorTableBody");
+                tbody.innerHTML = "";
+
+                let tax = data.taxonomy || {};
+                Object.keys(tax).forEach(cat => {
+                    let tr = document.createElement("tr");
+                    tr.innerHTML = `<td>${cat}</td><td>${tax[cat]}</td>`;
+                    tbody.appendChild(tr);
+                });
+            } catch(e) { console.error("Errors error:", e); }
+        }
+
+        async function loadLogs() {
+            try {
+                let lvl = document.getElementById("logLevelSelect").value;
+                let data = await fetchAPI(`/v1/logs?level=${lvl}&limit=50`);
+                let box = document.getElementById("logBox");
+                box.innerHTML = "";
+
+                if (!data || data.length === 0) {
+                    box.innerText = "No log records found.";
+                    return;
+                }
+
+                data.forEach(l => {
+                    let div = document.createElement("div");
+                    let cls = "log-info";
+                    if (l.level === "ERROR") cls = "log-error";
+                    else if (l.level === "WARNING") cls = "log-warn";
+                    else if (l.level === "DEBUG") cls = "log-debug";
+
+                    div.className = `log-line ${cls}`;
+                    let dateStr = new Date(l.ts * 1000).toISOString().replace("T", " ").substring(0, 19);
+                    div.innerText = `[${dateStr}] [${l.level}] ${l.logger}: ${l.message}`;
+                    box.appendChild(div);
+                });
+            } catch(e) { console.error("Logs error:", e); }
+        }
+
+        function refreshAll() {
+            loadSummary();
+            loadTimeseries();
+            loadHeatmap();
+            loadSources();
+            loadErrors();
+            loadLogs();
+        }
+
+        window.onload = function() {
+            refreshAll();
+            setInterval(refreshAll, 30000); // 30s auto refresh
+        };
+    </script>
+</body>
+</html>

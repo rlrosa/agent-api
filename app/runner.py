@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import os
 import shutil
 import signal
@@ -7,26 +9,37 @@ from app.agents import AGENTS, ensure_available
 from app.config import get_settings
 from app.db import finish_job
 
+
+logger = logging.getLogger("agent-api.runner")
 ACTIVE_PROCESSES: Dict[str, asyncio.subprocess.Process] = {}
+
 
 
 def kill_active_job_process(job_id: str) -> bool:
     proc = ACTIVE_PROCESSES.get(job_id)
     if proc and proc.returncode is None:
         try:
-            pgid = os.getpgid(proc.pid)
             try:
-                os.killpg(pgid, signal.SIGTERM)
+                proc.kill()
             except Exception:
                 pass
+            pgid = os.getpgid(proc.pid)
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except Exception:
                 pass
+            for pipe in (proc.stdout, proc.stderr, proc.stdin):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
             return True
         except Exception:
             pass
     return False
+
+
 
 
 
@@ -51,6 +64,19 @@ def build_scrubbed_env(settings) -> Dict[str, str]:
     return scrubbed
 
 
+def check_bwrap_confinement() -> Dict[str, Any]:
+    settings = get_settings()
+    if not settings.bwrap_enabled:
+        return {"enabled": False, "available": False, "mode": "disabled"}
+
+    bwrap_path = shutil.which("bwrap")
+    if not bwrap_path:
+        mode = "unconfined_warning" if settings.allow_unconfined else "enforced"
+        return {"enabled": True, "available": False, "mode": mode}
+
+    return {"enabled": True, "available": True, "mode": "enforced"}
+
+
 def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List[str]:
     settings = get_settings()
     if not settings.bwrap_enabled:
@@ -58,16 +84,23 @@ def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List
 
     bwrap_path = shutil.which("bwrap")
     if not bwrap_path:
+        if not settings.allow_unconfined:
+            raise RuntimeError("Confinement error: bubblewrap (bwrap) binary missing or unexecutable, refusing unconfined execution")
+        logger.warning(f"UNCONFINED EXECUTION WARNING: bwrap missing/disabled, executing unconfined due to ALLOW_UNCONFINED=1 for agent '{agent}'")
         return cmd
+
 
     bwrap_cmd = [
         bwrap_path,
+        "--die-with-parent",
+        "--new-session",
         "--dir", "/etc",
         "--ro-bind", "/usr", "/usr",
         "--ro-bind", "/bin", "/bin",
         "--ro-bind", "/sbin", "/sbin",
         "--ro-bind", "/lib", "/lib",
     ]
+
     if os.path.exists("/lib64"):
         bwrap_cmd.extend(["--ro-bind", "/lib64", "/lib64"])
 
@@ -95,15 +128,21 @@ def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List
                 "--tmpfs", "/home/ubuntu/.gemini/antigravity-cli/log",
             ])
     elif agent == "claude":
-        if os.path.exists("/home/ubuntu/.claude"):
+        bwrap_cmd.extend(["--tmpfs", "/home/ubuntu/.claude"])
+        if os.path.exists("/home/ubuntu/.claude/.credentials.json"):
             bwrap_cmd.extend([
-                "--ro-bind", "/home/ubuntu/.claude", "/home/ubuntu/.claude",
-                "--tmpfs", "/home/ubuntu/.claude/session-env",
+                "--ro-bind", "/home/ubuntu/.claude/.credentials.json", "/home/ubuntu/.claude/.credentials.json",
+            ])
+        if os.path.exists("/home/ubuntu/.claude/settings.json"):
+            bwrap_cmd.extend([
+                "--ro-bind", "/home/ubuntu/.claude/settings.json", "/home/ubuntu/.claude/settings.json",
             ])
         if os.path.exists("/home/ubuntu/.claude.json"):
             bwrap_cmd.extend([
                 "--ro-bind", "/home/ubuntu/.claude.json", "/home/ubuntu/.claude.json",
             ])
+
+
 
 
 
@@ -154,7 +193,18 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
             workspace_path=workspace_path,
         )
 
-        argv = wrap_cmd_with_bwrap(raw_argv, workspace_path, agent_name)
+        try:
+            argv = wrap_cmd_with_bwrap(raw_argv, workspace_path, agent_name)
+        except RuntimeError as conf_err:
+            logger.error(f"Job {job_id} confinement error: {conf_err}")
+            return finish_job(
+                job_id=job_id,
+                status="failed",
+                exit_code=-1,
+                error=str(conf_err),
+                db_path=job.get("db_path"),
+            )
+
 
 
         if spec.prompt_delivery == "stdin":
@@ -169,6 +219,11 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
     stdout_str = None
     stderr_str = None
     error_msg = None
+    input_tokens = None
+    output_tokens = None
+    cached_tokens = None
+    total_tokens = None
+    cost_usd = None
 
     proc = None
     try:
@@ -192,9 +247,44 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         stderr_str = stderr_data.decode("utf-8", errors="replace")
         exit_code = proc.returncode
 
+
         if exit_code == 0:
             status = "completed"
             error_msg = None
+            try:
+                parsed = json.loads(stdout_str)
+                if isinstance(parsed, dict):
+                    if agent_name == "agy":
+                        answer = parsed.get("response")
+                        if answer is not None:
+                            stdout_str = str(answer)
+                        usage = parsed.get("usage") or {}
+                        input_tokens = usage.get("input_tokens")
+                        output_tokens = usage.get("output_tokens")
+                        cached_tokens = usage.get("cache_read_tokens") or usage.get("cache_read_input_tokens")
+                        total_tokens = usage.get("total_tokens") or (
+                            (input_tokens or 0) + (output_tokens or 0)
+                        )
+                        cost_usd = None
+                    elif agent_name == "claude":
+                        answer = parsed.get("result")
+                        if answer is not None:
+                            stdout_str = str(answer)
+                        usage = parsed.get("usage") or {}
+                        input_tokens = usage.get("input_tokens")
+                        output_tokens = usage.get("output_tokens")
+                        cached_tokens = usage.get("cache_read_input_tokens") or usage.get("cache_read_tokens")
+                        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+                        if cached_tokens:
+                            total_tokens += cached_tokens
+                        cost_usd = parsed.get("total_cost_usd")
+                logger.info(
+                    f"Job {job_id} parsed tokens for agent {agent_name}: input={input_tokens}, output={output_tokens}, "
+                    f"total={total_tokens}, cost={cost_usd}, new_stdout_len={len(stdout_str)}"
+                )
+            except Exception as parse_err:
+                logger.warning(f"Job {job_id} stdout JSON parse fallback: {parse_err}")
+
         else:
             status = "failed"
             error_msg = stderr_str.strip() if stderr_str.strip() else f"Process exited with exit code {exit_code}"
@@ -205,15 +295,30 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         exit_code = -1
 
         if proc is not None:
+            pid = proc.pid
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                await asyncio.sleep(0.5)
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            except ProcessLookupError:
+                os.killpg(pid, signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.2)
+
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
                 pass
 
     except Exception as exc:
@@ -235,5 +340,14 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         stdout=stdout_str,
         stderr=stderr_str,
         error=error_msg,
+        finished_at=None,
+        db_path=job.get("db_path"),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached_tokens,
+        total_tokens=total_tokens,
+        cost_usd=cost_usd,
     )
     return result
+
+

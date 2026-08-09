@@ -7,7 +7,19 @@ from app.main import app
 os.environ["API_KEY"] = "test-secret-key"
 
 
+@pytest.fixture(autouse=True)
+def use_temp_db(tmp_path):
+    test_db = str(tmp_path / "test_api.db")
+    os.environ["DB_PATH"] = test_db
+    os.environ["API_KEY"] = "test-secret-key"
+    os.environ["ALLOW_MOCK_AGENT"] = "1"
+    from app.db import init_db
+    init_db(test_db)
+    yield test_db
+
+
 def test_healthz():
+
     with TestClient(app) as client:
         response = client.get("/healthz")
         assert response.status_code == 200
@@ -48,7 +60,7 @@ def test_unknown_agent_returns_400():
 def test_create_job_wait_zero():
     with TestClient(app) as client:
         headers = {"X-API-Key": "test-secret-key"}
-        payload = {"prompt": "Reply pong", "wait": 0}
+        payload = {"agent": "mock_429", "prompt": "Reply pong", "wait": 0}
         res = client.post("/v1/jobs", json=payload, headers=headers)
         assert res.status_code == 202
         data = res.json()
@@ -60,7 +72,7 @@ def test_get_list_and_delete_job():
     with TestClient(app) as client:
         headers = {"X-API-Key": "test-secret-key"}
         # Create job
-        c_res = client.post("/v1/jobs", json={"prompt": "Test job", "wait": 0}, headers=headers)
+        c_res = client.post("/v1/jobs", json={"agent": "mock_429", "prompt": "Test job", "wait": 0}, headers=headers)
         job_id = c_res.json()["job_id"]
 
         # Get job
@@ -77,3 +89,4 @@ def test_get_list_and_delete_job():
         d_res = client.delete(f"/v1/jobs/{job_id}", headers=headers)
         assert d_res.status_code == 200
         assert d_res.json()["status"] == "canceled"
+

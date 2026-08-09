@@ -11,6 +11,7 @@ fi
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8090}"
+LOG_LEVEL_LOWER=$(echo "${LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')
 
+exec .venv/bin/uvicorn app.main:app --host "$HOST" --port "$PORT" --log-level "$LOG_LEVEL_LOWER"
 
-exec .venv/bin/uvicorn app.main:app --host "$HOST" --port "$PORT"

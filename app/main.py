@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import secrets
+import time
 import uuid
+
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Union
 
@@ -20,9 +22,10 @@ from fastapi import (
     status,
 )
 
-from app.agents import ensure_available, get_agent_availability
+from app.agents import ensure_available, get_agent_availability, validate_agent_model
 from app.attachments import compose_prompt, materialize_attachment
 from app.config import get_settings
+
 from app.db import (
     cancel_job,
     create_job,
@@ -43,10 +46,31 @@ from app.models import (
 )
 
 
+def format_truncated_prompt(prompt: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return "[disabled]"
+    clean_prompt = " ".join(prompt.split())
+    if len(clean_prompt) > max_chars:
+        return f"{clean_prompt[:max_chars]}... (truncated)"
+    return clean_prompt
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.settings = settings
+
+    log_level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
+    )
+    logging.getLogger("agent-api").setLevel(log_level)
+    logging.getLogger("uvicorn").setLevel(log_level)
+
+    from app.events import setup_async_logging, stop_async_logging
+    setup_async_logging(log_level=settings.log_level)
 
     # Ensure DB tables exist
     init_db(settings.db_path)
@@ -56,9 +80,12 @@ async def lifespan(app: FastAPI):
     yield
     # Stop background worker dispatcher pool
     await stop_dispatcher()
+    stop_async_logging()
+
 
 
 app = FastAPI(title="agent-api", version="0.1.0", lifespan=lifespan)
+
 
 
 import ipaddress
@@ -82,6 +109,38 @@ def is_trusted_peer(client_ip: str, trusted_networks: List[str]) -> bool:
     return False
 
 
+_security_auth_failures: List[Dict[str, Any]] = []
+
+
+def record_auth_failure(peer_ip: str, reason: str, path: str):
+    _security_auth_failures.append({
+        "ts": time.time(),
+        "peer_ip": peer_ip,
+        "reason": reason,
+        "path": path,
+    })
+    if len(_security_auth_failures) > 1000:
+        _security_auth_failures.pop(0)
+
+
+def get_security_stats(since: Optional[float] = None) -> Dict[str, Any]:
+    cutoff = since if since is not None else (time.time() - 86400)
+    recent = [f for f in _security_auth_failures if f["ts"] >= cutoff]
+    failures_by_ip: Dict[str, int] = {}
+    for f in recent:
+        ip = f["peer_ip"]
+        failures_by_ip[ip] = failures_by_ip.get(ip, 0) + 1
+
+    from app.runner import check_bwrap_confinement
+    return {
+        "since": cutoff,
+        "total_failures": len(recent),
+        "failures_by_ip": failures_by_ip,
+        "failures": recent[-50:],
+        "confinement": check_bwrap_confinement(),
+    }
+
+
 def verify_api_key(
     request: Request,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
@@ -97,19 +156,36 @@ def verify_api_key(
 
     trusted = (not has_cf_header) and is_trusted_peer(client_ip, settings.trusted_networks)
 
+    from app.security import authenticate_key, rate_limiter
+
     if trusted:
-        logger.info(f"Auth BYPASS (trusted peer IP: {client_ip}) for {request.url.path}")
-        return "bypass"
+        key_name = "bypass"
+    else:
+        key_name = authenticate_key(x_api_key)
+        if not key_name:
+            reason = "Missing or invalid X-API-Key"
+            record_auth_failure(client_ip, reason, request.url.path)
+            logger.warning(f"Auth DENIED (peer IP: {client_ip}, CF header: {has_cf_header}) for {request.url.path}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized: Missing or invalid X-API-Key header",
+            )
+        logger.info(f"Auth OK (Key name '{key_name}' provided by {client_ip}) for {request.url.path}")
 
-    if not x_api_key or not secrets.compare_digest(x_api_key, settings.api_key):
-        logger.warning(f"Auth DENIED (peer IP: {client_ip}, CF header: {has_cf_header}) for {request.url.path}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized: Missing or invalid X-API-Key header",
-        )
+    # Sliding-window rate limit (skip for /healthz and /dashboard)
+    if request.url.path not in ("/healthz", "/dashboard"):
+        caller_id = key_name if key_name != "bypass" else f"ip_{client_ip}"
+        is_limited, retry_after = rate_limiter.is_rate_limited(caller_id, settings.rate_limit_per_min)
+        if is_limited:
+            logger.warning(f"Rate limit exceeded for caller '{caller_id}' (IP: {client_ip}) on {request.url.path}")
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded",
+                headers={"Retry-After": str(retry_after)},
+            )
 
-    logger.info(f"Auth OK (API Key provided by {client_ip}) for {request.url.path}")
-    return x_api_key
+    return key_name
+
 
 
 
@@ -120,6 +196,7 @@ async def healthz():
     running_jobs = list_jobs(status="running", limit=1000)
 
     from app.ratelimit import rate_limit_manager
+    from app.runner import check_bwrap_confinement
 
     return HealthResponse(
         version="0.1.0",
@@ -128,24 +205,25 @@ async def healthz():
         running_count=len(running_jobs),
         effective_concurrency=rate_limit_manager.effective_concurrency,
         agents=get_agent_availability(),
+        confinement=check_bwrap_confinement(),
     )
+
 
 
 
 @app.post("/v1/jobs")
 async def create_job_endpoint(
     request: Request,
-    api_key: str = Depends(verify_api_key),
+    auth: str = Depends(verify_api_key),
 ):
     settings = get_settings()
-    content_type = request.headers.get("content-type", "").lower()
+    content_type = request.headers.get("content-type", "")
 
+    attachments_input: List[Dict[str, Any]] = []
     agent_name: Optional[str] = None
     prompt: str = ""
     model: Optional[str] = None
     effort: Optional[str] = None
-    attachments_input: List[Dict[str, Any]] = []
-
     wait_time: int = settings.wait_default
     job_timeout: int = settings.job_timeout
     metadata: Optional[Dict[str, Any]] = None
@@ -215,17 +293,30 @@ async def create_job_endpoint(
 
     target_agent = agent_name or settings.default_agent
 
-    # Validate agent availability -> 400 Bad Request if missing/unavailable
+    # Validate agent availability & model -> 400 Bad Request if missing/invalid
     try:
         ensure_available(target_agent)
+        validate_agent_model(target_agent, model)
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err))
+
 
     # Clamp wait_time to WAIT_MAX
     effective_wait = min(max(0, wait_time), settings.wait_max)
 
     job_id = str(uuid.uuid4())
     ws_path = os.path.join(settings.work_root, job_id)
+
+    client_ip = request.client.host if request.client else "unknown"
+    auth_mode_str = "bypass" if auth == "bypass" else "key"
+    att_count = len(attachments_input)
+    trunc_prompt = format_truncated_prompt(prompt, settings.log_prompt_chars)
+    logger.info(
+        f"Job {job_id} submitted by {client_ip} (agent={target_agent}, model={model or 'default'}, "
+        f"effort={effort or 'default'}, attachments={att_count}, prompt=\"{trunc_prompt}\")"
+    )
+    logger.debug(f"Job {job_id} submission details: wait={effective_wait}, timeout={job_timeout}, metadata={metadata}")
+
 
     # Handle attachments if any
     saved_filenames = []
@@ -247,7 +338,17 @@ async def create_job_endpoint(
 
     final_prompt = compose_prompt(prompt, saved_filenames, workspace_path=ws_path) if saved_filenames else prompt
 
-    # Create job row in DB with fully-composed prompt
+    # Check MAX_PENDING_JOBS cap
+    pending_jobs = list_jobs(status="pending", limit=settings.max_pending_jobs + 1, db_path=settings.db_path)
+    if len(pending_jobs) >= settings.max_pending_jobs:
+        logger.warning(f"Pending queue limit reached ({settings.max_pending_jobs}). Rejecting submission.")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Queue capacity exceeded: maximum pending jobs limit reached",
+            headers={"Retry-After": "10"},
+        )
+
+    # Create job row in DB with fully-composed prompt, client_ip, auth_mode, and api_key_name
     job = create_job(
         agent=target_agent,
         prompt=final_prompt,
@@ -258,7 +359,11 @@ async def create_job_endpoint(
         timeout=job_timeout,
         db_path=settings.db_path,
         job_id=job_id,
+        client_ip=client_ip,
+        auth_mode=auth_mode_str,
+        api_key_name=auth,
     )
+
 
 
 
@@ -324,4 +429,101 @@ async def cancel_job_endpoint(
 
     canceled = cancel_job(job_id, db_path=settings.db_path)
     return canceled
+
+
+from app.stats import (
+    get_summary_stats,
+    get_timeseries_stats,
+    get_load_stats,
+    get_sources_stats,
+    get_error_stats,
+)
+
+
+@app.get("/v1/stats/summary")
+async def stats_summary_endpoint(
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    auth: str = Depends(verify_api_key),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(get_summary_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+
+
+@app.get("/v1/stats/timeseries")
+async def stats_timeseries_endpoint(
+    bucket: str = Query("day"),
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    auth: str = Depends(verify_api_key),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(get_timeseries_stats, bucket=bucket, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+
+
+@app.get("/v1/stats/load")
+async def stats_load_endpoint(
+    by: str = Query("dow_hour"),
+    auth: str = Depends(verify_api_key),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(get_load_stats, by=by, db_path=settings.db_path)
+
+
+@app.get("/v1/stats/sources")
+async def stats_sources_endpoint(
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    auth: str = Depends(verify_api_key),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(get_sources_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+
+
+@app.get("/v1/stats/errors")
+async def stats_errors_endpoint(
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    auth: str = Depends(verify_api_key),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(get_error_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+
+
+@app.get("/v1/stats/security")
+async def stats_security_endpoint(
+    since: Optional[float] = Query(None),
+    auth: str = Depends(verify_api_key),
+):
+    return get_security_stats(since=since)
+
+
+from app.events import get_logs
+
+
+
+@app.get("/v1/logs")
+async def get_logs_endpoint(
+    level: Optional[str] = Query(None),
+    since: Optional[float] = Query(None),
+    job_id: Optional[str] = Query(None),
+    limit: int = Query(default=100, ge=1, le=500),
+    auth: str = Depends(verify_api_key),
+):
+    return await asyncio.to_thread(get_logs, level=level, since=since, job_id=job_id, limit=limit)
+
+
+from fastapi.responses import HTMLResponse
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_endpoint():
+    dash_path = os.path.join(os.path.dirname(__file__), "static", "dashboard.html")
+    if os.path.exists(dash_path):
+        with open(dash_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    raise HTTPException(status_code=404, detail="Dashboard page not found")
+
+
+
 

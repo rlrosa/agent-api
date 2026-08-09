@@ -23,8 +23,9 @@ def validate_url_ssrf(url: str, allowlist: Optional[List[str]] = None) -> str:
     # Check explicit allowlist
     if allowlist:
         clean_allowlist = {h.strip().lower() for h in allowlist if h.strip()}
-        if hostname.lower() in clean_allowlist:
+        if hostname.lower() in clean_allowlist or (parsed.netloc and parsed.netloc.lower() in clean_allowlist):
             return hostname
+
 
     # Try parsing direct IP
     try:
@@ -117,42 +118,65 @@ async def fetch_url_attachment(
     max_total_bytes: int,
     allowlist: Optional[List[str]] = None,
 ) -> Tuple[str, int]:
-    validate_url_ssrf(url, allowlist=allowlist)
+    current_url = url
+    max_hops = 5
 
-    async with httpx.AsyncClient(follow_redirects=True, max_redirects=5, timeout=10.0) as client:
-        async with client.stream("GET", url) as response:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=10.0) as client:
+        for hop in range(max_hops + 1):
+            validate_url_ssrf(current_url, allowlist=allowlist)
+
+            req = client.build_request("GET", current_url)
+            response = await client.send(req, stream=True)
+
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("location")
+                await response.aclose()
+                if not location:
+                    raise ValueError(f"HTTP redirect {response.status_code} missing Location header")
+                if hop >= max_hops:
+                    raise ValueError(f"Too many redirects (exceeded max {max_hops} hops)")
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
+
             if response.status_code != 200:
-                raise ValueError(f"Failed to fetch attachment URL {url}: HTTP {response.status_code}")
-
-            content_type = response.headers.get("content-type")
-            raw_filename = get_filename_from_response(response, url)
-            clean_filename = sanitize_filename(raw_filename, content_type=content_type)
-            target_path = get_unique_filepath(attachments_dir, clean_filename)
-
-            bytes_written_this_file = 0
-            temp_path = target_path + ".tmp"
+                await response.aclose()
+                raise ValueError(f"Failed to fetch attachment URL {current_url}: HTTP {response.status_code}")
 
             try:
-                with open(temp_path, "wb") as f:
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        chunk_len = len(chunk)
-                        if bytes_written_this_file + chunk_len > max_attachment_bytes:
-                            raise ValueError(
-                                f"Attachment exceeds max single file size limit ({max_attachment_bytes} bytes). Aborted after {bytes_written_this_file + chunk_len} bytes."
-                            )
-                        if total_bytes_written + bytes_written_this_file + chunk_len > max_total_bytes:
-                            raise ValueError(
-                                f"Job total attachments size exceeds limit ({max_total_bytes} bytes). Aborted after {total_bytes_written + bytes_written_this_file + chunk_len} bytes."
-                            )
-                        f.write(chunk)
-                        bytes_written_this_file += chunk_len
+                content_type = response.headers.get("content-type")
+                raw_filename = get_filename_from_response(response, current_url)
+                clean_filename = sanitize_filename(raw_filename, content_type=content_type)
+                target_path = get_unique_filepath(attachments_dir, clean_filename)
 
-                os.rename(temp_path, target_path)
-                return os.path.basename(target_path), bytes_written_this_file
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
+                bytes_written_this_file = 0
+                temp_path = target_path + ".tmp"
+
+                try:
+                    with open(temp_path, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            chunk_len = len(chunk)
+                            if bytes_written_this_file + chunk_len > max_attachment_bytes:
+                                raise ValueError(
+                                    f"Attachment exceeds max single file size limit ({max_attachment_bytes} bytes). Aborted after {bytes_written_this_file + chunk_len} bytes."
+                                )
+                            if total_bytes_written + bytes_written_this_file + chunk_len > max_total_bytes:
+                                raise ValueError(
+                                    f"Job total attachments size exceeds limit ({max_total_bytes} bytes). Aborted after {total_bytes_written + bytes_written_this_file + chunk_len} bytes."
+                                )
+                            f.write(chunk)
+                            bytes_written_this_file += chunk_len
+
+                    os.rename(temp_path, target_path)
+                    return os.path.basename(target_path), bytes_written_this_file
+                except Exception:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    raise
+            finally:
+                await response.aclose()
+
+    raise ValueError(f"Failed to fetch attachment URL {url}: max redirects exceeded")
+
 
 
 def materialize_base64_attachment(

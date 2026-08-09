@@ -45,20 +45,35 @@ class Settings(BaseModel):
     recover_successes: int = Field(default=3)
     allow_mock_agent: bool = Field(default=False)
     bwrap_enabled: bool = Field(default=True)
+    allow_unconfined: bool = Field(default=False)
+    egress_restrict: bool = Field(default=False)
+    api_keys: str = Field(default="")
+    rate_limit_per_min: int = Field(default=60)
+    max_pending_jobs: int = Field(default=100)
+    log_level: str = Field(default="INFO")
+    log_prompt_chars: int = Field(default=200)
+    job_retention_days: int = Field(default=30)
 
 
 def get_settings() -> Settings:
 
-
-    api_key = os.environ.get("API_KEY")
-    if not api_key:
-        raise ValueError("API_KEY environment variable is required and cannot be empty")
+    api_key = os.environ.get("API_KEY", "")
+    api_keys = os.environ.get("API_KEYS", "")
+    if not api_key and not api_keys:
+        raise ValueError("API_KEY or API_KEYS environment variable is required and cannot be empty")
 
     trusted_nets_raw = os.environ.get("TRUSTED_NETWORKS", "192.168.87.0/24,100.64.0.0/10")
     trusted_networks = [net.strip() for net in trusted_nets_raw.split(",") if net.strip()]
 
+    # Parse JOB_RETENTION (e.g., "30d" or "30")
+    retention_raw = os.environ.get("JOB_RETENTION", "30d").lower().replace("d", "").strip()
+    try:
+        job_retention_days = int(retention_raw)
+    except ValueError:
+        job_retention_days = 30
+
     return Settings(
-        api_key=api_key,
+        api_key=api_key or "default-secret-key",
         host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", "8090")),
         trusted_networks=trusted_networks,
@@ -84,7 +99,17 @@ def get_settings() -> Settings:
         recover_successes=int(os.environ.get("RECOVER_SUCCESSES", "3")),
         allow_mock_agent=os.environ.get("ALLOW_MOCK_AGENT", "0").lower() in ("1", "true", "yes"),
         bwrap_enabled=os.environ.get("BWRAP_ENABLED", "1").lower() in ("1", "true", "yes"),
+        allow_unconfined=os.environ.get("ALLOW_UNCONFINED", "0").lower() in ("1", "true", "yes"),
+        egress_restrict=os.environ.get("EGRESS_RESTRICT", "0").lower() in ("1", "true", "yes"),
+        api_keys=os.environ.get("API_KEYS", ""),
+        rate_limit_per_min=int(os.environ.get("RATE_LIMIT_PER_MIN", "60")),
+        max_pending_jobs=int(os.environ.get("MAX_PENDING_JOBS", "100")),
+        log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        log_prompt_chars=int(os.environ.get("LOG_PROMPT_CHARS", "200")),
+        job_retention_days=job_retention_days,
     )
+
+
 
 
 
