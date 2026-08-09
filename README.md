@@ -16,35 +16,102 @@ A lightweight, secure FastAPI HTTP service that exposes CLI-based AI agents (`ag
 
 ---
 
-## Quick Start
+## Getting Started from Scratch
 
-
-### 1. Requirements & Setup
-- Python 3.10+
-- `bwrap` (Bubblewrap 0.6+) for OS-level sandboxing
-- Configured agent binaries in PATH (`agy` and `claude`)
+### Automated Installation (Recommended)
+Run the idempotent installer script to verify dependencies, create `.venv`, generate an initial API key at `~/.config/agent-api/env` (mode `0600`), and set up the systemd user service:
 
 ```bash
-# Create virtual environment and install dependencies
+./scripts/install.sh
+```
+
+### Manual Step-by-Step Setup
+
+#### 1. System Prerequisites
+Ensure system packages are installed. Note that Debian/Ubuntu systems do not provide a global system `pip`; use `python3-venv` to create a virtual environment and use `.venv/bin/pip`.
+
+```bash
+# Install system packages (Ubuntu/Debian)
+sudo apt-get update && sudo apt-get install -y bubblewrap python3-venv sqlite3
+```
+
+#### 2. Virtual Environment & Dependencies
+```bash
 python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 ```
 
-### 2. Persistent Production Service Management (`systemd --user`)
+#### 3. Configuration & Security Key Setup
+Create `~/.config/agent-api/env` with mode `0600`:
 
-The service runs persistently under `systemd --user` with `Restart=always` and `loginctl enable-linger ubuntu` (surviving reboots and logouts).
-
-- **Environment & Key File**: Configured on the server in `~/.config/agent-api/env` (mode `0600`).
-- **Service Status**: `systemctl --user status agent-api`
-- **Restart Service**: `systemctl --user restart agent-api`
-- **Stop Service**: `systemctl --user stop agent-api`
-- **Start Service**: `systemctl --user start agent-api`
-- **View Live Logs**: `journalctl --user -u agent-api -f`
-
-To run manually in foreground (development mode):
 ```bash
-API_KEY="your-secret-api-key" ./run.sh
+mkdir -p ~/.config/agent-api
+cat << 'EOF' > ~/.config/agent-api/env
+API_KEY="YOUR_GENERATED_SECURE_API_KEY"
+HOST="0.0.0.0"
+PORT="8090"
+TRUSTED_NETWORKS="192.168.87.0/24,100.64.0.0/10"
+MAX_CONCURRENCY="3"
+JOB_TIMEOUT="120"
+LOG_LEVEL="INFO"
+EOF
+chmod 0600 ~/.config/agent-api/env
 ```
+
+#### 4. Persistent Service Management (`systemd --user` & Linger)
+Install the systemd user unit and enable user process lingering so `agent-api` survives logouts and system reboots:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat << 'EOF' > ~/.config/systemd/user/agent-api.service
+[Unit]
+Description=Agent API Job Queue Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/agent-api
+EnvironmentFile=%h/.config/agent-api/env
+ExecStart=/home/ubuntu/agent-api/.venv/bin/uvicorn app.main:app --host ${HOST} --port ${PORT}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable linger for current user
+loginctl enable-linger $(whoami)
+
+# Reload daemon and start service
+systemctl --user daemon-reload
+systemctl --user enable agent-api.service
+systemctl --user restart agent-api.service
+```
+
+#### 5. Verify Installation
+```bash
+curl -s http://127.0.0.1:8090/healthz | jq .
+```
+
+Expected output:
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "confinement": {
+    "enabled": true,
+    "available": true,
+    "mode": "enforced"
+  }
+}
+```
+
+---
+
+## Quick Reference & Commands
+
 
 ### 3. Setting Up Authentication on Client Machines
 
