@@ -62,7 +62,7 @@ def get_settings() -> Settings:
     if not api_key and not api_keys:
         raise ValueError("API_KEY or API_KEYS environment variable is required and cannot be empty")
 
-    trusted_nets_raw = os.environ.get("TRUSTED_NETWORKS", "192.168.87.0/24,100.64.0.0/10")
+    trusted_nets_raw = os.environ.get("TRUSTED_NETWORKS", "127.0.0.1/32,::1/128,127.0.0.0/8,192.168.87.0/24,100.64.0.0/10")
     trusted_networks = [net.strip() for net in trusted_nets_raw.split(",") if net.strip()]
 
     # Parse JOB_RETENTION (e.g., "30d" or "30")

@@ -51,7 +51,7 @@ cat << 'EOF' > ~/.config/agent-api/env
 API_KEY="YOUR_GENERATED_SECURE_API_KEY"
 HOST="0.0.0.0"
 PORT="8090"
-TRUSTED_NETWORKS="192.168.87.0/24,100.64.0.0/10"
+TRUSTED_NETWORKS="127.0.0.1/32,::1/128,127.0.0.0/8,192.168.87.0/24,100.64.0.0/10"
 MAX_CONCURRENCY="3"
 JOB_TIMEOUT="120"
 LOG_LEVEL="INFO"
@@ -165,7 +165,7 @@ The server is configured via environment variables.
 | `API_KEY` | *(Required)* | Secret key required in the `X-API-Key` HTTP header. |
 | `HOST` | `0.0.0.0` | Server bind IP address. |
 | `PORT` | `8090` | Server HTTP port. |
-| `TRUSTED_NETWORKS` | `192.168.87.0/24,100.64.0.0/10` | Trusted CIDR networks for API key auth bypass (LAN & Tailscale). |
+| `TRUSTED_NETWORKS` | `127.0.0.1/32,::1/128,127.0.0.0/8,192.168.87.0/24,100.64.0.0/10` | Trusted CIDR networks for API key auth bypass (Loopback, LAN & Tailscale). |
 | `DB_PATH` | `./data/jobs.db` | SQLite database filepath. |
 | `WORK_ROOT` | `/var/tmp/agent-api/jobs` | Directory for per-job isolated workspaces. |
 | `BWRAP_ENABLED` | `1` | Enable Bubblewrap OS sandboxing for `agy` and `claude` (1=true, 0=false). |
@@ -292,9 +292,8 @@ curl -s -X POST http://192.168.87.132:8090/v1/jobs \
   - Workspace attachments (`<work_root>/<job_id>/attachments/`) are explicitly bind-mounted read-write into the job container.
 - **Strict Caller Request Lock**: Caller requests are validated with Pydantic `extra="forbid"`. Any payload containing `sandbox`, `tools`, `permissions`, `dangerously_skip_permissions`, or CLI flags returns **HTTP 422 Unprocessable Entity**.
 - **Trusted Network Auth Bypass & Tunnel Protection**:
-  - Requests from raw peer socket IPs matching `TRUSTED_NETWORKS` (`192.168.87.0/24`, `100.64.0.0/10`) bypass API key authentication.
-  - Loopback (`127.0.0.1`) is **not** trusted by default.
-  - Any request with Cloudflare Tunnel headers (`CF-Connecting-IP`, `CF-Ray`, `CF-Visitor`) **always requires the API key**, preventing public internet bypass over local tunnel proxies.
+  - Requests from raw peer socket IPs matching `TRUSTED_NETWORKS` (`127.0.0.1/32`, `::1/128`, `127.0.0.0/8`, `192.168.87.0/24`, `100.64.0.0/10`) bypass API key authentication.
+  - Any request carrying Cloudflare Tunnel headers (`CF-Connecting-IP`, `CF-Ray`, `CF-Visitor`) **always requires the API key**, preventing public internet bypass over local tunnel proxies even on loopback connections.
 - **Zero Bypass Flags**: `--dangerously-skip-permissions` is completely removed from all execution code paths.
 - **Per-Job Attachment Isolation**: Attachments are stored in isolated per-job directories (`<work_root>/<job_id>/attachments/`) and passed via explicit absolute paths, preventing cross-job contamination.
 - **Environment Scrubbing**: Sensitive environment variables (`API_KEY`, secret tokens, credentials) are stripped before subprocess spawning; only essential variables (`HOME`, `PATH`) pass through.

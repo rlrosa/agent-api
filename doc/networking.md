@@ -8,11 +8,13 @@
 2. **Tailscale VPN Overlay**: Subnet `100.64.0.0/10` (direct encrypted access without API key required).
 3. **Cloudflare Tunnel (Public Ingress)**: Arrives at `127.0.0.1:8090` from `cloudflared` via `https://agent-api.rela.uy`.
 
-## Important Warning Regarding Loopback (127.0.0.1)
+## Loopback & Cloudflare Tunnel Protection
 
-> [!WARNING]
-> **Do NOT add loopback (`127.0.0.1/32` or `::1`) to `TRUSTED_NETWORKS`.**
-> Because Cloudflare Tunnel ingress (`cloudflared`) terminates incoming public HTTP traffic and proxies requests to `127.0.0.1:8090`, loopback requests carry Cloudflare headers (`CF-Connecting-IP`, `CF-Ray`). `agent-api` specifically traps these headers to enforce `X-API-Key` authentication. Adding `127.0.0.1` to trusted networks would bypass authentication for public tunnel requests.
+Local loopback subnets (`127.0.0.1/32`, `::1/128`, `127.0.0.0/8`) are included in `TRUSTED_NETWORKS` by default to allow local host applications to access `agent-api` without an API key.
+
+> [!NOTE]
+> **Cloudflare Tunnel Protection:**
+> When public HTTP traffic arrives via Cloudflare Tunnel (`cloudflared`) to `127.0.0.1:8090`, requests contain Cloudflare headers (`CF-Connecting-IP`, `CF-Ray`, `CF-Visitor`). `agent-api` detects these headers (`has_cf_header`) and forces mandatory `X-API-Key` authentication even though the peer IP is `127.0.0.1`. Direct local requests without Cloudflare headers safely bypass authentication.
 
 ## How to Whitelist an IP Range
 
