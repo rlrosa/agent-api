@@ -398,7 +398,7 @@ async def get_job_endpoint(
     api_key: str = Depends(verify_api_key),
 ):
     settings = get_settings()
-    job = get_job(job_id, db_path=settings.db_path)
+    job = get_job(job_id, db_path=settings.db_path, api_key_name=api_key)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
     return job
@@ -411,7 +411,7 @@ async def list_jobs_endpoint(
     api_key: str = Depends(verify_api_key),
 ):
     settings = get_settings()
-    return list_jobs(status=status_filter, limit=limit, db_path=settings.db_path)
+    return list_jobs(status=status_filter, limit=limit, db_path=settings.db_path, api_key_name=api_key)
 
 
 @app.delete("/v1/jobs/{job_id}")
@@ -420,14 +420,14 @@ async def cancel_job_endpoint(
     api_key: str = Depends(verify_api_key),
 ):
     settings = get_settings()
-    job = get_job(job_id, db_path=settings.db_path)
+    job = get_job(job_id, db_path=settings.db_path, api_key_name=api_key)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
     from app.runner import kill_active_job_process
     kill_active_job_process(job_id)
 
-    canceled = cancel_job(job_id, db_path=settings.db_path)
+    canceled = cancel_job(job_id, db_path=settings.db_path, api_key_name=api_key)
     return canceled
 
 

@@ -5,11 +5,11 @@ from pydantic import BaseModel, Field
 
 
 class Settings(BaseModel):
-    api_key: str = Field(..., description="Shared secret for API key authentication")
+    api_key: str = Field(default="", description="Shared secret for API key authentication")
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8090)
     trusted_networks: List[str] = Field(
-        default_factory=lambda: ["192.168.87.0/24", "100.64.0.0/10"]
+        default_factory=lambda: ["127.0.0.1/32", "::1/128", "127.0.0.0/8"]
     )
     max_concurrency: int = Field(default=3)
     job_timeout: int = Field(default=120)
@@ -62,7 +62,7 @@ def get_settings() -> Settings:
     if not api_key and not api_keys:
         raise ValueError("API_KEY or API_KEYS environment variable is required and cannot be empty")
 
-    trusted_nets_raw = os.environ.get("TRUSTED_NETWORKS", "127.0.0.1/32,::1/128,127.0.0.0/8,192.168.87.0/24,100.64.0.0/10")
+    trusted_nets_raw = os.environ.get("TRUSTED_NETWORKS", "127.0.0.1/32,::1/128,127.0.0.0/8")
     trusted_networks = [net.strip() for net in trusted_nets_raw.split(",") if net.strip()]
 
     # Parse JOB_RETENTION (e.g., "30d" or "30")
@@ -73,7 +73,7 @@ def get_settings() -> Settings:
         job_retention_days = 30
 
     return Settings(
-        api_key=api_key or "default-secret-key",
+        api_key=api_key,
         host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", "8090")),
         trusted_networks=trusted_networks,

@@ -4,8 +4,8 @@
 
 `agent-api` handles requests originating across three distinct network topologies:
 
-1. **Trusted Local Area Network (LAN)**: Subnet `192.168.87.0/24` (direct access without API key required).
-2. **Tailscale VPN Overlay**: Subnet `100.64.0.0/10` (direct encrypted access without API key required).
+1. **Trusted Local Loopback**: Subnets `127.0.0.1/32`, `::1/128`, `127.0.0.0/8` (direct local access without API key required).
+2. **Custom Whitelisted Subnets**: Any optional operator-configured CIDR in `TRUSTED_NETWORKS` (e.g. LAN `192.168.87.0/24` or Tailscale `100.64.0.0/10`). Adding a network to `TRUSTED_NETWORKS` grants callers on that network full API key auth bypass.
 3. **Cloudflare Tunnel (Public Ingress)**: Arrives at `127.0.0.1:8090` from `cloudflared` via `https://agent-api.rela.uy`.
 
 ## Loopback & Cloudflare Tunnel Protection

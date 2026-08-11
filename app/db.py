@@ -280,33 +280,51 @@ def schedule_retry(
             return _row_to_dict(row)
 
 
-def cancel_job(job_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def cancel_job(job_id: str, db_path: Optional[str] = None, api_key_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     path = _get_db_path(db_path)
     now = time.time()
 
     with _db_lock:
         with _connect(path) as conn:
-            cur = conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'canceled',
-                    finished_at = ?
-                WHERE id = ?
-                RETURNING *;
-                """,
-                (now, job_id),
-            )
+            if api_key_name is not None and api_key_name != "bypass":
+                cur = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'canceled',
+                        finished_at = ?
+                    WHERE id = ? AND (api_key_name = ? OR (api_key_name IS NULL AND ? = 'default'))
+                    RETURNING *;
+                    """,
+                    (now, job_id, api_key_name, api_key_name),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'canceled',
+                        finished_at = ?
+                    WHERE id = ?
+                    RETURNING *;
+                    """,
+                    (now, job_id),
+                )
             row = cur.fetchone()
             conn.commit()
             return _row_to_dict(row)
 
 
-def get_job(job_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def get_job(job_id: str, db_path: Optional[str] = None, api_key_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
     path = _get_db_path(db_path)
 
     with _db_lock:
         with _connect(path) as conn:
-            cur = conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,))
+            if api_key_name is not None and api_key_name != "bypass":
+                cur = conn.execute(
+                    "SELECT * FROM jobs WHERE id = ? AND (api_key_name = ? OR (api_key_name IS NULL AND ? = 'default'));",
+                    (job_id, api_key_name, api_key_name),
+                )
+            else:
+                cur = conn.execute("SELECT * FROM jobs WHERE id = ?;", (job_id,))
             row = cur.fetchone()
             return _row_to_dict(row)
 
@@ -315,21 +333,28 @@ def list_jobs(
     status: Optional[str] = None,
     limit: int = 50,
     db_path: Optional[str] = None,
+    api_key_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     path = _get_db_path(db_path)
 
     with _db_lock:
         with _connect(path) as conn:
+            where_clauses = []
+            params: List[Any] = []
+
             if status is not None:
-                cur = conn.execute(
-                    "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?;",
-                    (status, limit),
-                )
-            else:
-                cur = conn.execute(
-                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?;",
-                    (limit,),
-                )
+                where_clauses.append("status = ?")
+                params.append(status)
+
+            if api_key_name is not None and api_key_name != "bypass":
+                where_clauses.append("(api_key_name = ? OR (api_key_name IS NULL AND ? = 'default'))")
+                params.extend([api_key_name, api_key_name])
+
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            params.append(limit)
+
+            sql = f"SELECT * FROM jobs {where_sql} ORDER BY created_at DESC LIMIT ?;"
+            cur = conn.execute(sql, params)
             rows = cur.fetchall()
             return [_row_to_dict(r) for r in rows]
 
