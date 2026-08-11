@@ -141,3 +141,43 @@ def test_f8_multi_tenant_job_isolation():
         os.environ.pop("API_KEYS", None)
 
 
+def test_fuzzy_model_and_effort_resolution():
+    from app.agents import build_agy_argv, build_claude_argv, resolve_effort, resolve_model
+
+    # 1. Exact match
+    assert resolve_model("claude", "claude-sonnet-5") == "claude-sonnet-5"
+    assert resolve_effort("high") == "high"
+
+    # 2. Near-miss resolution
+    assert resolve_model("agy", "gemini-3.6-flsh") == "gemini-3.6-flash"
+    assert resolve_model("claude", "sonnet") == "claude-sonnet-5"
+    assert resolve_effort("med") == "medium"
+    assert resolve_effort("HIGH") == "high"
+
+    # 3. Garbage -> Default
+    assert resolve_model("agy", "zzzzzz") == "gemini-3.6-flash"
+    assert resolve_model("claude", "zzzzzz") == "claude-sonnet-5"
+    assert resolve_effort("zzzzzz") == "low"
+
+    # 4. Flag-shaped inputs never appear as model or effort values in argv
+    agy_argv = build_agy_argv("test", model="--permission-mode", effort="--allowed-tools")
+    claude_argv = build_claude_argv("test", model="--permission-mode", effort="--allowed-tools")
+
+    assert agy_argv[agy_argv.index("--model") + 1] == "gemini-3.6-flash-low"
+    assert agy_argv[agy_argv.index("--effort") + 1] == "low"
+
+    assert claude_argv[claude_argv.index("--model") + 1] == "claude-sonnet-5"
+    assert claude_argv[claude_argv.index("--effort") + 1] == "low"
+
+    # 5. Omit flags when unspecified
+    claude_default_argv = build_claude_argv("test", model=None, effort=None)
+    assert "--model" not in claude_default_argv
+    assert "--effort" not in claude_default_argv
+
+    agy_default_argv = build_agy_argv("test", model=None, effort=None)
+    assert "--model" in agy_default_argv  # agy model is always emitted
+    assert "--effort" not in agy_default_argv  # agy effort is omitted when unspecified
+
+
+
+

@@ -22,7 +22,13 @@ from fastapi import (
     status,
 )
 
-from app.agents import ensure_available, get_agent_availability, validate_agent_model
+from app.agents import (
+    ensure_available,
+    get_agent_availability,
+    resolve_effort,
+    resolve_model,
+    validate_agent_model,
+)
 from app.attachments import compose_prompt, materialize_attachment
 from app.config import get_settings
 
@@ -293,13 +299,23 @@ async def create_job_endpoint(
 
     target_agent = agent_name or settings.default_agent
 
-    # Validate agent availability & model -> 400 Bad Request if missing/invalid
+    # Validate agent availability -> 400 Bad Request if missing
     try:
         ensure_available(target_agent)
-        validate_agent_model(target_agent, model)
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err))
 
+    resolved_model = resolve_model(target_agent, model) if model else None
+    resolved_effort = resolve_effort(effort) if effort else None
+
+    if model and model != resolved_model:
+        logger.info(
+            f"Fuzzy model resolution for agent '{target_agent}': requested '{model}' -> resolved '{resolved_model}'"
+        )
+    if effort and effort != resolved_effort:
+        logger.info(
+            f"Fuzzy effort resolution for agent '{target_agent}': requested '{effort}' -> resolved '{resolved_effort}'"
+        )
 
     # Clamp wait_time to WAIT_MAX
     effective_wait = min(max(0, wait_time), settings.wait_max)
@@ -312,8 +328,8 @@ async def create_job_endpoint(
     att_count = len(attachments_input)
     trunc_prompt = format_truncated_prompt(prompt, settings.log_prompt_chars)
     logger.info(
-        f"Job {job_id} submitted by {client_ip} (agent={target_agent}, model={model or 'default'}, "
-        f"effort={effort or 'default'}, attachments={att_count}, prompt=\"{trunc_prompt}\")"
+        f"Job {job_id} submitted by {client_ip} (agent={target_agent}, model={resolved_model or 'default'}, "
+        f"effort={resolved_effort or 'default'}, attachments={att_count}, prompt=\"{trunc_prompt}\")"
     )
     logger.debug(f"Job {job_id} submission details: wait={effective_wait}, timeout={job_timeout}, metadata={metadata}")
 
@@ -352,8 +368,8 @@ async def create_job_endpoint(
     job = create_job(
         agent=target_agent,
         prompt=final_prompt,
-        model=model,
-        effort=effort,
+        model=resolved_model,
+        effort=resolved_effort,
         metadata=metadata,
         wait=effective_wait,
         timeout=job_timeout,

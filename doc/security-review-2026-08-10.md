@@ -32,7 +32,7 @@ documentation. Environment variables and CLI flags are treated as trusted inputs
 | F5 | Host credentials mounted into the sandbox with unrestricted egress | **High** | `app/runner.py:115,121-143` | Open |
 | F8 | Any caller can read and cancel any other caller's jobs | **High** | `app/main.py:395-431`, `app/db.py:309,330` | **Fixed** (uncommitted) |
 | F6 | `EGRESS_RESTRICT` is a documented control that does nothing | **Medium** | `app/config.py:49,103` | Open |
-| F4 | Unvalidated `model` / `effort` reach the `claude` argv | **Low** | `app/agents.py:88,90-91` | Open (assessed, see below) |
+| F4 | Unvalidated `model` / `effort` reach the `claude` argv | **Low** | `app/agents.py:88,90-91` | **Fixed** (uncommitted) |
 | F7 | `CLAUDE_DISALLOWED_TOOLS` is a documented control that does nothing | **Low** | `app/config.py:32,98` | Open |
 | F9 | Installer writes the API key before restricting file permissions | **Low** | `scripts/install.sh:66-76` | Open |
 
@@ -273,14 +273,28 @@ normalise `effort` in `build_claude_argv` as the agy builder already does. Defen
 argument's safety currently depends on a third-party CLI's parser behaviour, which can change.
 
 **Follow-up assessment — should these become enumerated options rather than free strings?**
-Considered and **not recommended as a nearest-match scheme**. On the `agy` path the caller's
-`model` is already discarded: `build_agy_argv` always constructs `gemini-3.6-flash-{effort}`
-(`agents.py:47-55`), and an unknown agy model is already rejected with a 400. Only the `claude`
-path forwards the caller's string. A fuzzy nearest-match mapper would add a real hazard of its
-own — a caller requesting a cheap model could be silently served an expensive one without being
-told. If this is hardened, the right shape is an **explicit allowlist per agent that rejects
-unknown values with HTTP 400**, covering `effort` as well as `model`, rather than any silent
-coercion.
+The reviewer's initial assessment was that a nearest-match scheme was not worth the hazard it
+introduces (a caller asking for a cheap model could be silently served an expensive one). **The
+operator decided otherwise** — a fuzzy match is preferable to letting a caller-supplied string
+reach a subprocess argv at all — and it was implemented on that basis.
+
+**Resolution as built.** `resolve_model` / `resolve_effort` (`app/agents.py`) match the caller's
+string against per-agent literal sets using `difflib` (cutoff 0.4), and **the literal from the set
+is what reaches argv** — the caller's string never does. Unmatched input falls back to the
+configured default rather than to an arbitrary set member. The cost hazard is mitigated rather
+than dismissed: the resolved values are persisted on the job row and returned to the caller, and
+a substitution is logged at INFO with both the requested and resolved value.
+
+Verified by the reviewer against the real builders across 24 input combinations — including
+`--permission-mode`, `--allowed-tools`, `--dangerously-skip-permissions`, `zzzzzz` and
+`'; rm -rf /` in both the `model` and `effort` positions, on both agents — with **no argv value
+outside the hardcoded sets**. Omit-when-unspecified is preserved: a caller who supplies neither
+value gets no `--model` / `--effort` flag on the `claude` path, so the CLI picks its own default.
+
+The supported claude set is `claude-haiku-4-5`, `claude-sonnet-5`, `claude-opus-4-8`,
+`claude-opus-5`, ordered cheapest first, defaulting to `claude-sonnet-5`. `claude-fable-5` is
+deliberately excluded — it is the most expensive tier and a poor target for unmatched input to
+land on; it also requires usage credits on this host, confirmed by invoking the CLI directly.
 
 ---
 

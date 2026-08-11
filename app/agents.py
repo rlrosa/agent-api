@@ -1,7 +1,11 @@
+import difflib
+import logging
 import shutil
 from typing import Any, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 from app.config import get_settings
+
+logger = logging.getLogger("agent-api.agents")
 
 
 class AgentSpec(BaseModel):
@@ -12,22 +16,92 @@ class AgentSpec(BaseModel):
     default_model: Optional[str] = None
 
 
-VALID_AGY_MODELS = {
+VALID_AGY_MODELS = [
     "gemini-3.6-flash",
     "gemini-3.6-flash-low",
     "gemini-3.6-flash-medium",
     "gemini-3.6-flash-high",
-}
+]
+
+VALID_CLAUDE_MODELS = [
+    "claude-haiku-4-5",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-5",
+]
+
+VALID_EFFORTS = [
+    "low",
+    "medium",
+    "high",
+]
 
 
-def validate_agent_model(agent: str, model: Optional[str]) -> None:
-    if not model:
-        return
+def resolve_model(agent: str, raw_model: Optional[str]) -> str:
+    """
+    Fuzzy resolves caller-supplied model string against supported model literals.
+    Returns a safe, hardcoded literal string from the supported set.
+    """
+    settings = get_settings()
     if agent == "agy":
-        if model not in VALID_AGY_MODELS:
-            raise ValueError(
-                f"Invalid model '{model}' for agent 'agy'. Allowed model is 'gemini-3.6-flash' (effort: low, medium, high)."
-            )
+        supported = VALID_AGY_MODELS
+        default = settings.agy_default_model or "gemini-3.6-flash"
+    elif agent == "claude":
+        supported = VALID_CLAUDE_MODELS
+        default = settings.claude_default_model or "claude-sonnet-5"
+    else:
+        return "default"
+
+    if default not in supported:
+        default = supported[0]
+
+    if not raw_model:
+        return default
+
+    raw = raw_model.strip()
+
+    # Exact match check (case-insensitive)
+    for s in supported:
+        if s.lower() == raw.lower():
+            return s
+
+    # Fuzzy match using stdlib difflib (cutoff = 0.4 for reasonable similarity)
+    matches = difflib.get_close_matches(raw.lower(), [s.lower() for s in supported], n=1, cutoff=0.4)
+    if matches:
+        matched_lower = matches[0]
+        for s in supported:
+            if s.lower() == matched_lower:
+                return s
+
+    # Safe fallback: no match or poor match lands on default model
+    return default
+
+
+def resolve_effort(raw_effort: Optional[str]) -> str:
+    """
+    Fuzzy resolves caller-supplied effort string against supported effort literals ('low', 'medium', 'high').
+    Returns a safe, hardcoded literal string from VALID_EFFORTS.
+    """
+    if not raw_effort:
+        return "low"
+
+    raw = raw_effort.strip().lower()
+
+    # Exact match check
+    if raw in VALID_EFFORTS:
+        return raw
+
+    # Fuzzy match using stdlib difflib (cutoff = 0.4)
+    matches = difflib.get_close_matches(raw, VALID_EFFORTS, n=1, cutoff=0.4)
+    if matches:
+        return matches[0]
+
+    # Safe fallback: land on default effort 'low'
+    return "low"
+
+
+def validate_agent_model(agent: str, model: Optional[str]) -> str:
+    return resolve_model(agent, model)
 
 
 def build_agy_argv(
@@ -39,24 +113,14 @@ def build_agy_argv(
     spec = AGENTS["agy"]["spec"]
     cmd = ["agy", "-p", prompt]
 
-    eff = (effort or "low").lower()
-    if eff not in ("low", "medium", "high"):
-        eff = "low"
-
-    settings = get_settings()
-    raw_model = model or settings.agy_default_model or spec.default_model
-
-    if raw_model:
-        validate_agent_model("agy", raw_model)
-        selected_model = f"gemini-3.6-flash-{eff}"
-    else:
-        selected_model = f"gemini-3.6-flash-{eff}"
+    eff = resolve_effort(effort) if effort else "low"
+    selected_model = f"gemini-3.6-flash-{eff}"
 
     cmd.extend(["--model", selected_model])
-
     if effort:
-        cmd.extend(["--effort", effort])
+        cmd.extend(["--effort", eff])
 
+    settings = get_settings()
     if settings.sandbox_enabled and settings.agy_sandbox_flags:
         for flag in settings.agy_sandbox_flags.split():
             if flag:
@@ -69,7 +133,6 @@ def build_agy_argv(
     return cmd
 
 
-
 def build_claude_argv(
     prompt: str,
     model: Optional[str] = None,
@@ -80,15 +143,15 @@ def build_claude_argv(
     cmd = ["claude", "-p"]
 
     settings = get_settings()
-    selected_model = model or settings.claude_default_model or spec.default_model
+    raw_model = model or settings.claude_default_model or spec.default_model
 
-    if selected_model:
-        if not spec.supports_model_flag:
-            raise ValueError("Agent 'claude' does not support model overrides")
-        cmd.extend(["--model", selected_model])
+    if raw_model:
+        resolved_model = resolve_model("claude", raw_model)
+        cmd.extend(["--model", resolved_model])
 
     if effort:
-        cmd.extend(["--effort", effort])
+        resolved_eff = resolve_effort(effort)
+        cmd.extend(["--effort", resolved_eff])
 
     if settings.sandbox_enabled:
         cmd.extend(["--allowed-tools", "View,Read"])
