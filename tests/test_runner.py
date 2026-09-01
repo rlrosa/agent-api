@@ -179,3 +179,49 @@ async def test_output_validation_guard(tmp_env):
     assert "could not be found or read from disk" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_sweep_orphaned_workspaces(tmp_env):
+    from app.runner import sweep_orphaned_workspaces
+    from app.db import finish_job
+
+
+    job1 = create_job("agy", "Completed job", db_path=tmp_env["db_path"])
+    job1_id = job1["id"]
+    claimed1 = claim_next_job(db_path=tmp_env["db_path"])
+    finish_job(job1_id, status="completed", db_path=tmp_env["db_path"])
+
+    ws1 = os.path.join(tmp_env["work_root"], job1_id)
+    os.makedirs(ws1, exist_ok=True)
+    old_time = time.time() - 600
+    os.utime(ws1, (old_time, old_time))
+
+    job2 = create_job("agy", "Retry job", db_path=tmp_env["db_path"])
+    job2_id = job2["id"]
+    claimed2 = claim_next_job(db_path=tmp_env["db_path"])
+    finish_job(job2_id, status="pending_retry", db_path=tmp_env["db_path"])
+
+    ws2 = os.path.join(tmp_env["work_root"], job2_id)
+    os.makedirs(ws2, exist_ok=True)
+    os.utime(ws2, (old_time, old_time))
+
+    job3 = create_job("agy", "Recent job", db_path=tmp_env["db_path"])
+    job3_id = job3["id"]
+    claimed3 = claim_next_job(db_path=tmp_env["db_path"])
+    finish_job(job3_id, status="completed", db_path=tmp_env["db_path"])
+
+    ws3 = os.path.join(tmp_env["work_root"], job3_id)
+    os.makedirs(ws3, exist_ok=True)
+
+    reaped = sweep_orphaned_workspaces(
+        work_root=tmp_env["work_root"],
+        db_path=tmp_env["db_path"],
+        min_age_seconds=300.0,
+    )
+
+    assert reaped == 1
+    assert not os.path.exists(ws1), "Completed old workspace must be reaped"
+    assert os.path.exists(ws2), "Pending retry workspace must be preserved"
+    assert os.path.exists(ws3), "Recent workspace must be preserved"
+
+
+

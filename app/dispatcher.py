@@ -7,7 +7,8 @@ from app.db import build_daily_rollups, claim_next_job, finish_job, list_jobs, p
 
 
 from app.ratelimit import is_rate_limit_error, rate_limit_manager
-from app.runner import run_job
+from app.runner import run_job, sweep_orphaned_workspaces
+
 
 
 
@@ -174,6 +175,10 @@ async def _retention_loop() -> None:
             rollups_cnt = build_daily_rollups(db_path=settings.db_path)
             logger.info(f"Scheduled daily rollups built: updated {rollups_cnt} hourly buckets")
 
+            reaped_ws = sweep_orphaned_workspaces(db_path=settings.db_path)
+            if reaped_ws > 0:
+                logger.info(f"Scheduled retention purge: reaped {reaped_ws} orphaned workspace directories")
+
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
             logger.info("Retention sweeper loop cancelled")
@@ -193,6 +198,10 @@ async def start_dispatcher() -> None:
     reset_count = reset_orphans()
     if reset_count > 0:
         logger.info(f"Reset {reset_count} orphaned running jobs to pending")
+
+    reaped_ws = sweep_orphaned_workspaces(db_path=settings.db_path)
+    if reaped_ws > 0:
+        logger.info(f"Startup sweep: reaped {reaped_ws} orphaned workspace directories")
 
     concurrency = settings.max_concurrency
     _worker_tasks = [

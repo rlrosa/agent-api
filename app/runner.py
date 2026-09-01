@@ -4,10 +4,12 @@ import logging
 import os
 import shutil
 import signal
+import time
 from typing import Any, Dict, List, Optional
 from app.agents import AGENTS, ensure_available
 from app.config import get_settings
-from app.db import finish_job
+from app.db import finish_job, get_job
+
 from app.ratelimit import is_rate_limit_error
 
 
@@ -424,3 +426,41 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         cost_usd=cost_usd,
     )
     return result
+
+
+def sweep_orphaned_workspaces(
+    work_root: Optional[str] = None,
+    db_path: Optional[str] = None,
+    min_age_seconds: float = 300.0,
+) -> int:
+    settings = get_settings()
+    root = work_root or settings.work_root
+    if not os.path.exists(root):
+        return 0
+
+    now = time.time()
+    reaped = 0
+
+    for item in os.listdir(root):
+        job_dir = os.path.join(root, item)
+        if not os.path.isdir(job_dir):
+            continue
+
+        try:
+            mtime = os.path.getmtime(job_dir)
+        except OSError:
+            continue
+
+        if (now - mtime) < min_age_seconds:
+            continue
+
+        job = get_job(item, db_path=db_path)
+        if job is None or job.get("status") in ("completed", "failed", "canceled"):
+            try:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                reaped += 1
+            except Exception as err:
+                logger.warning(f"Failed to sweep orphaned workspace {job_dir}: {err}")
+
+    return reaped
+
