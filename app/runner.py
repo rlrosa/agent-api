@@ -8,10 +8,45 @@ from typing import Any, Dict, List, Optional
 from app.agents import AGENTS, ensure_available
 from app.config import get_settings
 from app.db import finish_job
+from app.ratelimit import is_rate_limit_error
+
 
 
 logger = logging.getLogger("agent-api.runner")
 ACTIVE_PROCESSES: Dict[str, asyncio.subprocess.Process] = {}
+
+UNREADABLE_ATTACHMENT_PATTERNS = [
+    "could not be found or read from disk",
+    "could not be found or accessed on the disk",
+    "file not found at specified",
+    "attachment file missing",
+    "receipt file not found",
+    "audio perception failed and no file attached",
+    "specified media attachment file",
+    "specified image file could not be found",
+]
+
+
+def find_declared_attachments(prompt: str, workspace_path: str) -> List[str]:
+    paths = []
+    in_attached_section = False
+    for line in prompt.splitlines():
+        line_str = line.strip()
+        if "Attached files (read them from disk as needed):" in line_str or "Attached files:" in line_str:
+            in_attached_section = True
+            continue
+        if in_attached_section:
+            if line_str.startswith("- "):
+                raw_path = line_str[2:].strip()
+                if raw_path.startswith("./"):
+                    full_path = os.path.normpath(os.path.join(workspace_path, raw_path))
+                else:
+                    full_path = os.path.abspath(raw_path)
+                paths.append(full_path)
+            elif line_str and not line_str.startswith("-"):
+                in_attached_section = False
+    return paths
+
 
 
 
@@ -212,6 +247,19 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         else:
             stdin_bytes = None
 
+    # Pre-execution attachment guard (F2)
+    declared_attachments = find_declared_attachments(prompt, workspace_path)
+    for att_path in declared_attachments:
+        if not os.path.exists(att_path):
+            error_msg = f"Attachment file missing from workspace prior to execution: {att_path}"
+            logger.error(f"Job {job_id} pre-execution guard failed: {error_msg}")
+            return finish_job(
+                job_id=job_id,
+                status="failed",
+                exit_code=-1,
+                error=error_msg,
+                db_path=job.get("db_path"),
+            )
 
     timeout = job.get("timeout") or settings.job_timeout
     status = "failed"
@@ -251,39 +299,55 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         if exit_code == 0:
             status = "completed"
             error_msg = None
-            try:
-                parsed = json.loads(stdout_str)
-                if isinstance(parsed, dict):
-                    if agent_name == "agy":
-                        answer = parsed.get("response")
-                        if answer is not None:
-                            stdout_str = str(answer)
-                        usage = parsed.get("usage") or {}
-                        input_tokens = usage.get("input_tokens")
-                        output_tokens = usage.get("output_tokens")
-                        cached_tokens = usage.get("cache_read_tokens") or usage.get("cache_read_input_tokens")
-                        total_tokens = usage.get("total_tokens") or (
-                            (input_tokens or 0) + (output_tokens or 0)
-                        )
-                        cost_usd = None
-                    elif agent_name == "claude":
-                        answer = parsed.get("result")
-                        if answer is not None:
-                            stdout_str = str(answer)
-                        usage = parsed.get("usage") or {}
-                        input_tokens = usage.get("input_tokens")
-                        output_tokens = usage.get("output_tokens")
-                        cached_tokens = usage.get("cache_read_input_tokens") or usage.get("cache_read_tokens")
-                        total_tokens = (input_tokens or 0) + (output_tokens or 0)
-                        if cached_tokens:
-                            total_tokens += cached_tokens
-                        cost_usd = parsed.get("total_cost_usd")
-                logger.info(
-                    f"Job {job_id} parsed tokens for agent {agent_name}: input={input_tokens}, output={output_tokens}, "
-                    f"total={total_tokens}, cost={cost_usd}, new_stdout_len={len(stdout_str)}"
-                )
-            except Exception as parse_err:
-                logger.warning(f"Job {job_id} stdout JSON parse fallback: {parse_err}")
+
+            # Output validation guard (F3): detect missing/unreadable attachment output
+            matched_pattern = None
+            if stdout_str:
+                stdout_lower = stdout_str.lower()
+                for pat in UNREADABLE_ATTACHMENT_PATTERNS:
+                    if pat in stdout_lower:
+                        matched_pattern = pat
+                        break
+
+            if matched_pattern:
+                status = "failed"
+                exit_code = -1
+                error_msg = f"Output validation guard failed: agent reported missing attachment ('{matched_pattern}')"
+                logger.error(f"Job {job_id} output validation guard failed: {error_msg}")
+            else:
+                try:
+                    parsed = json.loads(stdout_str)
+                    if isinstance(parsed, dict):
+                        if agent_name == "agy":
+                            answer = parsed.get("response")
+                            if answer is not None:
+                                stdout_str = str(answer)
+                            usage = parsed.get("usage") or {}
+                            input_tokens = usage.get("input_tokens")
+                            output_tokens = usage.get("output_tokens")
+                            cached_tokens = usage.get("cache_read_tokens") or usage.get("cache_read_input_tokens")
+                            total_tokens = usage.get("total_tokens") or (
+                                (input_tokens or 0) + (output_tokens or 0)
+                            )
+                            cost_usd = None
+                        elif agent_name == "claude":
+                            answer = parsed.get("result")
+                            if answer is not None:
+                                stdout_str = str(answer)
+                            usage = parsed.get("usage") or {}
+                            input_tokens = usage.get("input_tokens")
+                            output_tokens = usage.get("output_tokens")
+                            cached_tokens = usage.get("cache_read_input_tokens") or usage.get("cache_read_tokens")
+                            total_tokens = (input_tokens or 0) + (output_tokens or 0)
+                            if cached_tokens:
+                                total_tokens += cached_tokens
+                            cost_usd = parsed.get("total_cost_usd")
+                    logger.info(
+                        f"Job {job_id} parsed tokens for agent {agent_name}: input={input_tokens}, output={output_tokens}, "
+                        f"total={total_tokens}, cost={cost_usd}, new_stdout_len={len(stdout_str)}"
+                    )
+                except Exception as parse_err:
+                    logger.warning(f"Job {job_id} stdout JSON parse fallback: {parse_err}")
 
         else:
             status = "failed"
@@ -328,7 +392,18 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
 
     finally:
         ACTIVE_PROCESSES.pop(job_id, None)
-        should_keep = settings.keep_workspace_on_failure and status == "failed"
+        # Defer workspace deletion if job will be retried (F1)
+        attempts = job.get("attempts", 1)
+        max_attempts = settings.max_attempts
+        is_rate_limit = is_rate_limit_error(
+            stdout=stdout_str,
+            stderr=stderr_str,
+            error=error_msg,
+            exit_code=exit_code,
+        )
+        will_retry = is_rate_limit and (attempts < max_attempts)
+
+        should_keep = (settings.keep_workspace_on_failure and status == "failed") or will_retry
         if not should_keep:
             if os.path.exists(workspace_path):
                 shutil.rmtree(workspace_path, ignore_errors=True)
@@ -349,5 +424,3 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         cost_usd=cost_usd,
     )
     return result
-
-
