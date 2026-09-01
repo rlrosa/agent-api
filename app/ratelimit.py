@@ -18,9 +18,16 @@ def is_rate_limit_error(
     if exit_code == 429:
         return True
 
+    # Governing Principle: exit_code 0 plus usable stdout means the job SUCCEEDED.
+    # Rate-limit classification must never override a successful run with non-empty stdout.
+    if exit_code == 0 and stdout and stdout.strip():
+        return False
+
+    # For failed or un-exited runs (exit_code != 0 or exit_code is None), check stdout/stderr/error against rate limit patterns
     text_to_check = f"{stdout or ''}\n{stderr or ''}\n{error or ''}"
     if not text_to_check.strip():
         return False
+
 
     settings = get_settings()
     for pattern in settings.rate_limit_patterns:
@@ -28,6 +35,7 @@ def is_rate_limit_error(
             return True
 
     return False
+
 
 
 class RateLimitManager:

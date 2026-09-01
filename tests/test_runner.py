@@ -224,4 +224,30 @@ async def test_sweep_orphaned_workspaces(tmp_env):
     assert os.path.exists(ws3), "Recent workspace must be preserved"
 
 
+def test_rate_limit_exit0_with_stderr_warning_is_not_rate_limited():
+    from app.ratelimit import is_rate_limit_error
+
+    # Case 1: Process succeeded (exit 0) with valid extraction JSON in stdout, but stderr has rate limit noise
+    stdout_json = '{"is_receipt": true, "payee": "Test Payee S.R.L.", "amount": 4830, "currency": "$UY"}'
+    stderr_warning = "HTTP 429: Too Many Requests encountered during subagent execution; retrying..."
+
+    is_rl = is_rate_limit_error(
+        stdout=stdout_json,
+        stderr=stderr_warning,
+        error=None,
+        exit_code=0,
+    )
+    assert is_rl is False, "Exit code 0 with usable stdout MUST NOT be classified as rate-limited error"
+
+    # Case 2: Process failed (exit 1) with rate limit noise in stderr -> SHOULD be classified as rate-limited
+    is_rl_failed = is_rate_limit_error(
+        stdout="",
+        stderr=stderr_warning,
+        error="Process exited with exit code 1",
+        exit_code=1,
+    )
+    assert is_rl_failed is True, "Failed exit code with rate limit stderr MUST be classified as rate-limited error"
+
+
+
 

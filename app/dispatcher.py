@@ -114,7 +114,10 @@ async def _worker_loop(worker_id: int) -> None:
                         f"stderr_len={len(stderr or '')}, error={error}"
                     )
 
-                    if is_rate_limit_error(stdout=stdout, stderr=stderr, error=error, exit_code=exit_code):
+                    if res_status == "completed":
+                        await rate_limit_manager.handle_success()
+                        await resolve_waiters(job["id"], res)
+                    elif is_rate_limit_error(stdout=stdout, stderr=stderr, error=error, exit_code=exit_code):
                         attempts = job.get("attempts", 1)
                         if attempts < settings.max_attempts:
                             delay = await rate_limit_manager.handle_rate_limit(attempts)
@@ -129,15 +132,17 @@ async def _worker_loop(worker_id: int) -> None:
                             res_failed = finish_job(
                                 job["id"],
                                 status="failed",
+                                exit_code=exit_code if exit_code is not None else -1,
+                                stdout=stdout,
+                                stderr=stderr,
                                 error=fail_err,
                                 db_path=settings.db_path,
                             )
                             logger.error(f"Job {job['id']} failed: {fail_err}")
                             await resolve_waiters(job["id"], res_failed or res)
                     else:
-                        if res and res.get("status") == "completed":
-                            await rate_limit_manager.handle_success()
                         await resolve_waiters(job["id"], res)
+
                 except Exception as exc:
                     logger.error(f"Worker {worker_id} error executing job {job['id']}: {exc}", exc_info=True)
             else:
