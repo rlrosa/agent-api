@@ -7,9 +7,9 @@ from app.ratelimit import is_rate_limit_error, rate_limit_manager
 def test_rate_limit_classifier():
     assert is_rate_limit_error(error="HTTP 429 Too Many Requests")
     assert is_rate_limit_error(stderr="Error: rate limit exceeded for model")
-    assert is_rate_limit_error(stdout="QuotaFailure: RESOURCE_EXHAUSTED")
+    assert is_rate_limit_error(stdout='{"status": "ERROR", "error": "QuotaFailure: RESOURCE_EXHAUSTED"}')
     assert is_rate_limit_error(exit_code=429)
-    assert not is_rate_limit_error(stdout="All good", stderr="", exit_code=0)
+    assert not is_rate_limit_error(stdout='{"status": "SUCCESS", "response": "All good"}', stderr="", exit_code=0)
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,9 @@ from app.config import get_settings
 logger = logging.getLogger("agent-api.ratelimit")
 
 
+import json
+
+
 def is_rate_limit_error(
     stdout: Optional[str] = None,
     stderr: Optional[str] = None,
@@ -18,22 +21,36 @@ def is_rate_limit_error(
     if exit_code == 429:
         return True
 
-    # Governing Principle: exit_code 0 plus usable stdout means the job SUCCEEDED.
-    # Rate-limit classification must never override a successful run with non-empty stdout.
+    # Layer 1: Governing Principle — exit_code 0 with non-empty stdout means SUCCESS.
     if exit_code == 0 and stdout and stdout.strip():
         return False
 
-    # For failed or un-exited runs (exit_code != 0 or exit_code is None), check stdout/stderr/error against rate limit patterns.
-    # Bare "429" is safely bounded with r"\b429\b" so address numbers like "AV ITALIA 4429" never trigger false matches.
-    text_to_check = f"{stdout or ''}\n{stderr or ''}\n{error or ''}"
+    # Layer 2 & 3: Structured JSON Envelope Inspection.
+    # CRITICAL AUDIT RULE: NEVER regex-scan the `response` field in stdout.
+    # The `response` field contains user payload (OCR text, item prices like "$ 429,00", street addresses like "AV ITALIA 4429", RUTs).
+    stdout_envelope_text = ""
+    if stdout and stdout.strip():
+        try:
+            parsed = json.loads(stdout.strip())
+            if isinstance(parsed, dict):
+                # Layer 2: If JSON envelope status is SUCCESS -> not rate-limited
+                if parsed.get("status") == "SUCCESS":
+                    return False
+                # Layer 3: Strip `response` payload before inspecting envelope metadata
+                envelope_copy = {k: v for k, v in parsed.items() if k != "response"}
+                stdout_envelope_text = json.dumps(envelope_copy)
+        except Exception:
+            # Layer 5: Unparseable stdout (CLI crash path) -> do NOT use raw stdout; fall back to stderr/error scan
+            stdout_envelope_text = ""
+
+    # Layer 4: Apply rate limit regex patterns ONLY to stderr, error, and stdout envelope metadata (excluding response payload).
+    text_to_check = f"{stdout_envelope_text}\n{stderr or ''}\n{error or ''}"
     if not text_to_check.strip():
         return False
 
     settings = get_settings()
     for pattern in settings.rate_limit_patterns:
-        # Avoid bare "429" matching embedded numbers inside text (e.g., "4429"); require word boundaries
-        effective_pattern = r"\b429\b" if pattern == r"429" else pattern
-        if re.search(effective_pattern, text_to_check, re.IGNORECASE):
+        if re.search(pattern, text_to_check, re.IGNORECASE):
             return True
 
     return False

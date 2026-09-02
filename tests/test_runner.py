@@ -252,21 +252,58 @@ def test_rate_limit_exit0_with_stderr_warning_is_not_rate_limited():
 def test_av_italia_4429_ocr_address_is_not_rate_limited():
     from app.ratelimit import is_rate_limit_error
 
-    # Alad Alfombras receipt containing street address "AV ITALIA 4429" inside stdout
-    stdout_alad = '''{
-        "is_receipt": true,
-        "payee": "Alad Alfombras S.R.L.",
-        "address": "AV ITALIA 4429",
-        "amount": 4830,
-        "currency": "$UY"
-    }'''
+    # Alad Alfombras receipt containing street address "AV ITALIA 4429" inside stdout envelope
+    stdout_alad_envelope = json.dumps({
+        "status": "SUCCESS",
+        "response": '{"is_receipt": true, "payee": "Alad Alfombras S.R.L.", "address": "AV ITALIA 4429", "amount": 4830, "currency": "$UY"}'
+    })
 
     # Test Case A: Exit 0 run
-    assert is_rate_limit_error(stdout=stdout_alad, stderr="", exit_code=0) is False
+    assert is_rate_limit_error(stdout=stdout_alad_envelope, stderr="", exit_code=0) is False
 
-    # Test Case B: Failed exit run where stdout happens to be passed in text_to_check
-    # Ensure "4429" in stdout is NEVER matched as a rate limit error even if exit_code != 0
-    assert is_rate_limit_error(stdout=stdout_alad, stderr="Compilation error in step 2", exit_code=1) is False
+    # Test Case B: Non-zero exit code with SUCCESS envelope status
+    assert is_rate_limit_error(stdout=stdout_alad_envelope, stderr="Warning notice", exit_code=1) is False
+
+
+def test_price_429_in_response_payload_is_never_rate_limited():
+    from app.ratelimit import is_rate_limit_error
+
+    # Receipt with item price $ 429,00 or VERDULERIA 429 inside response payload
+    stdout_price_429 = json.dumps({
+        "status": "SUCCESS",
+        "response": "TOTAL $ 429,00\nVERDULERIA 429"
+    })
+
+    # Test Case 1: Exit 0 run
+    assert is_rate_limit_error(stdout=stdout_price_429, stderr="", exit_code=0) is False
+
+    # Test Case 2: Exit 1 run (response payload must be excluded from pattern scanning)
+    assert is_rate_limit_error(stdout=stdout_price_429, stderr="Warning: step took 4s", exit_code=1) is False
+
+
+def test_genuine_rate_limit_is_detected():
+    from app.ratelimit import is_rate_limit_error
+
+    # Genuine rate limit in stderr
+    assert is_rate_limit_error(stdout="", stderr="HTTP 429: Too Many Requests", exit_code=1) is True
+
+    # Genuine rate limit in envelope error metadata
+    stdout_err_envelope = json.dumps({
+        "status": "ERROR",
+        "error": "RESOURCE_EXHAUSTED: Rate limit exceeded for model"
+    })
+    assert is_rate_limit_error(stdout=stdout_err_envelope, stderr="", exit_code=1) is True
+
+
+def test_unparseable_stdout_falls_back_safely():
+    from app.ratelimit import is_rate_limit_error
+
+    # Unparseable CLI crash output with non-rate-limit error
+    assert is_rate_limit_error(stdout="Fatal crash: Segmentation fault (core dumped)", stderr="Process aborted", exit_code=139) is False
+
+    # Unparseable CLI crash output with genuine rate limit in stderr
+    assert is_rate_limit_error(stdout="Fatal crash: Segmentation fault", stderr="Error: 429 Too Many Requests", exit_code=1) is True
+
 
 
 
