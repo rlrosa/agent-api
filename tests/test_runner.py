@@ -304,6 +304,16 @@ def test_unparseable_stdout_falls_back_safely():
     # Unparseable CLI crash output with genuine rate limit in stderr
     assert is_rate_limit_error(stdout="Fatal crash: Segmentation fault", stderr="Error: 429 Too Many Requests", exit_code=1) is True
 
+    # Choice (b) Assertion: stdout='not json 429', stderr='', exit_code=1 -> returns True
+    assert is_rate_limit_error(stdout="not json 429", stderr="", exit_code=1) is True
+
+    # Choice (b) Edge Case: stdout='not json 429', stderr='', exit_code=0 -> returns False (Layer 1 exit-0 success short-circuit)
+    assert is_rate_limit_error(stdout="not json 429", stderr="", exit_code=0) is False
+
+    # Choice (b) Edge Case: stdout='not json 4429', stderr='', exit_code=1 -> returns False (word-bounded 429 pattern)
+    assert is_rate_limit_error(stdout="not json 4429", stderr="", exit_code=1) is False
+
+
 
 
 
