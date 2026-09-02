@@ -249,5 +249,26 @@ def test_rate_limit_exit0_with_stderr_warning_is_not_rate_limited():
     assert is_rl_failed is True, "Failed exit code with rate limit stderr MUST be classified as rate-limited error"
 
 
+def test_av_italia_4429_ocr_address_is_not_rate_limited():
+    from app.ratelimit import is_rate_limit_error
+
+    # Alad Alfombras receipt containing street address "AV ITALIA 4429" inside stdout
+    stdout_alad = '''{
+        "is_receipt": true,
+        "payee": "Alad Alfombras S.R.L.",
+        "address": "AV ITALIA 4429",
+        "amount": 4830,
+        "currency": "$UY"
+    }'''
+
+    # Test Case A: Exit 0 run
+    assert is_rate_limit_error(stdout=stdout_alad, stderr="", exit_code=0) is False
+
+    # Test Case B: Failed exit run where stdout happens to be passed in text_to_check
+    # Ensure "4429" in stdout is NEVER matched as a rate limit error even if exit_code != 0
+    assert is_rate_limit_error(stdout=stdout_alad, stderr="Compilation error in step 2", exit_code=1) is False
+
+
+
 
 

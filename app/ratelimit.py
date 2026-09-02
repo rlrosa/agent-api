@@ -23,18 +23,21 @@ def is_rate_limit_error(
     if exit_code == 0 and stdout and stdout.strip():
         return False
 
-    # For failed or un-exited runs (exit_code != 0 or exit_code is None), check stdout/stderr/error against rate limit patterns
+    # For failed or un-exited runs (exit_code != 0 or exit_code is None), check stdout/stderr/error against rate limit patterns.
+    # Bare "429" is safely bounded with r"\b429\b" so address numbers like "AV ITALIA 4429" never trigger false matches.
     text_to_check = f"{stdout or ''}\n{stderr or ''}\n{error or ''}"
     if not text_to_check.strip():
         return False
 
-
     settings = get_settings()
     for pattern in settings.rate_limit_patterns:
-        if re.search(pattern, text_to_check, re.IGNORECASE):
+        # Avoid bare "429" matching embedded numbers inside text (e.g., "4429"); require word boundaries
+        effective_pattern = r"\b429\b" if pattern == r"429" else pattern
+        if re.search(effective_pattern, text_to_check, re.IGNORECASE):
             return True
 
     return False
+
 
 
 
