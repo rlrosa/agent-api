@@ -294,7 +294,7 @@ curl -s -X POST http://192.168.87.132:8090/v1/jobs \
 - **Trusted Network Auth Bypass & Tunnel Protection**:
   - Requests from raw peer socket IPs matching `TRUSTED_NETWORKS` (`127.0.0.1/32`, `::1/128`, `127.0.0.0/8`) bypass API key authentication. Adding subnets to `TRUSTED_NETWORKS` grants those networks full auth bypass.
   - Any request carrying Cloudflare Tunnel headers (`CF-Connecting-IP`, `CF-Ray`, `CF-Visitor`) **always requires the API key**, preventing public internet bypass over local tunnel proxies even on loopback connections.
-- **Zero Bypass Flags**: `--dangerously-skip-permissions` is completely removed from all execution code paths.
+- **Agy Sandbox Flags (operator-configurable)**: Flags passed to `agy` come from `AGY_SANDBOX_FLAGS`; the effective default is `--sandbox`. `--dangerously-skip-permissions` is supported but auto-approves every agent tool request. The job sandbox bind-mounts `~/.gemini` read-only and permits outbound network, so enabling it widens the prompt-injection exposure recorded as F5 in `doc/security-review-2026-08-10.md`. Accepted by the operator on the basis that the exposed credential is a subscription-scoped OAuth token.
 - **Per-Job Attachment Isolation**: Attachments are stored in isolated per-job directories (`<work_root>/<job_id>/attachments/`) and passed via explicit absolute paths, preventing cross-job contamination.
 - **Environment Scrubbing**: Sensitive environment variables (`API_KEY`, secret tokens, credentials) are stripped before subprocess spawning; only essential variables (`HOME`, `PATH`) pass through.
 

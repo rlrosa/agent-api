@@ -28,7 +28,7 @@ class Settings(BaseModel):
     passthrough_env: str = Field(default="")
     keep_workspace_on_failure: bool = Field(default=False)
     sandbox_enabled: bool = Field(default=True)
-    agy_sandbox_flags: str = Field(default="--sandbox")
+    agy_sandbox_flags: str = Field(default="--sandbox --dangerously-skip-permissions")
     claude_disallowed_tools: str = Field(default="Bash,WebFetch")
     rate_limit_patterns: List[str] = Field(
         default_factory=lambda: [
