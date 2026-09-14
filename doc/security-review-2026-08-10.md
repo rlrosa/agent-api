@@ -167,9 +167,9 @@ the token file's presence and mode by directory listing (contents deliberately n
 **Evidence:** `evidence/06-bwrap-argv.txt` (real constructed argv),
 `evidence/10-gemini-credentials-mount.txt` (file listing, no secret values)
 
-**Operator decision (2026-09-06).** The residual risk is accepted: the credential exposed on the `agy` path is a subscription-scoped OAuth token, whose worst-case abuse is consumption of the monthly subscription. On that basis `--dangerously-skip-permissions` was added to the `agy_sandbox_flags` field default. Note two things the decision did not cover: `~/.gemini/antigravity-cli/history.jsonl` (the operator's own interactive prompt history) is readable inside the sandbox alongside the token, and the field default is shadowed by `get_settings()` — see the note below.
+**Operator decision (2026-09-06).** The residual risk is accepted: the credential exposed on the `agy` path is a subscription-scoped OAuth token, whose worst-case abuse is consumption of the monthly subscription. On that basis `--dangerously-skip-permissions` can be added via `AGENT_FLAGS_AGY` (e.g. `AGENT_FLAGS_AGY="--sandbox --dangerously-skip-permissions"`). Note: `~/.gemini/antigravity-cli/history.jsonl` (the operator's own interactive prompt history) is readable inside the sandbox alongside the token. Legacy `AGY_SANDBOX_FLAGS` is deprecated and ignored.
 
-**The committed flag is currently inert.** `config.py` sets the field default *and* passes an explicit `os.environ.get("AGY_SANDBOX_FLAGS", "--sandbox")`, and the latter wins. Verified by calling the real builder: the flag does not appear in argv. To make it effective, either set `AGY_SANDBOX_FLAGS` in `~/.config/agent-api/env` or change the fallback on `config.py:97`.
+**Per-Agent Operator Flags.** Default flags live in `AgentSpec.default_flags` in `app/agents.py`, and operators can configure per-agent flag overrides via `AGENT_FLAGS_<NAME>` environment variables (e.g. `AGENT_FLAGS_AGY="--sandbox --dangerously-skip-permissions"`). Overriding `AGENT_FLAGS_<NAME>` replaces default flags entirely.
 
 **Recommendation.** Mount only what each CLI needs to authenticate, never a whole credential
 directory — bind the specific token file, or better, hand the agent a short-lived scoped

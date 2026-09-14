@@ -114,10 +114,10 @@ Tracked in `doc/security-review-2026-08-10.md`. Fixed: F1, F2, F4, F8. Still ope
 - **F5 (High, risk accepted)** — the host's `~/.gemini` is bind-mounted read-only into the sandbox,
   so `antigravity-oauth-token` *and* `history.jsonl` are readable by a prompt-injected job on the
   default `agy` path, which also has outbound network and whose output is returned to the caller.
-  The operator accepted this (2026-09-06) on the basis that the token is subscription-scoped, and
-  added `--dangerously-skip-permissions` to the `agy_sandbox_flags` field default. **That flag is
-  inert as committed** — `get_settings()` shadows the field default. Do not "fix" the shadowing
-  without realising it switches the flag on for every agy job.
+  The operator accepted this (2026-09-06) on the basis that the token is subscription-scoped.
+  The shipped default flags (`--sandbox` for `agy`) live in `AgentSpec.default_flags` in `app/agents.py`,
+  and operators can configure per-agent flag overrides via `AGENT_FLAGS_<NAME>` environment variables
+  (e.g., `AGENT_FLAGS_AGY="--sandbox --dangerously-skip-permissions"`). Legacy `AGY_SANDBOX_FLAGS` is deprecated and ignored.
 - **F6 (Medium)** — `EGRESS_RESTRICT` is documented as the mitigation for the project's own top
   accepted risk and is read nowhere; `--share-net` is unconditional.
 - **F7 (Low)** — `CLAUDE_DISALLOWED_TOOLS` is ignored; `build_claude_argv` hardcodes

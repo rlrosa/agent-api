@@ -1,7 +1,9 @@
+import logging
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
+logger = logging.getLogger("agent-api.config")
 
 
 class Settings(BaseModel):
@@ -28,7 +30,7 @@ class Settings(BaseModel):
     passthrough_env: str = Field(default="")
     keep_workspace_on_failure: bool = Field(default=False)
     sandbox_enabled: bool = Field(default=True)
-    agy_sandbox_flags: str = Field(default="--sandbox --dangerously-skip-permissions")
+    agent_flags: Dict[str, str] = Field(default_factory=dict)
     claude_disallowed_tools: str = Field(default="Bash,WebFetch")
     rate_limit_patterns: List[str] = Field(
         default_factory=lambda: [
@@ -72,6 +74,15 @@ def get_settings() -> Settings:
     except ValueError:
         job_retention_days = 30
 
+    if "AGY_SANDBOX_FLAGS" in os.environ:
+        logger.warning("AGY_SANDBOX_FLAGS is deprecated and ignored; use AGENT_FLAGS_AGY instead")
+
+    agent_flags: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key.startswith("AGENT_FLAGS_"):
+            agent_name = key[len("AGENT_FLAGS_"):].lower()
+            agent_flags[agent_name] = value
+
     return Settings(
         api_key=api_key,
         host=os.environ.get("HOST", "0.0.0.0"),
@@ -94,7 +105,7 @@ def get_settings() -> Settings:
         passthrough_env=os.environ.get("PASSTHROUGH_ENV", ""),
         keep_workspace_on_failure=os.environ.get("KEEP_WORKSPACE_ON_FAILURE", "0").lower() in ("1", "true", "yes"),
         sandbox_enabled=os.environ.get("SANDBOX_ENABLED", "1").lower() in ("1", "true", "yes"),
-        agy_sandbox_flags=os.environ.get("AGY_SANDBOX_FLAGS", "--sandbox"),
+        agent_flags=agent_flags,
         claude_disallowed_tools=os.environ.get("CLAUDE_DISALLOWED_TOOLS", "Bash,WebFetch"),
         recover_successes=int(os.environ.get("RECOVER_SUCCESSES", "3")),
         allow_mock_agent=os.environ.get("ALLOW_MOCK_AGENT", "0").lower() in ("1", "true", "yes"),
