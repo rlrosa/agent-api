@@ -294,7 +294,7 @@ curl -s -X POST http://192.168.87.132:8090/v1/jobs \
 - **Trusted Network Auth Bypass & Tunnel Protection**:
   - Requests from raw peer socket IPs matching `TRUSTED_NETWORKS` (`127.0.0.1/32`, `::1/128`, `127.0.0.0/8`) bypass API key authentication. Adding subnets to `TRUSTED_NETWORKS` grants those networks full auth bypass.
   - Any request carrying Cloudflare Tunnel headers (`CF-Connecting-IP`, `CF-Ray`, `CF-Visitor`) **always requires the API key**, preventing public internet bypass over local tunnel proxies even on loopback connections.
-- **Zero Bypass Flags**: `--dangerously-skip-permissions` is completely removed from all execution code paths.
+- **Per-Agent Operator Flags (operator-configurable)**: Flags passed to CLI agents come from generic `AGENT_FLAGS_<NAME>` environment variables (`AGENT_FLAGS_AGY`, `AGENT_FLAGS_CLAUDE`). Defaults are configured per agent spec (`--sandbox` for `agy`; `--allowed-tools View,Read --permission-mode dontAsk` for `claude`). Overriding `AGENT_FLAGS_<NAME>` replaces default flags entirely. Note: overriding `AGENT_FLAGS_CLAUDE` without `--allowed-tools` drops claude's default tool restrictions. Legacy `AGY_SANDBOX_FLAGS` is deprecated and ignored.
 - **Per-Job Attachment Isolation**: Attachments are stored in isolated per-job directories (`<work_root>/<job_id>/attachments/`) and passed via explicit absolute paths, preventing cross-job contamination.
 - **Environment Scrubbing**: Sensitive environment variables (`API_KEY`, secret tokens, credentials) are stripped before subprocess spawning; only essential variables (`HOME`, `PATH`) pass through.
 

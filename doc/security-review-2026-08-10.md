@@ -167,6 +167,10 @@ the token file's presence and mode by directory listing (contents deliberately n
 **Evidence:** `evidence/06-bwrap-argv.txt` (real constructed argv),
 `evidence/10-gemini-credentials-mount.txt` (file listing, no secret values)
 
+**Operator decision (2026-09-06).** The residual risk is accepted: the credential exposed on the `agy` path is a subscription-scoped OAuth token, whose worst-case abuse is consumption of the monthly subscription. On that basis `--dangerously-skip-permissions` can be added via `AGENT_FLAGS_AGY` (e.g. `AGENT_FLAGS_AGY="--sandbox --dangerously-skip-permissions"`). Note: `~/.gemini/antigravity-cli/history.jsonl` (the operator's own interactive prompt history) is readable inside the sandbox alongside the token. Legacy `AGY_SANDBOX_FLAGS` is deprecated and ignored.
+
+**Per-Agent Operator Flags.** Default flags live in `AgentSpec.default_flags` in `app/agents.py`, and operators can configure per-agent flag overrides via `AGENT_FLAGS_<NAME>` environment variables (e.g. `AGENT_FLAGS_AGY="--sandbox --dangerously-skip-permissions"`). Overriding `AGENT_FLAGS_<NAME>` replaces default flags entirely.
+
 **Recommendation.** Mount only what each CLI needs to authenticate, never a whole credential
 directory — bind the specific token file, or better, hand the agent a short-lived scoped
 credential rather than the host's own. `doc/security.md:38-40` already accepts prompt-injection

@@ -179,5 +179,47 @@ def test_fuzzy_model_and_effort_resolution():
     assert "--effort" not in agy_default_argv  # agy effort is omitted when unspecified
 
 
+def test_agent_flags_resolution(caplog):
+    from app.agents import build_agy_argv, build_claude_argv, get_agent_flags
+    from app.config import get_settings
+
+    # 1. Default argv unchanged
+    agy_default = build_agy_argv("P", workspace_path="/ws")
+    assert agy_default == ['agy', '-p', 'P', '--model', 'gemini-3.6-flash-low', '--sandbox', '--add-dir', '/ws', '--output-format', 'json']
+
+    claude_default = build_claude_argv("P")
+    assert claude_default == ['claude', '-p', '--allowed-tools', 'View,Read', '--permission-mode', 'dontAsk', '--output-format', 'json']
+
+    # 2. Operator override replaces spec default
+    os.environ["AGENT_FLAGS_CLAUDE"] = "--allowed-tools Read"
+    try:
+        claude_override = build_claude_argv("P")
+        assert claude_override == ['claude', '-p', '--allowed-tools', 'Read', '--output-format', 'json']
+    finally:
+        os.environ.pop("AGENT_FLAGS_CLAUDE", None)
+
+    # 3. Dropped --sandbox footgun
+    os.environ["AGENT_FLAGS_AGY"] = "--dangerously-skip-permissions"
+    try:
+        agy_override = build_agy_argv("P")
+        assert "--sandbox" not in agy_override
+        assert "--dangerously-skip-permissions" in agy_override
+    finally:
+        os.environ.pop("AGENT_FLAGS_AGY", None)
+
+    # 4. Ignored old variable (AGY_SANDBOX_FLAGS) warning
+    os.environ["AGY_SANDBOX_FLAGS"] = "--dangerously-skip-permissions"
+    try:
+        import logging
+        with caplog.at_level(logging.WARNING):
+            settings = get_settings()
+            agy_argv = build_agy_argv("P")
+            assert "--sandbox" in agy_argv
+            assert "--dangerously-skip-permissions" not in agy_argv
+            assert "AGY_SANDBOX_FLAGS is deprecated and ignored" in caplog.text
+    finally:
+        os.environ.pop("AGY_SANDBOX_FLAGS", None)
+
+
 
 

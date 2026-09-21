@@ -14,6 +14,7 @@ class AgentSpec(BaseModel):
     prompt_delivery: str  # "argv" or "stdin"
     supports_model_flag: bool
     default_model: Optional[str] = None
+    default_flags: str = ""
 
 
 VALID_AGY_MODELS = [
@@ -104,6 +105,20 @@ def validate_agent_model(agent: str, model: Optional[str]) -> str:
     return resolve_model(agent, model)
 
 
+def get_agent_flags(agent_name: str) -> List[str]:
+    settings = get_settings()
+    if not settings.sandbox_enabled:
+        return []
+
+    if agent_name in settings.agent_flags:
+        flags_str = settings.agent_flags[agent_name]
+    else:
+        spec = AGENTS.get(agent_name, {}).get("spec")
+        flags_str = spec.default_flags if spec else ""
+
+    return [f for f in flags_str.split() if f]
+
+
 def build_agy_argv(
     prompt: str,
     model: Optional[str] = None,
@@ -120,11 +135,7 @@ def build_agy_argv(
     if effort:
         cmd.extend(["--effort", eff])
 
-    settings = get_settings()
-    if settings.sandbox_enabled and settings.agy_sandbox_flags:
-        for flag in settings.agy_sandbox_flags.split():
-            if flag:
-                cmd.append(flag)
+    cmd.extend(get_agent_flags("agy"))
 
     if workspace_path:
         cmd.extend(["--add-dir", workspace_path])
@@ -153,9 +164,7 @@ def build_claude_argv(
         resolved_eff = resolve_effort(effort)
         cmd.extend(["--effort", resolved_eff])
 
-    if settings.sandbox_enabled:
-        cmd.extend(["--allowed-tools", "View,Read"])
-        cmd.extend(["--permission-mode", "dontAsk"])
+    cmd.extend(get_agent_flags("claude"))
 
     cmd.extend(["--output-format", "json"])
     return cmd
@@ -179,6 +188,7 @@ AGENTS: Dict[str, Dict] = {
             prompt_delivery="argv",
             supports_model_flag=True,
             default_model=None,
+            default_flags="--sandbox",
         ),
         "argv_builder": build_agy_argv,
     },
@@ -189,6 +199,7 @@ AGENTS: Dict[str, Dict] = {
             prompt_delivery="stdin",
             supports_model_flag=True,
             default_model=None,
+            default_flags="--allowed-tools View,Read --permission-mode dontAsk",
         ),
         "argv_builder": build_claude_argv,
     },
@@ -199,6 +210,7 @@ AGENTS: Dict[str, Dict] = {
             prompt_delivery="argv",
             supports_model_flag=False,
             default_model=None,
+            default_flags="",
         ),
         "argv_builder": build_codex_argv,
     },
@@ -209,6 +221,7 @@ AGENTS: Dict[str, Dict] = {
             prompt_delivery="argv",
             supports_model_flag=False,
             default_model=None,
+            default_flags="",
         ),
         "argv_builder": None,
     },
