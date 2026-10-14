@@ -106,6 +106,18 @@ re-opens it.
 - **The job's own output is an exfiltration channel.** `stdout`/`stderr` are columns on the job row
   and are returned to the caller. Anything the agent can read, it can return. Egress filtering does
   not close that path.
+- **`agy` 1.3.5 model and effort contract.** In `agy` 1.3.5, combining a tiered model name
+  (e.g., `gemini-3.8-flash-low`) with a non-matching `--effort` is a hard error (exit 1).
+  `build_agy_argv` enforces conflict-free emission: when `--effort` is explicitly supplied, any
+  trailing `-low`/`-medium`/`-high` suffix is stripped from the model name before emission. Bare base
+  names (e.g., `gemini-3.8-flash`, `gemini-4-argon`, `claude-sonnet-5-5`, `gpt-oss-120b`) are valid at
+  runtime even though `agy models` lists only tiered names. Additionally, global `agy --help` advertises
+  `xhigh` and `max` efforts, but every current model rejects them (exit 1), so supported efforts remain
+  `low|medium|high`. Note also that the `agy` allowlist reaches `claude-opus-5-5` and `gemini-4-argon`,
+  which are significantly more expensive than the gemini-flash default, and fuzzy resolution can land
+  a caller on one of them if similar names are requested. The cheapest-first ordering of both model lists
+  (`VALID_AGY_MODELS` and `VALID_CLAUDE_MODELS`) is load-bearing for cost safety: `resolve_model` uses a
+  cheapest-wins tie-break among candidates scoring within 0.10 of the best fuzzy match.
 
 ## Open findings
 

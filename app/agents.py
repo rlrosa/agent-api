@@ -17,12 +17,36 @@ class AgentSpec(BaseModel):
     default_flags: str = ""
 
 
+# Note: The ordering of VALID_AGY_MODELS and VALID_CLAUDE_MODELS is load-bearing
+# for cost safety. Ambiguous inputs scoring within 0.10 of the best fuzzy match
+# resolve to whichever candidate appears earliest in these lists (cheapest-first).
 VALID_AGY_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-3.6-flash-low",
-    "gemini-3.6-flash-medium",
-    "gemini-3.6-flash-high",
+    "gemini-3.8-flash",
+    "gemini-3.8-flash-low",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-high",
+    "gemini-4-argon",
+    "gemini-4-argon-low",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-high",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5-5-low",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-high",
+    "claude-opus-5-5",
+    "claude-opus-5-5-low",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-high",
+    "gpt-oss-120b",
+    "gpt-oss-120b-medium",
 ]
+
+LEGACY_AGY_MODEL_ALIASES = {
+    "gemini-3.6-flash": "gemini-3.8-flash",
+    "gemini-3.6-flash-low": "gemini-3.8-flash-low",
+    "gemini-3.6-flash-medium": "gemini-3.8-flash-medium",
+    "gemini-3.6-flash-high": "gemini-3.8-flash-high",
+}
 
 VALID_CLAUDE_MODELS = [
     "claude-haiku-4-5",
@@ -46,7 +70,7 @@ def resolve_model(agent: str, raw_model: Optional[str]) -> str:
     settings = get_settings()
     if agent == "agy":
         supported = VALID_AGY_MODELS
-        default = settings.agy_default_model or "gemini-3.6-flash"
+        default = settings.agy_default_model or "gemini-3.8-flash-low"
     elif agent == "claude":
         supported = VALID_CLAUDE_MODELS
         default = settings.claude_default_model or "claude-sonnet-5"
@@ -61,18 +85,35 @@ def resolve_model(agent: str, raw_model: Optional[str]) -> str:
 
     raw = raw_model.strip()
 
+    # Legacy back-compat alias mapping (applied BEFORE exact and fuzzy matching)
+    if agent == "agy":
+        for legacy_k, legacy_v in LEGACY_AGY_MODEL_ALIASES.items():
+            if raw.lower() == legacy_k.lower():
+                logger.info(f"Legacy agy model alias: requested '{raw}' -> aliased '{legacy_v}'")
+                return legacy_v
+
     # Exact match check (case-insensitive)
     for s in supported:
         if s.lower() == raw.lower():
             return s
 
-    # Fuzzy match using stdlib difflib (cutoff = 0.4 for reasonable similarity)
-    matches = difflib.get_close_matches(raw.lower(), [s.lower() for s in supported], n=1, cutoff=0.4)
-    if matches:
-        matched_lower = matches[0]
+    # Fuzzy match with cheapest-wins tie-break (cutoff = 0.40)
+    # Collect all candidates scoring >= 0.40, then pick the earliest in supported
+    # list among those within 0.10 of the best score.
+    scored = []
+    raw_lower = raw.lower()
+    for s in supported:
+        score = difflib.SequenceMatcher(None, raw_lower, s.lower()).ratio()
+        if score >= 0.40:
+            scored.append((s, score))
+
+    if scored:
+        best_score = max(score for _, score in scored)
+        threshold = best_score - 0.10
         for s in supported:
-            if s.lower() == matched_lower:
-                return s
+            for cand, score in scored:
+                if cand == s and score >= threshold:
+                    return cand
 
     # Safe fallback: no match or poor match lands on default model
     return default
@@ -119,6 +160,13 @@ def get_agent_flags(agent_name: str) -> List[str]:
     return [f for f in flags_str.split() if f]
 
 
+def strip_model_tier(model_name: str) -> str:
+    for suffix in ("-low", "-medium", "-high"):
+        if model_name.endswith(suffix):
+            return model_name[:-len(suffix)]
+    return model_name
+
+
 def build_agy_argv(
     prompt: str,
     model: Optional[str] = None,
@@ -128,12 +176,13 @@ def build_agy_argv(
     spec = AGENTS["agy"]["spec"]
     cmd = ["agy", "-p", prompt]
 
-    eff = resolve_effort(effort) if effort else "low"
-    selected_model = f"gemini-3.6-flash-{eff}"
-
-    cmd.extend(["--model", selected_model])
+    resolved_model = resolve_model("agy", model)
     if effort:
-        cmd.extend(["--effort", eff])
+        base = strip_model_tier(resolved_model)
+        resolved_eff = resolve_effort(effort)
+        cmd.extend(["--model", base, "--effort", resolved_eff])
+    else:
+        cmd.extend(["--model", resolved_model])
 
     cmd.extend(get_agent_flags("agy"))
 

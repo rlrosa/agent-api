@@ -149,13 +149,13 @@ def test_fuzzy_model_and_effort_resolution():
     assert resolve_effort("high") == "high"
 
     # 2. Near-miss resolution
-    assert resolve_model("agy", "gemini-3.6-flsh") == "gemini-3.6-flash"
+    assert resolve_model("agy", "gemini-3.8-flsh") == "gemini-3.8-flash"
     assert resolve_model("claude", "sonnet") == "claude-sonnet-5"
     assert resolve_effort("med") == "medium"
     assert resolve_effort("HIGH") == "high"
 
     # 3. Garbage -> Default
-    assert resolve_model("agy", "zzzzzz") == "gemini-3.6-flash"
+    assert resolve_model("agy", "zzzzzz") == "gemini-3.8-flash-low"
     assert resolve_model("claude", "zzzzzz") == "claude-sonnet-5"
     assert resolve_effort("zzzzzz") == "low"
 
@@ -163,7 +163,8 @@ def test_fuzzy_model_and_effort_resolution():
     agy_argv = build_agy_argv("test", model="--permission-mode", effort="--allowed-tools")
     claude_argv = build_claude_argv("test", model="--permission-mode", effort="--allowed-tools")
 
-    assert agy_argv[agy_argv.index("--model") + 1] == "gemini-3.6-flash-low"
+    # Deliberate accepted behaviour: --permission-mode lands on premium gemini-4-argon (ratio 0.474), ensuring flag string never reaches argv
+    assert agy_argv[agy_argv.index("--model") + 1] == "gemini-4-argon"
     assert agy_argv[agy_argv.index("--effort") + 1] == "low"
 
     assert claude_argv[claude_argv.index("--model") + 1] == "claude-sonnet-5"
@@ -179,13 +180,53 @@ def test_fuzzy_model_and_effort_resolution():
     assert "--effort" not in agy_default_argv  # agy effort is omitted when unspecified
 
 
+def test_fuzzy_model_cheapest_wins_tiebreak():
+    from app.agents import resolve_model
+
+    # Ambiguous inputs that score within 0.10 of a more expensive model resolve downward in cost
+    assert resolve_model("agy", "gemini") == "gemini-3.8-flash"  # not gemini-4-argon
+    assert resolve_model("agy", "claude") == "claude-sonnet-5-5"  # not claude-opus-5-5
+    assert resolve_model("agy", "flash") == "gemini-3.8-flash"
+    assert resolve_model("claude", "sonnet") == "claude-sonnet-5"
+    assert resolve_model("claude", "haiku") == "claude-haiku-4-5"
+    assert resolve_model("claude", "opus-5") == "claude-opus-5"
+    assert resolve_model("agy", "gemini-3.8-flsh") == "gemini-3.8-flash"
+
+
+def test_agy_38_migration_and_argv_resolution():
+    from app.agents import build_agy_argv, resolve_model
+
+    # 1. Legacy 3.6 -> 3.8 alias (all four names)
+    assert resolve_model("agy", "gemini-3.6-flash") == "gemini-3.8-flash"
+    assert resolve_model("agy", "gemini-3.6-flash-low") == "gemini-3.8-flash-low"
+    assert resolve_model("agy", "gemini-3.6-flash-medium") == "gemini-3.8-flash-medium"
+    assert resolve_model("agy", "gemini-3.6-flash-high") == "gemini-3.8-flash-high"
+
+    # Aliases produce expected argv
+    assert build_agy_argv("test", model="gemini-3.6-flash-low")[3:5] == ["--model", "gemini-3.8-flash-low"]
+    assert build_agy_argv("test", model="gemini-3.6-flash")[3:5] == ["--model", "gemini-3.8-flash"]
+    assert build_agy_argv("test", model="gemini-3.6-flash-medium")[3:5] == ["--model", "gemini-3.8-flash-medium"]
+    assert build_agy_argv("test", model="gemini-3.6-flash-high")[3:5] == ["--model", "gemini-3.8-flash-high"]
+
+    # 2. Caller model reaching argv (D2)
+    argv = build_agy_argv("test", model="gemini-3.8-flash-high")
+    assert argv[argv.index("--model") + 1] == "gemini-3.8-flash-high"
+    assert "--effort" not in argv
+
+    # 3. Tier-stripping when effort is supplied (D3)
+    argv_stripped = build_agy_argv("test", model="gemini-3.8-flash-low", effort="high")
+    assert argv_stripped[argv_stripped.index("--model") + 1] == "gemini-3.8-flash"
+    assert argv_stripped[argv_stripped.index("--effort") + 1] == "high"
+    assert "gemini-3.8-flash-low" not in argv_stripped
+
+
 def test_agent_flags_resolution(caplog):
     from app.agents import build_agy_argv, build_claude_argv, get_agent_flags
     from app.config import get_settings
 
     # 1. Default argv unchanged
     agy_default = build_agy_argv("P", workspace_path="/ws")
-    assert agy_default == ['agy', '-p', 'P', '--model', 'gemini-3.6-flash-low', '--sandbox', '--add-dir', '/ws', '--output-format', 'json']
+    assert agy_default == ['agy', '-p', 'P', '--model', 'gemini-3.8-flash-low', '--sandbox', '--add-dir', '/ws', '--output-format', 'json']
 
     claude_default = build_claude_argv("P")
     assert claude_default == ['claude', '-p', '--allowed-tools', 'View,Read', '--permission-mode', 'dontAsk', '--output-format', 'json']
