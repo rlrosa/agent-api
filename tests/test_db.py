@@ -30,7 +30,7 @@ def test_init_and_create_job(tmp_db_path):
     job = create_job(
         agent="agy",
         prompt="Hello world",
-        model="gemini-3.6-flash-low",
+        model="gemini-3.8-flash-low",
         metadata={"caller": "unit-test"},
         wait=60,
         timeout=120,
@@ -39,7 +39,7 @@ def test_init_and_create_job(tmp_db_path):
     assert job is not None
     assert job["agent"] == "agy"
     assert job["prompt"] == "Hello world"
-    assert job["model"] == "gemini-3.6-flash-low"
+    assert job["model"] == "gemini-3.8-flash-low"
     assert job["status"] == "pending"
     assert job["attempts"] == 0
     assert job["metadata"] == {"caller": "unit-test"}
