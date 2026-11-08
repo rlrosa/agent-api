@@ -125,6 +125,12 @@
         .log-warn { color: #fde047; }
         .log-error { color: var(--accent-red); }
         .log-debug { color: var(--text-muted); }
+
+        .btn-sm { padding: 4px 8px; font-size: 0.75rem; border-radius: 4px; }
+        .btn-danger { border-color: var(--accent-red); color: var(--accent-red); }
+        .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+        .badge-pending { background-color: rgba(56, 189, 248, 0.2); color: var(--accent-blue); }
+        .badge-failed { background-color: rgba(248, 113, 113, 0.2); color: var(--accent-red); }
     </style>
 </head>
 <body>
@@ -167,10 +173,10 @@
             <div class="tile-value" id="valTokens">-</div>
             <div class="tile-sub" id="subTokens">-</div>
         </div>
-        <div class="tile">
+        <div class="tile" id="tileCost">
             <div class="tile-title">Total Cost</div>
             <div class="tile-value" id="valCost">-</div>
-            <div class="tile-sub">Claude API Usage</div>
+            <div class="tile-sub">API Usage</div>
         </div>
         <div class="tile">
             <div class="tile-title">Database Size</div>
@@ -236,24 +242,88 @@
         </div>
     </div>
 
+    <!-- Model Stats & Quota Events -->
+    <div class="dashboard-grid">
+        <!-- Model Breakdown -->
+        <div class="card">
+            <div class="section-title">Model Breakdown</div>
+            <table>
+                <thead>
+                    <tr><th>Agent</th><th>Model</th><th>Jobs</th><th>Failed</th><th>Total Tokens</th><th>Avg In Tokens</th><th>p50 / p95</th></tr>
+                </thead>
+                <tbody id="modelsTableBody">
+                    <tr><td colspan="7">Loading model statistics...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Quota Events -->
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <div class="section-title" style="margin:0;">Quota & Rate-Limit Events</div>
+                <button onclick="loadQuotaEvents()" style="padding: 4px 8px; font-size: 0.75rem;">Refresh</button>
+            </div>
+            <div class="log-box" id="quotaEventsBox">Loading quota events...</div>
+        </div>
+    </div>
+
+    <!-- Queue Control -->
+    <div class="card" style="margin-bottom: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 12px;">
+            <div class="section-title" style="margin:0;">Queue Control (Pending & Failed Jobs)</div>
+            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <select id="queueStatusSelect" onchange="loadQueueJobs()" style="padding: 4px 8px; font-size: 0.75rem;">
+                    <option value="all">Pending & Failed</option>
+                    <option value="pending">Pending Only</option>
+                    <option value="failed">Failed Only</option>
+                </select>
+                <button onclick="retrySelectedJobs()" style="background-color: #1e3a5f; border-color: var(--accent-blue);">Retry Selected</button>
+                <button onclick="cancelSelectedJobs()" class="btn-danger">Cancel Selected</button>
+                <span id="queueActionStatus" style="font-size: 0.75rem; color: var(--accent-green); margin-left: 8px;"></span>
+            </div>
+        </div>
+        <div style="overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 32px;"><input type="checkbox" id="selectAllJobs" onchange="toggleSelectAllJobs(this.checked)"></th>
+                        <th>ID</th>
+                        <th>Created</th>
+                        <th>Agent</th>
+                        <th>Model</th>
+                        <th>Attempts</th>
+                        <th>Status</th>
+                        <th>Error / Exit Code</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="queueTableBody">
+                    <tr><td colspan="9">Loading queue jobs...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
     <script>
         function getApiKey() {
             let key = sessionStorage.getItem("AGENT_API_KEY");
             return key || "";
         }
 
-        async function fetchAPI(url) {
-            let headers = {};
+        async function fetchAPI(url, options = {}) {
+            let headers = options.headers || {};
             let key = getApiKey();
             if (key) headers["X-API-Key"] = key;
 
-            let res = await fetch(url, { headers });
+            let opts = { ...options, headers };
+            let res = await fetch(url, opts);
             if (res.status === 401) {
                 let promptKey = prompt("API Key Required for tunnel access:");
                 if (promptKey) {
                     sessionStorage.setItem("AGENT_API_KEY", promptKey);
                     headers["X-API-Key"] = promptKey;
-                    res = await fetch(url, { headers });
+                    opts.headers = headers;
+                    res = await fetch(url, opts);
                 }
             }
             if (!res.ok) throw new Error("HTTP " + res.status);
@@ -275,7 +345,12 @@
                 document.getElementById("valTokens").innerText = data.total_tokens.toLocaleString();
                 document.getElementById("subTokens").innerText = `${data.total_input_tokens.toLocaleString()} in / ${data.total_output_tokens.toLocaleString()} out`;
 
-                document.getElementById("valCost").innerText = "$" + data.total_cost_usd.toFixed(4);
+                if (data.total_cost_usd !== null && data.total_cost_usd !== undefined) {
+                    document.getElementById("tileCost").style.display = "";
+                    document.getElementById("valCost").innerText = "$" + data.total_cost_usd.toFixed(4);
+                } else {
+                    document.getElementById("tileCost").style.display = "none";
+                }
 
                 document.getElementById("valDbSize").innerText = data.db_size.mb + " MB";
                 document.getElementById("subDbSize").innerText = `${data.db_size.bytes.toLocaleString()} bytes on disk`;
@@ -421,11 +496,210 @@
             } catch(e) { console.error("Logs error:", e); }
         }
 
+        async function loadModelStats() {
+            try {
+                let data = await fetchAPI("/v1/stats/models");
+                let tbody = document.getElementById("modelsTableBody");
+                tbody.innerHTML = "";
+
+                if (!data || data.length === 0) {
+                    tbody.innerHTML = "<tr><td colspan='7'>No model statistics found</td></tr>";
+                    return;
+                }
+
+                data.forEach(m => {
+                    let tr = document.createElement("tr");
+                    let modelName = m.model ? m.model : "(default)";
+                    let p50_p95 = `${m.duration_p50_s}s / ${m.duration_p95_s}s`;
+                    tr.innerHTML = `
+                        <td><strong>${m.agent}</strong></td>
+                        <td><code>${modelName}</code></td>
+                        <td>${m.total_jobs}</td>
+                        <td style="${m.failed_jobs > 0 ? 'color:var(--accent-red);' : ''}">${m.failed_jobs}</td>
+                        <td>${(m.total_tokens || 0).toLocaleString()}</td>
+                        <td>${(m.avg_input_tokens || 0).toLocaleString()}</td>
+                        <td>${p50_p95}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch(e) { console.error("Models error:", e); }
+        }
+
+        async function loadQuotaEvents() {
+            try {
+                let data = await fetchAPI("/v1/logs?limit=200");
+                let box = document.getElementById("quotaEventsBox");
+                box.innerHTML = "";
+
+                if (!data || data.length === 0) {
+                    box.innerText = "No log records found.";
+                    return;
+                }
+
+                let quotaLogs = data.filter(l => {
+                    let msg = (l.message || "").toLowerCase();
+                    return msg.includes("rate") || msg.includes("quota") || msg.includes("429") || msg.includes("resource_exhausted") || msg.includes("cooldown");
+                });
+
+                if (quotaLogs.length === 0) {
+                    box.innerText = "No quota or rate-limit events recorded.";
+                    return;
+                }
+
+                quotaLogs.forEach(l => {
+                    let div = document.createElement("div");
+                    let cls = "log-warn";
+                    if (l.level === "ERROR") cls = "log-error";
+                    div.className = `log-line ${cls}`;
+                    let dateStr = new Date(l.ts * 1000).toISOString().replace("T", " ").substring(0, 19);
+                    div.innerText = `[${dateStr}] [${l.level}] ${l.message}`;
+                    box.appendChild(div);
+                });
+            } catch(e) { console.error("Quota events error:", e); }
+        }
+
+        async function loadQueueJobs() {
+            try {
+                let filter = document.getElementById("queueStatusSelect").value;
+                let tbody = document.getElementById("queueTableBody");
+                tbody.innerHTML = "<tr><td colspan='9'>Loading...</td></tr>";
+
+                let jobs = [];
+                if (filter === "all") {
+                    let [pRes, fRes] = await Promise.all([
+                        fetchAPI("/v1/jobs?status=pending&limit=50"),
+                        fetchAPI("/v1/jobs?status=failed&limit=50"),
+                    ]);
+                    jobs = [...(pRes || []), ...(fRes || [])];
+                    jobs.sort((a, b) => b.created_at - a.created_at);
+                } else {
+                    jobs = await fetchAPI(`/v1/jobs?status=${filter}&limit=100`);
+                }
+
+                tbody.innerHTML = "";
+                let selectAll = document.getElementById("selectAllJobs");
+                if (selectAll) selectAll.checked = false;
+
+                if (!jobs || jobs.length === 0) {
+                    tbody.innerHTML = "<tr><td colspan='9' style='color:var(--text-muted); text-align:center;'>No pending or failed jobs in queue.</td></tr>";
+                    return;
+                }
+
+                jobs.forEach(j => {
+                    let tr = document.createElement("tr");
+                    let dateStr = new Date(j.created_at * 1000).toISOString().replace("T", " ").substring(0, 19);
+                    let badgeCls = j.status === "pending" ? "badge-pending" : "badge-failed";
+                    let errSnippet = j.error ? j.error.substring(0, 60) : (j.exit_code !== null ? `Exit code ${j.exit_code}` : "-");
+                    let modelStr = j.model ? j.model : "(default)";
+
+                    tr.innerHTML = `
+                        <td><input type="checkbox" class="job-checkbox" value="${j.id}"></td>
+                        <td title="${j.id}"><code>${j.id.substring(0, 8)}...</code></td>
+                        <td>${dateStr}</td>
+                        <td>${j.agent}</td>
+                        <td><code>${modelStr}</code></td>
+                        <td>${j.attempts}</td>
+                        <td><span class="badge ${badgeCls}">${j.status}</span></td>
+                        <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${j.error || ''}">${errSnippet}</td>
+                        <td>
+                            <button onclick="retryJobSingle('${j.id}')" class="btn-sm" style="margin-right: 4px;">Retry</button>
+                            <button onclick="cancelJobSingle('${j.id}')" class="btn-sm btn-danger">Cancel</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch(e) { console.error("Queue jobs error:", e); }
+        }
+
+        function toggleSelectAllJobs(checked) {
+            let boxes = document.querySelectorAll(".job-checkbox");
+            boxes.forEach(b => b.checked = checked);
+        }
+
+        function getSelectedJobIds() {
+            let boxes = document.querySelectorAll(".job-checkbox:checked");
+            return Array.from(boxes).map(b => b.value);
+        }
+
+        async function retryJobSingle(jobId) {
+            try {
+                await fetchAPI(`/v1/jobs/${jobId}/retry`, { method: "POST" });
+                loadQueueJobs();
+                loadSummary();
+            } catch(e) {
+                alert(`Failed to retry job ${jobId}: ${e.message}`);
+            }
+        }
+
+        async function cancelJobSingle(jobId) {
+            try {
+                await fetchAPI(`/v1/jobs/${jobId}`, { method: "DELETE" });
+                loadQueueJobs();
+                loadSummary();
+            } catch(e) {
+                alert(`Failed to cancel job ${jobId}: ${e.message}`);
+            }
+        }
+
+        async function retrySelectedJobs() {
+            let ids = getSelectedJobIds();
+            if (ids.length === 0) {
+                alert("Please select at least one job to retry.");
+                return;
+            }
+            let statusSpan = document.getElementById("queueActionStatus");
+            statusSpan.innerText = `Retrying ${ids.length} job(s)...`;
+            let success = 0;
+            let failed = 0;
+            for (let id of ids) {
+                try {
+                    await fetchAPI(`/v1/jobs/${id}/retry`, { method: "POST" });
+                    success++;
+                } catch(e) {
+                    console.error(`Retry error on ${id}:`, e);
+                    failed++;
+                }
+            }
+            statusSpan.innerText = `Retried ${success} job(s)${failed > 0 ? `, ${failed} failed` : ''}`;
+            setTimeout(() => { statusSpan.innerText = ""; }, 5000);
+            loadQueueJobs();
+            loadSummary();
+        }
+
+        async function cancelSelectedJobs() {
+            let ids = getSelectedJobIds();
+            if (ids.length === 0) {
+                alert("Please select at least one job to cancel.");
+                return;
+            }
+            if (!confirm(`Cancel ${ids.length} selected job(s)?`)) return;
+            let statusSpan = document.getElementById("queueActionStatus");
+            statusSpan.innerText = `Cancelling ${ids.length} job(s)...`;
+            let success = 0;
+            let failed = 0;
+            for (let id of ids) {
+                try {
+                    await fetchAPI(`/v1/jobs/${id}`, { method: "DELETE" });
+                    success++;
+                } catch(e) {
+                    console.error(`Cancel error on ${id}:`, e);
+                    failed++;
+                }
+            }
+            statusSpan.innerText = `Cancelled ${success} job(s)${failed > 0 ? `, ${failed} failed` : ''}`;
+            setTimeout(() => { statusSpan.innerText = ""; }, 5000);
+            loadQueueJobs();
+            loadSummary();
+        }
+
         function refreshAll() {
             loadSummary();
             loadTimeseries();
             loadHeatmap();
             loadSources();
+            loadModelStats();
+            loadQuotaEvents();
+            loadQueueJobs();
             loadErrors();
             loadLogs();
         }

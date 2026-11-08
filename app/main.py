@@ -38,6 +38,7 @@ from app.db import (
     get_job,
     init_db,
     list_jobs,
+    schedule_retry,
 )
 from app.dispatcher import (
     register_waiter,
@@ -447,11 +448,39 @@ async def cancel_job_endpoint(
     return canceled
 
 
+@app.post("/v1/jobs/{job_id}/retry")
+async def retry_job_endpoint(
+    job_id: str,
+    api_key: str = Depends(verify_api_key),
+):
+    settings = get_settings()
+    job = get_job(job_id, db_path=settings.db_path, api_key_name=api_key)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    job_status = job.get("status")
+    if job_status in ("pending", "running"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot retry job '{job_id}' in non-terminal state '{job_status}'. Only terminal states ('failed', 'canceled', 'completed') may be retried.",
+        )
+
+    requeued = schedule_retry(
+        job_id,
+        next_attempt_at=time.time(),
+        db_path=settings.db_path,
+        reset_attempts=True,
+    )
+    wake_dispatcher()
+    return requeued
+
+
 from app.stats import (
     get_summary_stats,
     get_timeseries_stats,
     get_load_stats,
     get_sources_stats,
+    get_model_stats,
     get_error_stats,
 )
 
@@ -494,6 +523,16 @@ async def stats_sources_endpoint(
 ):
     settings = get_settings()
     return await asyncio.to_thread(get_sources_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+
+
+@app.get("/v1/stats/models")
+async def stats_models_endpoint(
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    auth: str = Depends(verify_api_key),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(get_model_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
 
 
 @app.get("/v1/stats/errors")

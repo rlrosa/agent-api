@@ -260,21 +260,24 @@ def schedule_retry(
     job_id: str,
     next_attempt_at: float,
     db_path: Optional[str] = None,
+    reset_attempts: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     path = _get_db_path(db_path)
 
     with _db_lock:
         with _connect(path) as conn:
-            cur = conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'pending',
-                    next_attempt_at = ?
-                WHERE id = ?
-                RETURNING *;
-                """,
-                (next_attempt_at, job_id),
-            )
+            query = "UPDATE jobs SET status = 'pending', next_attempt_at = ?"
+            params = [next_attempt_at]
+            if reset_attempts:
+                query += ", attempts = 0"
+            if metadata is not None:
+                query += ", metadata = ?"
+                params.append(json.dumps(metadata))
+            query += " WHERE id = ? RETURNING *;"
+            params.append(job_id)
+
+            cur = conn.execute(query, tuple(params))
             row = cur.fetchone()
             conn.commit()
             return _row_to_dict(row)

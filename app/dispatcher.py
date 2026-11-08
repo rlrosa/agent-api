@@ -1,12 +1,14 @@
 import asyncio
+import json
 import logging
+import random
 import time
 from typing import Any, Dict, List, Optional
 from app.config import get_settings
 from app.db import build_daily_rollups, claim_next_job, finish_job, list_jobs, purge_old, reset_orphans, schedule_retry, sweep_stuck_running_jobs
 
 
-from app.ratelimit import is_rate_limit_error, rate_limit_manager
+from app.ratelimit import is_rate_limit_error, parse_reset_hint, rate_limit_manager
 from app.runner import run_job, sweep_orphaned_workspaces
 
 
@@ -128,18 +130,50 @@ async def _worker_loop(worker_id: int) -> None:
                                 f"Scheduled retry at {next_attempt:.3f} (+{delay:.2f}s delay)"
                             )
                         else:
-                            fail_err = f"Rate limited after {attempts} attempts"
-                            res_failed = finish_job(
-                                job["id"],
-                                status="failed",
-                                exit_code=exit_code if exit_code is not None else -1,
-                                stdout=stdout,
-                                stderr=stderr,
-                                error=fail_err,
-                                db_path=settings.db_path,
-                            )
-                            logger.error(f"Job {job['id']} failed: {fail_err}")
-                            await resolve_waiters(job["id"], res_failed or res)
+                            # Restrict hint search to stderr and error (never scan raw stdout to preserve response payload isolation)
+                            hint = None
+                            for text_src in (stderr, error):
+                                hint = parse_reset_hint(text_src)
+                                if hint is not None:
+                                    break
+
+                            meta = job.get("metadata") or {}
+                            if isinstance(meta, str):
+                                try:
+                                    meta = json.loads(meta)
+                                except Exception:
+                                    meta = {}
+                            already_quota_requeued = bool(meta.get("quota_requeued"))
+
+                            if hint is not None and hint <= 3 * 3600 and not already_quota_requeued:
+                                jitter = random.uniform(1.0, 5.0)
+                                next_attempt = time.time() + hint + jitter
+                                new_meta = dict(meta)
+                                new_meta["quota_requeued"] = True
+                                schedule_retry(
+                                    job["id"],
+                                    next_attempt,
+                                    db_path=settings.db_path,
+                                    reset_attempts=True,
+                                    metadata=new_meta,
+                                )
+                                logger.warning(
+                                    f"Job {job['id']} exhausted retries but parsed reset hint ({hint:.1f}s). "
+                                    f"Requeued with attempts=0 at {next_attempt:.3f} (+{hint+jitter:.1f}s)."
+                                )
+                            else:
+                                fail_err = f"Rate limited after {attempts} attempts"
+                                res_failed = finish_job(
+                                    job["id"],
+                                    status="failed",
+                                    exit_code=exit_code if exit_code is not None else -1,
+                                    stdout=stdout,
+                                    stderr=stderr,
+                                    error=fail_err,
+                                    db_path=settings.db_path,
+                                )
+                                logger.error(f"Job {job['id']} failed: {fail_err}")
+                                await resolve_waiters(job["id"], res_failed or res)
                     else:
                         await resolve_waiters(job["id"], res)
 

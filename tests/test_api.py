@@ -133,10 +133,20 @@ def test_f8_multi_tenant_job_isolation():
             d_bob = client.delete(f"/v1/jobs/{alice_job_id}", headers=bob_headers)
             assert d_bob.status_code == 404
 
+            # Bob cannot retry Alice's job (returns 404 - ownership scoping)
+            r_bob = client.post(f"/v1/jobs/{alice_job_id}/retry", headers=bob_headers)
+            assert r_bob.status_code == 404
+
             # Alice can cancel her job
             d_alice = client.delete(f"/v1/jobs/{alice_job_id}", headers=alice_headers)
             assert d_alice.status_code == 200
             assert d_alice.json()["status"] == "canceled"
+
+            # Alice can retry her job (resets attempts to 0)
+            r_alice = client.post(f"/v1/jobs/{alice_job_id}/retry", headers=alice_headers)
+            assert r_alice.status_code == 200
+            assert r_alice.json()["status"] == "pending"
+            assert r_alice.json()["attempts"] == 0
     finally:
         os.environ.pop("API_KEYS", None)
 
@@ -260,6 +270,82 @@ def test_agent_flags_resolution(caplog):
             assert "AGY_SANDBOX_FLAGS is deprecated and ignored" in caplog.text
     finally:
         os.environ.pop("AGY_SANDBOX_FLAGS", None)
+
+
+def test_stats_models_endpoint():
+    with TestClient(app) as client:
+        res = client.get("/v1/stats/models", headers={"X-API-Key": "test-secret-key"})
+        assert res.status_code == 200
+        data = res.json()
+        assert isinstance(data, list)
+        for item in data:
+            assert "agent" in item
+            assert "model" in item
+            assert "total_jobs" in item
+            assert "failed_jobs" in item
+            assert "total_tokens" in item
+
+
+def test_model_prices_config_and_cost_null(tmp_path):
+    import json
+    from app.config import get_settings
+    from app.runner import run_job
+    from app.db import create_job, get_job, init_db, finish_job
+
+    db_path = str(tmp_path / "test_cost.db")
+    init_db(db_path)
+
+    # 1. Unpriced model -> cost_usd is None
+    settings = get_settings()
+    assert settings.model_prices == {}
+    job = create_job("mock_success", "echo test", model="unpriced-model", db_path=db_path)
+    finish_job(job["id"], status="completed", total_tokens=1000, db_path=db_path, cost_usd=None)
+    fetched = get_job(job["id"], db_path=db_path)
+    assert fetched["cost_usd"] is None
+
+    # 2. Priced model via MODEL_PRICES env var (per-1M tokens)
+    # 14,000 in @ $0.30/1M + 200 out @ $2.50/1M = (4200 + 500) / 1M = $0.0047
+    os.environ["MODEL_PRICES"] = json.dumps({"gemini-3.8-flash-low": {"input": 0.30, "output": 2.50}})
+    try:
+        settings_priced = get_settings()
+        assert "gemini-3.8-flash-low" in settings_priced.model_prices
+        rates = settings_priced.model_prices["gemini-3.8-flash-low"]
+        in_t = 14000
+        out_t = 200
+        computed_cost = round((in_t * rates["input"] + out_t * rates["output"]) / 1_000_000.0, 6)
+        assert computed_cost == 0.0047
+
+        job2 = create_job("mock_success", "echo test 2", model="gemini-3.8-flash-low", db_path=db_path)
+        finish_job(job2["id"], status="completed", input_tokens=in_t, output_tokens=out_t, total_tokens=in_t+out_t, db_path=db_path, cost_usd=computed_cost)
+        fetched2 = get_job(job2["id"], db_path=db_path)
+        assert fetched2["cost_usd"] == 0.0047
+    finally:
+        os.environ.pop("MODEL_PRICES", None)
+
+
+def test_retry_job_status_guard(tmp_path):
+    from app.db import create_job, init_db, finish_job
+
+    with TestClient(app) as client:
+        headers = {"X-API-Key": "test-secret-key"}
+
+        # 1. Pending job cannot be retried -> 409 Conflict
+        c_res = client.post("/v1/jobs", json={"agent": "mock_429", "prompt": "test pending retry", "wait": 0}, headers=headers)
+        assert c_res.status_code == 202
+        pending_job_id = c_res.json()["job_id"]
+        r_pending = client.post(f"/v1/jobs/{pending_job_id}/retry", headers=headers)
+        assert r_pending.status_code == 409
+        assert "non-terminal state" in r_pending.json()["detail"]
+
+        # 2. Cancel job -> now terminal, retry succeeds -> 200
+        d_res = client.delete(f"/v1/jobs/{pending_job_id}", headers=headers)
+        assert d_res.status_code == 200
+        r_canceled = client.post(f"/v1/jobs/{pending_job_id}/retry", headers=headers)
+        assert r_canceled.status_code == 200
+        assert r_canceled.json()["status"] == "pending"
+        assert r_canceled.json()["attempts"] == 0
+
+
 
 
 

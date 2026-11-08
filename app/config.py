@@ -1,6 +1,7 @@
+import json
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("agent-api.config")
@@ -31,6 +32,7 @@ class Settings(BaseModel):
     keep_workspace_on_failure: bool = Field(default=False)
     sandbox_enabled: bool = Field(default=True)
     agent_flags: Dict[str, str] = Field(default_factory=dict)
+    model_prices: Dict[str, Any] = Field(default_factory=dict)
     claude_disallowed_tools: str = Field(default="Bash,WebFetch")
     rate_limit_patterns: List[str] = Field(
         default_factory=lambda: [
@@ -83,6 +85,16 @@ def get_settings() -> Settings:
             agent_name = key[len("AGENT_FLAGS_"):].lower()
             agent_flags[agent_name] = value
 
+    model_prices: Dict[str, Any] = {}
+    raw_model_prices = os.environ.get("MODEL_PRICES", "")
+    if raw_model_prices:
+        try:
+            parsed = json.loads(raw_model_prices)
+            if isinstance(parsed, dict):
+                model_prices = {k.lower(): v for k, v in parsed.items()}
+        except Exception as exc:
+            logger.warning(f"Failed to parse MODEL_PRICES JSON: {exc}")
+
     return Settings(
         api_key=api_key,
         host=os.environ.get("HOST", "0.0.0.0"),
@@ -106,6 +118,7 @@ def get_settings() -> Settings:
         keep_workspace_on_failure=os.environ.get("KEEP_WORKSPACE_ON_FAILURE", "0").lower() in ("1", "true", "yes"),
         sandbox_enabled=os.environ.get("SANDBOX_ENABLED", "1").lower() in ("1", "true", "yes"),
         agent_flags=agent_flags,
+        model_prices=model_prices,
         claude_disallowed_tools=os.environ.get("CLAUDE_DISALLOWED_TOOLS", "Bash,WebFetch"),
         recover_successes=int(os.environ.get("RECOVER_SUCCESSES", "3")),
         allow_mock_agent=os.environ.get("ALLOW_MOCK_AGENT", "0").lower() in ("1", "true", "yes"),

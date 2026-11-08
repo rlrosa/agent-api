@@ -118,6 +118,11 @@ re-opens it.
   a caller on one of them if similar names are requested. The cheapest-first ordering of both model lists
   (`VALID_AGY_MODELS` and `VALID_CLAUDE_MODELS`) is load-bearing for cost safety: `resolve_model` uses a
   cheapest-wins tie-break among candidates scoring within 0.10 of the best fuzzy match.
+- **Virtualenv dependency residual drift.** `requirements.txt` and `requirements-dev.txt` define
+  the exact runtime closure. The running host virtualenv retains residual extra packages (such as
+  `gTTS`, `pillow`, `reportlab`, `requests`, `urllib3`, `charset-normalizer`,
+  `backports.asyncio.runner`) which are not imported anywhere in `app/`, `tests/` or `scripts/`.
+  Do not treat these extras as dependencies or add them to the requirements files.
 
 ## Open findings
 

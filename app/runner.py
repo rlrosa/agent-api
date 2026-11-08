@@ -6,7 +6,7 @@ import shutil
 import signal
 import time
 from typing import Any, Dict, List, Optional
-from app.agents import AGENTS, ensure_available
+from app.agents import AGENTS, ensure_available, strip_model_tier
 from app.config import get_settings
 from app.db import finish_job, get_job
 
@@ -331,7 +331,6 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
                             total_tokens = usage.get("total_tokens") or (
                                 (input_tokens or 0) + (output_tokens or 0)
                             )
-                            cost_usd = None
                         elif agent_name == "claude":
                             answer = parsed.get("result")
                             if answer is not None:
@@ -343,7 +342,49 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
                             total_tokens = (input_tokens or 0) + (output_tokens or 0)
                             if cached_tokens:
                                 total_tokens += cached_tokens
-                            cost_usd = parsed.get("total_cost_usd")
+
+                        # Cost resolution: upstream-reported cost wins over configured prices.
+                        cost_usd = None
+                        if agent_name == "claude" and parsed.get("total_cost_usd") is not None:
+                            try:
+                                cost_usd = float(parsed["total_cost_usd"])
+                            except (ValueError, TypeError):
+                                cost_usd = None
+
+                        # Fallback to configured prices (in USD per 1M tokens) if upstream cost is absent
+                        if cost_usd is None:
+                            executed_model = None
+                            if "--model" in argv:
+                                try:
+                                    executed_model = argv[argv.index("--model") + 1]
+                                except IndexError:
+                                    pass
+                            if not executed_model and job.get("model"):
+                                executed_model = job.get("model")
+
+                            if executed_model and settings.model_prices:
+                                m_key = executed_model.lower()
+                                base_key = strip_model_tier(m_key)
+                                price_val = settings.model_prices.get(m_key)
+                                if price_val is None:
+                                    price_val = settings.model_prices.get(base_key)
+
+                                if price_val is not None:
+                                    # All prices are in USD per 1M tokens
+                                    if isinstance(price_val, dict):
+                                        in_rate = float(price_val.get("input", 0.0))
+                                        out_rate = float(price_val.get("output", 0.0))
+                                        cost_usd = round(
+                                            ((input_tokens or 0) * in_rate + (output_tokens or 0) * out_rate) / 1_000_000.0,
+                                            6,
+                                        )
+                                    elif isinstance(price_val, (int, float)):
+                                        # Bare scalar interpreted as USD per 1M total tokens
+                                        cost_usd = round(
+                                            (total_tokens or 0) * float(price_val) / 1_000_000.0,
+                                            6,
+                                        )
+
                     logger.info(
                         f"Job {job_id} parsed tokens for agent {agent_name}: input={input_tokens}, output={output_tokens}, "
                         f"total={total_tokens}, cost={cost_usd}, new_stdout_len={len(stdout_str)}"
