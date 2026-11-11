@@ -346,6 +346,233 @@ def test_retry_job_status_guard(tmp_path):
         assert r_canceled.json()["attempts"] == 0
 
 
+def test_scope_parsing():
+    from app.security import parse_api_keys
+    old_key = os.environ.pop("API_KEY", None)
+    old_keys = os.environ.pop("API_KEYS", None)
+    try:
+        os.environ["API_KEY"] = "legacy-secret"
+        os.environ["API_KEYS"] = (
+            "plain:k1,"
+            "worker:k2:jobs,"
+            "monitor:k3:stats,"
+            "admin:k4:jobs+stats+admin,"
+            "svc:with:colons:k5:stats,"
+            "inv:with:colons:k6:not_a_valid_scope"
+        )
+        keys_map = parse_api_keys()
+
+        # Legacy default key gets {jobs, stats}
+        assert "default" in keys_map
+        assert keys_map["default"].secret == "legacy-secret"
+        assert keys_map["default"].scopes == {"jobs", "stats"}
+
+        # Plain key gets {jobs, stats}
+        assert keys_map["plain"].secret == "k1"
+        assert keys_map["plain"].scopes == {"jobs", "stats"}
+
+        # Specific scopes
+        assert keys_map["worker"].secret == "k2"
+        assert keys_map["worker"].scopes == {"jobs"}
+
+        assert keys_map["monitor"].secret == "k3"
+        assert keys_map["monitor"].scopes == {"stats"}
+
+        assert keys_map["admin"].secret == "k4"
+        assert keys_map["admin"].scopes == {"jobs", "stats", "admin"}
+
+        # Key with colons where last segment is valid scope
+        assert keys_map["svc"].secret == "with:colons:k5"
+        assert keys_map["svc"].scopes == {"stats"}
+
+        # Key with colons where last segment is not a valid scope -> treated as part of secret with default scopes
+        assert keys_map["inv"].secret == "with:colons:k6:not_a_valid_scope"
+        assert keys_map["inv"].scopes == {"jobs", "stats"}
+
+    finally:
+        if old_key is not None:
+            os.environ["API_KEY"] = old_key
+        else:
+            os.environ.pop("API_KEY", None)
+        if old_keys is not None:
+            os.environ["API_KEYS"] = old_keys
+        else:
+            os.environ.pop("API_KEYS", None)
+
+
+def test_scope_enforcement_jobs_and_stats():
+    old_key = os.environ.pop("API_KEY", None)
+    old_keys = os.environ.pop("API_KEYS", None)
+    os.environ["API_KEYS"] = "worker:key-jobs:jobs,monitor:key-stats:stats,admin:key-admin:jobs+stats+admin"
+    try:
+        with TestClient(app) as client:
+            jobs_headers = {"X-API-Key": "key-jobs"}
+            stats_headers = {"X-API-Key": "key-stats"}
+
+            # Jobs-only key: can create jobs, but 403 on stats and logs
+            j_res = client.post("/v1/jobs", json={"agent": "mock_429", "prompt": "hi", "wait": 0}, headers=jobs_headers)
+            assert j_res.status_code == 202
+
+            stat_res = client.get("/v1/stats/summary", headers=jobs_headers)
+            assert stat_res.status_code == 403
+            assert "Missing required scope 'stats'" in stat_res.json()["detail"]
+
+            logs_res = client.get("/v1/logs", headers=jobs_headers)
+            assert logs_res.status_code == 403
+            assert "Missing required scope 'stats'" in logs_res.json()["detail"]
+
+            # Stats-only key: 403 on creating/getting jobs, 200 on stats
+            j_res2 = client.post("/v1/jobs", json={"agent": "mock_429", "prompt": "hi", "wait": 0}, headers=stats_headers)
+            assert j_res2.status_code == 403
+            assert "Missing required scope 'jobs'" in j_res2.json()["detail"]
+
+            list_res = client.get("/v1/jobs", headers=stats_headers)
+            assert list_res.status_code == 403
+
+            stat_res2 = client.get("/v1/stats/summary", headers=stats_headers)
+            assert stat_res2.status_code == 200
+
+            logs_res2 = client.get("/v1/logs", headers=stats_headers)
+            assert logs_res2.status_code == 200
+
+    finally:
+        if old_key is not None:
+            os.environ["API_KEY"] = old_key
+        else:
+            os.environ.pop("API_KEY", None)
+        if old_keys is not None:
+            os.environ["API_KEYS"] = old_keys
+        else:
+            os.environ.pop("API_KEYS", None)
+
+
+def test_v1_me_endpoint():
+    old_key = os.environ.pop("API_KEY", None)
+    old_keys = os.environ.pop("API_KEYS", None)
+    os.environ["API_KEYS"] = "worker:key-jobs:jobs,monitor:key-stats:stats,admin:key-admin:jobs+stats+admin"
+    try:
+        with TestClient(app) as client:
+            # Jobs key
+            r_jobs = client.get("/v1/me", headers={"X-API-Key": "key-jobs"})
+            assert r_jobs.status_code == 200
+            assert r_jobs.json() == {"key_name": "worker", "scopes": ["jobs"]}
+
+            # Stats key
+            r_stats = client.get("/v1/me", headers={"X-API-Key": "key-stats"})
+            assert r_stats.status_code == 200
+            assert r_stats.json() == {"key_name": "monitor", "scopes": ["stats"]}
+
+            # Admin key
+            r_admin = client.get("/v1/me", headers={"X-API-Key": "key-admin"})
+            assert r_admin.status_code == 200
+            assert r_admin.json() == {"key_name": "admin", "scopes": ["admin", "jobs", "stats"]}
+
+            # Trusted bypass (no key, loopback peer)
+            with TestClient(app, client=("127.0.0.1", 50000)) as loopback_client:
+                r_bypass = loopback_client.get("/v1/me")
+                assert r_bypass.status_code == 200
+                assert r_bypass.json() == {"key_name": "bypass", "scopes": ["admin", "jobs", "stats"]}
+
+            # Key secret is never exposed
+            assert "key-jobs" not in str(r_jobs.json())
+            assert "key-admin" not in str(r_admin.json())
+    finally:
+        if old_key is not None:
+            os.environ["API_KEY"] = old_key
+        else:
+            os.environ.pop("API_KEY", None)
+        if old_keys is not None:
+            os.environ["API_KEYS"] = old_keys
+        else:
+            os.environ.pop("API_KEYS", None)
+
+
+def test_dashboard_gating():
+    old_key = os.environ.pop("API_KEY", None)
+    old_keys = os.environ.pop("API_KEYS", None)
+    os.environ["API_KEYS"] = "worker:key-jobs:jobs,monitor:key-stats:stats"
+    try:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
+            # 1. Trusted peer (no CF header, loopback client) -> 200 HTML
+            r_trusted = client.get("/dashboard")
+            assert r_trusted.status_code == 200
+            assert "<!DOCTYPE html>" in r_trusted.text or "<html" in r_trusted.text
+
+            # 2. CF header without key -> 401
+            r_cf_no_key = client.get("/dashboard", headers={"cf-ray": "test-ray-id"})
+            assert r_cf_no_key.status_code == 401
+
+            # 3. CF header with stats key -> 200 HTML
+            r_cf_stats = client.get(
+                "/dashboard",
+                headers={"cf-ray": "test-ray-id", "X-API-Key": "key-stats"},
+            )
+            assert r_cf_stats.status_code == 200
+            assert "<!DOCTYPE html>" in r_cf_stats.text or "<html" in r_cf_stats.text
+
+            # 4. CF header with jobs-only key -> 401
+            r_cf_jobs = client.get(
+                "/dashboard",
+                headers={"cf-ray": "test-ray-id", "X-API-Key": "key-jobs"},
+            )
+            assert r_cf_jobs.status_code == 401
+
+    finally:
+        if old_key is not None:
+            os.environ["API_KEY"] = old_key
+        else:
+            os.environ.pop("API_KEY", None)
+        if old_keys is not None:
+            os.environ["API_KEYS"] = old_keys
+        else:
+            os.environ.pop("API_KEYS", None)
+
+
+def test_cross_tenant_admin_retry_and_cancel():
+    old_key = os.environ.pop("API_KEY", None)
+    old_keys = os.environ.pop("API_KEYS", None)
+    os.environ["API_KEYS"] = "alice:key-alice:jobs,bob:key-bob:jobs,monitor:key-stats:stats,admin:key-admin:jobs+stats+admin"
+    try:
+        with TestClient(app) as client:
+            # Alice creates job
+            c_res = client.post(
+                "/v1/jobs",
+                json={"agent": "mock_429", "prompt": "alice job", "wait": 0},
+                headers={"X-API-Key": "key-alice"},
+            )
+            assert c_res.status_code == 202
+            job_id = c_res.json()["job_id"]
+
+            # Monitor (stats only) tries to cancel -> 403 Forbidden
+            mon_res = client.delete(f"/v1/jobs/{job_id}", headers={"X-API-Key": "key-stats"})
+            assert mon_res.status_code == 403
+
+            # Bob (jobs scope) tries to cancel Alice's job -> 404 (tenant isolation)
+            bob_res = client.delete(f"/v1/jobs/{job_id}", headers={"X-API-Key": "key-bob"})
+            assert bob_res.status_code == 404
+
+            # Admin cancels Alice's job -> 200 (cross-tenant allowed)
+            admin_cancel = client.delete(f"/v1/jobs/{job_id}", headers={"X-API-Key": "key-admin"})
+            assert admin_cancel.status_code == 200
+            assert admin_cancel.json()["status"] == "canceled"
+
+            # Admin retries Alice's job -> 200 (cross-tenant retry allowed)
+            admin_retry = client.post(f"/v1/jobs/{job_id}/retry", headers={"X-API-Key": "key-admin"})
+            assert admin_retry.status_code == 200
+            assert admin_retry.json()["status"] == "pending"
+
+    finally:
+        if old_key is not None:
+            os.environ["API_KEY"] = old_key
+        else:
+            os.environ.pop("API_KEY", None)
+        if old_keys is not None:
+            os.environ["API_KEYS"] = old_keys
+        else:
+            os.environ.pop("API_KEYS", None)
+
+
+
 
 
 
