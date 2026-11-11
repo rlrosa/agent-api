@@ -572,6 +572,229 @@ def test_cross_tenant_admin_retry_and_cancel():
             os.environ.pop("API_KEYS", None)
 
 
+def test_parse_agy_usage_tsv_cases():
+    from app.agy_quota import parse_agy_usage_tsv
+
+    # Valid TSV
+    valid_tsv = (
+        "Gemini Models\tWeekly Limit Remaining\t80%\t2026-11-14T06:29:14Z\n"
+        "Gemini Models\tFive Hour Limit Remaining\t92%\t2026-11-09T03:29:14Z\n"
+        "Claude Models\tSession Limit\t50%\t2026-11-10T12:00:00Z\n"
+    )
+    res = parse_agy_usage_tsv(valid_tsv)
+    assert res is not None
+    assert len(res["buckets"]) == 3
+    b1 = res["buckets"][0]
+    assert b1["group"] == "Gemini Models"
+    assert b1["bucket"] == "Weekly Limit Remaining"
+    assert b1["period"] == "weekly"
+    assert b1["remaining_percent"] == 80
+    assert b1["reset_at"] == "2026-11-14T06:29:14Z"
+
+    b2 = res["buckets"][1]
+    assert b2["period"] == "five_hour"
+    assert b2["remaining_percent"] == 92
+
+    b3 = res["buckets"][2]
+    assert b3["period"] == "other"
+    assert b3["remaining_percent"] == 50
+
+    # Malformed lines: fewer than 4 columns
+    assert parse_agy_usage_tsv("Gemini\tWeekly\t80%") is None
+
+    # Empty field
+    assert parse_agy_usage_tsv("Gemini\tWeekly\t\t2026-11-14T06:29:14Z") is None
+
+    # Bad percent: non-numeric, > 100, < 0, missing %
+    assert parse_agy_usage_tsv("Gemini\tWeekly\tabc%\t2026-11-14T06:29:14Z") is None
+    assert parse_agy_usage_tsv("Gemini\tWeekly\t150%\t2026-11-14T06:29:14Z") is None
+    assert parse_agy_usage_tsv("Gemini\tWeekly\t-5%\t2026-11-14T06:29:14Z") is None
+    assert parse_agy_usage_tsv("Gemini\tWeekly\t80\t2026-11-14T06:29:14Z") is None
+
+    # Bad timestamp
+    assert parse_agy_usage_tsv("Gemini\tWeekly\t80%\tinvalid-timestamp") is None
+
+    # Empty / non-string
+    assert parse_agy_usage_tsv("") is None
+    assert parse_agy_usage_tsv("   \n  \n") is None
+    assert parse_agy_usage_tsv(None) is None
+
+
+def test_agy_quota_endpoint_and_caching(tmp_path):
+    from app.agy_quota import clear_quota_cache
+    from app.db import list_jobs
+
+    fixture_script = os.path.abspath("tests/fixtures/fake_agy_usage.sh")
+    counter_file = str(tmp_path / "quota_counter.txt")
+
+    old_cmd = os.environ.get("AGY_USAGE_CMD")
+    old_counter = os.environ.get("COUNTER_FILE")
+    old_fail = os.environ.get("SIMULATE_FAIL")
+
+    os.environ["AGY_USAGE_CMD"] = fixture_script
+    os.environ["COUNTER_FILE"] = counter_file
+    os.environ.pop("SIMULATE_FAIL", None)
+    clear_quota_cache()
+
+    try:
+        with TestClient(app) as client:
+            headers = {"X-API-Key": "test-secret-key"}
+
+            # Count rows before
+            jobs_before = len(list_jobs(limit=1000))
+
+            # Call 1: runs script, caches result
+            r1 = client.get("/v1/stats/agy-quota", headers=headers)
+            assert r1.status_code == 200
+            d1 = r1.json()
+            assert d1["available"] is True
+            assert len(d1["buckets"]) == 2
+            assert d1["buckets"][0]["group"] == "Gemini Models"
+            assert d1["buckets"][0]["period"] == "weekly"
+
+            with open(counter_file, "r") as f:
+                c1 = int(f.read().strip())
+            assert c1 == 1
+
+            # Call 2: inside TTL -> cached, script not run again
+            r2 = client.get("/v1/stats/agy-quota", headers=headers)
+            assert r2.status_code == 200
+            d2 = r2.json()
+            assert d2["available"] is True
+            assert d2["fetched_at"] == d1["fetched_at"]
+
+            with open(counter_file, "r") as f:
+                c2 = int(f.read().strip())
+            assert c2 == 1
+
+            # Assert jobs table row count is unchanged (no job created!)
+            jobs_after = len(list_jobs(limit=1000))
+            assert jobs_after == jobs_before
+
+            # Test failure path
+            os.environ["SIMULATE_FAIL"] = "1"
+            clear_quota_cache()
+
+            r_fail = client.get("/v1/stats/agy-quota", headers=headers)
+            assert r_fail.status_code == 200
+            d_fail = r_fail.json()
+            assert d_fail["available"] is False
+            assert "error" in d_fail
+            assert len(d_fail["buckets"]) == 0
+
+    finally:
+        clear_quota_cache()
+        if old_cmd is not None:
+            os.environ["AGY_USAGE_CMD"] = old_cmd
+        else:
+            os.environ.pop("AGY_USAGE_CMD", None)
+        if old_counter is not None:
+            os.environ["COUNTER_FILE"] = old_counter
+        else:
+            os.environ.pop("COUNTER_FILE", None)
+        if old_fail is not None:
+            os.environ["SIMULATE_FAIL"] = old_fail
+        else:
+            os.environ.pop("SIMULATE_FAIL", None)
+
+
+def test_sources_stats_by_key(tmp_path):
+    from app.db import create_job, finish_job
+
+    db_path = os.environ.get("DB_PATH")
+    headers = {"X-API-Key": "test-secret-key"}
+
+    # Seed rows with different api_key_name and statuses
+    j1 = create_job(agent="mock_429", prompt="p1", auth_mode="key", api_key_name="rondeau-int-wpp", db_path=db_path)
+    finish_job(j1["id"], status="completed", total_tokens=100, input_tokens=40, output_tokens=60, db_path=db_path)
+
+    j2 = create_job(agent="mock_429", prompt="p2", auth_mode="key", api_key_name="rondeau-int-wpp", db_path=db_path)
+    finish_job(j2["id"], status="failed", error="some error", db_path=db_path)
+
+    j3 = create_job(agent="mock_429", prompt="p3", auth_mode="bypass", api_key_name="bypass", db_path=db_path)
+    finish_job(j3["id"], status="completed", total_tokens=250, input_tokens=100, output_tokens=150, db_path=db_path)
+
+    j4 = create_job(agent="mock_429", prompt="p4", auth_mode="key", api_key_name="rondeau-int-admin", db_path=db_path)
+    finish_job(j4["id"], status="completed", total_tokens=50, input_tokens=20, output_tokens=30, db_path=db_path)
+
+    with TestClient(app) as client:
+        # sources with by=key
+        res_by_key = client.get("/v1/stats/sources?by=key", headers=headers)
+        assert res_by_key.status_code == 200
+        data_key = res_by_key.json()
+        assert isinstance(data_key, list)
+
+        key_map = {r["api_key_name"]: r for r in data_key}
+        assert "rondeau-int-wpp" in key_map
+        assert "bypass" in key_map
+        assert "rondeau-int-admin" in key_map
+
+        wpp = key_map["rondeau-int-wpp"]
+        assert wpp["total_jobs"] == 2
+        assert wpp["completed_jobs"] == 1
+        assert wpp["failed_jobs"] == 1
+        assert wpp["total_tokens"] == 100
+        assert wpp["error_rate"] == 0.5
+        assert "last_seen" in wpp
+
+        byp = key_map["bypass"]
+        assert byp["total_jobs"] == 1
+        assert byp["completed_jobs"] == 1
+        assert byp["total_tokens"] == 250
+
+        # default sources without by=key returns list grouped by client_ip, auth_mode
+        res_default = client.get("/v1/stats/sources", headers=headers)
+        assert res_default.status_code == 200
+        data_default = res_default.json()
+        assert any("client_ip" in r and "auth_mode" in r for r in data_default)
+
+
+def test_queue_redaction():
+    from app.db import create_job, finish_job
+
+    db_path = os.environ.get("DB_PATH")
+    secret_prompt = "TOP_SECRET_PROMPT_DO_NOT_LEAK_XYZ"
+    long_error = "E" * 400
+
+    j = create_job(
+        agent="mock_429",
+        prompt=secret_prompt,
+        model="gemini-3.8-flash",
+        auth_mode="key",
+        api_key_name="test-consumer",
+        db_path=db_path,
+    )
+    finish_job(j["id"], status="failed", error=long_error, stdout="secret stdout", stderr="secret stderr", db_path=db_path)
+
+    headers = {"X-API-Key": "test-secret-key"}
+    with TestClient(app) as client:
+        res = client.get("/v1/stats/queue", headers=headers)
+        assert res.status_code == 200
+        raw_text = res.text
+
+        # 1. Prompt text must NEVER appear in queue response
+        assert secret_prompt not in raw_text
+
+        # 2. stdout / stderr / metadata must not appear
+        assert "secret stdout" not in raw_text
+        assert "secret stderr" not in raw_text
+
+        # 3. Find our job
+        jobs = res.json()
+        target = next((item for item in jobs if item["id"] == j["id"]), None)
+        assert target is not None
+        assert "prompt" not in target
+        assert "stdout" not in target
+        assert "stderr" not in target
+        assert "metadata" not in target
+
+        # 4. Error is truncated to 300 chars
+        assert len(target["error"]) <= 320
+        assert target["error"].endswith("... (truncated)")
+        assert len(target["error"].replace("... (truncated)", "")) == 300
+
+
+
 
 
 

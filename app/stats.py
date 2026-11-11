@@ -214,10 +214,15 @@ def get_load_stats(by: str = "dow_hour", db_path: Optional[str] = None) -> Dict[
     return res
 
 
-def get_sources_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_sources_stats(
+    by: Optional[str] = None,
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     settings = get_settings()
     path = db_path or settings.db_path
-    cache_key = f"sources:{from_ts}:{to_ts}:{path}"
+    cache_key = f"sources:{by}:{from_ts}:{to_ts}:{path}"
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
@@ -231,6 +236,39 @@ def get_sources_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = 
         where_clauses.append("created_at <= ?")
         params.append(to_ts)
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    if by == "key":
+        sql = f"""
+            SELECT 
+                COALESCE(api_key_name, CASE WHEN auth_mode = 'bypass' THEN 'bypass' ELSE 'default' END) as api_key_name,
+                COUNT(*) as total_jobs,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_jobs,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_jobs,
+                SUM(COALESCE(input_tokens, 0)) as input_tokens,
+                SUM(COALESCE(output_tokens, 0)) as output_tokens,
+                SUM(COALESCE(total_tokens, 0)) as total_tokens,
+                MAX(created_at) as last_seen
+            FROM jobs
+            {where_sql}
+            GROUP BY COALESCE(api_key_name, CASE WHEN auth_mode = 'bypass' THEN 'bypass' ELSE 'default' END)
+            ORDER BY total_jobs DESC;
+        """
+        with _connect_ro(path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+            res = []
+            for r in rows:
+                d = dict(r)
+                tot = d["total_jobs"]
+                fail = d["failed_jobs"]
+                d["error_rate"] = round(fail / tot, 4) if tot > 0 else 0.0
+                d["jobs"] = d["total_jobs"]
+                d["completed"] = d["completed_jobs"]
+                d["failed"] = d["failed_jobs"]
+                d["key_name"] = d["api_key_name"]
+                res.append(d)
+
+        _set_cached(cache_key, res)
+        return res
 
     sql = f"""
         SELECT 

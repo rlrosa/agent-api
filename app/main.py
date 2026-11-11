@@ -38,6 +38,7 @@ from app.db import (
     get_job,
     init_db,
     list_jobs,
+    list_queue_jobs,
     schedule_retry,
 )
 from app.dispatcher import (
@@ -561,12 +562,13 @@ async def stats_load_endpoint(
 
 @app.get("/v1/stats/sources")
 async def stats_sources_endpoint(
+    by: Optional[str] = Query(None),
     from_ts: Optional[float] = Query(None, alias="from"),
     to_ts: Optional[float] = Query(None, alias="to"),
     auth: AuthContext = Depends(require_scope("stats")),
 ):
     settings = get_settings()
-    return await asyncio.to_thread(get_sources_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+    return await asyncio.to_thread(get_sources_stats, by=by, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
 
 
 @app.get("/v1/stats/models")
@@ -595,6 +597,31 @@ async def stats_security_endpoint(
     auth: AuthContext = Depends(require_scope("stats")),
 ):
     return get_security_stats(since=since)
+
+
+from app.agy_quota import get_agy_quota
+
+
+@app.get("/v1/stats/agy-quota")
+async def stats_agy_quota_endpoint(
+    auth: AuthContext = Depends(require_scope("stats")),
+):
+    return await get_agy_quota()
+
+
+@app.get("/v1/stats/queue")
+async def stats_queue_endpoint(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=500),
+    auth: AuthContext = Depends(require_scope("stats")),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(
+        list_queue_jobs,
+        status=status_filter,
+        limit=limit,
+        db_path=settings.db_path,
+    )
 
 
 from app.events import get_logs

@@ -57,6 +57,8 @@ class Settings(BaseModel):
     log_level: str = Field(default="INFO")
     log_prompt_chars: int = Field(default=200)
     job_retention_days: int = Field(default=30)
+    agy_usage_cmd: str = Field(default="agy -p /usage")
+    agy_quota_ttl_s: int = Field(default=300)
 
 
 def get_settings() -> Settings:
@@ -131,6 +133,8 @@ def get_settings() -> Settings:
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         log_prompt_chars=int(os.environ.get("LOG_PROMPT_CHARS", "200")),
         job_retention_days=job_retention_days,
+        agy_usage_cmd=os.environ.get("AGY_USAGE_CMD", "agy -p /usage"),
+        agy_quota_ttl_s=int(os.environ.get("AGY_QUOTA_TTL_S", "300")),
     )
 
 
