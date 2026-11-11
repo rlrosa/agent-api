@@ -167,9 +167,7 @@ def verify_api_key(
 
     trusted = (not has_cf_header) and is_trusted_peer(client_ip, settings.trusted_networks)
 
-    if trusted:
-        auth_ctx = AuthContext(name="bypass", scopes=ALL_SCOPES)
-    else:
+    if x_api_key:
         key_info = authenticate_key_info(x_api_key)
         if not key_info:
             reason = "Missing or invalid X-API-Key"
@@ -181,6 +179,16 @@ def verify_api_key(
             )
         auth_ctx = AuthContext(name=key_info.name, scopes=key_info.scopes)
         logger.info(f"Auth OK (Key name '{key_info.name}' provided by {client_ip}) for {request.url.path}")
+    elif trusted:
+        auth_ctx = AuthContext(name="bypass", scopes=ALL_SCOPES)
+    else:
+        reason = "Missing or invalid X-API-Key"
+        record_auth_failure(client_ip, reason, request.url.path)
+        logger.warning(f"Auth DENIED (peer IP: {client_ip}, CF header: {has_cf_header}) for {request.url.path}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Missing or invalid X-API-Key header",
+        )
 
     # Sliding-window rate limit (skip for /healthz and /dashboard)
     if request.url.path not in ("/healthz", "/dashboard"):

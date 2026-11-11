@@ -77,6 +77,14 @@
         }
         @media (max-width: 1024px) { .dashboard-grid { grid-template-columns: 1fr; } }
 
+        .dashboard-grid-equal {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+        @media (max-width: 1024px) { .dashboard-grid-equal { grid-template-columns: 1fr; } }
+
         .card {
             background-color: var(--card-bg);
             border: 1px solid var(--border-color);
@@ -131,6 +139,9 @@
         .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
         .badge-pending { background-color: rgba(56, 189, 248, 0.2); color: var(--accent-blue); }
         .badge-failed { background-color: rgba(248, 113, 113, 0.2); color: var(--accent-red); }
+        .badge-canceled { background-color: rgba(148, 163, 184, 0.2); color: var(--text-muted); }
+        .badge-completed { background-color: rgba(74, 222, 128, 0.2); color: var(--accent-green); }
+        .badge-running { background-color: rgba(192, 132, 252, 0.2); color: var(--accent-purple); }
     </style>
 </head>
 <body>
@@ -138,7 +149,7 @@
     <header>
         <div>
             <h1>agent-api Observability</h1>
-            <div style="font-size: 0.8rem; color: var(--text-muted);">Real-time System Load & Error Metrics</div>
+            <div style="font-size: 0.8rem; color: var(--text-muted);">Real-time System Load & Error Metrics <span id="authBadge" style="margin-left: 8px;"></span></div>
         </div>
         <div class="header-actions">
             <select id="bucketSelect" onchange="loadTimeseries()">
@@ -185,6 +196,20 @@
         </div>
     </div>
 
+    <!-- agy Quota Panel -->
+    <div class="card" style="margin-bottom: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div class="section-title" style="margin:0;">agy Quota</div>
+            <div style="display: flex; gap: 8px; align-items: center;">
+                <span id="agyQuotaTime" style="font-size: 0.75rem; color: var(--text-muted);"></span>
+                <button onclick="loadAgyQuota()" style="padding: 4px 8px; font-size: 0.75rem;">Refresh</button>
+            </div>
+        </div>
+        <div id="agyQuotaContainer">
+            <div style="color: var(--text-muted); font-size: 0.875rem;">Loading agy quota...</div>
+        </div>
+    </div>
+
     <div class="dashboard-grid">
         <!-- Main Timeseries -->
         <div class="card">
@@ -212,33 +237,36 @@
         <div class="heatmap-grid" id="heatmapGrid"></div>
     </div>
 
-    <div class="dashboard-grid">
-        <!-- Sources -->
+    <!-- Consumers & Traffic Sources Grid -->
+    <div class="dashboard-grid-equal">
+        <!-- Consumers (Usage by Key) -->
         <div class="card">
-            <div class="section-title">Traffic Sources</div>
-            <table>
-                <thead>
-                    <tr><th>Client IP</th><th>Auth Mode</th><th>Jobs</th><th>Completed</th><th>Error %</th></tr>
-                </thead>
-                <tbody id="sourcesTableBody">
-                    <tr><td colspan="5">Loading...</td></tr>
-                </tbody>
-            </table>
+            <div class="section-title">Consumers (Usage by Key)</div>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr><th>Key / Consumer</th><th>Jobs</th><th>Completed</th><th>Failed</th><th>Tokens</th><th>Last Seen</th></tr>
+                    </thead>
+                    <tbody id="consumersTableBody">
+                        <tr><td colspan="6">Loading consumers...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
-        <!-- Logs Viewer -->
+        <!-- Traffic Sources (IP & Auth Mode) -->
         <div class="card">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                <div class="section-title" style="margin:0;">System Events</div>
-                <select id="logLevelSelect" onchange="loadLogs()" style="padding: 4px 8px; font-size: 0.75rem;">
-                    <option value="">ALL Levels</option>
-                    <option value="INFO">INFO</option>
-                    <option value="WARNING">WARNING</option>
-                    <option value="ERROR">ERROR</option>
-                    <option value="DEBUG">DEBUG</option>
-                </select>
+            <div class="section-title">Traffic Sources</div>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr><th>Client IP</th><th>Auth Mode</th><th>Jobs</th><th>Completed</th><th>Error %</th></tr>
+                    </thead>
+                    <tbody id="sourcesTableBody">
+                        <tr><td colspan="5">Loading...</td></tr>
+                    </tbody>
+                </table>
             </div>
-            <div class="log-box" id="logBox">Loading logs...</div>
         </div>
     </div>
 
@@ -267,18 +295,35 @@
         </div>
     </div>
 
-    <!-- Queue Control -->
+    <!-- System Events Logs -->
+    <div class="card" style="margin-bottom: 24px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div class="section-title" style="margin:0;">System Events</div>
+            <select id="logLevelSelect" onchange="loadLogs()" style="padding: 4px 8px; font-size: 0.75rem;">
+                <option value="">ALL Levels</option>
+                <option value="INFO">INFO</option>
+                <option value="WARNING">WARNING</option>
+                <option value="ERROR">ERROR</option>
+                <option value="DEBUG">DEBUG</option>
+            </select>
+        </div>
+        <div class="log-box" id="logBox">Loading logs...</div>
+    </div>
+
+    <!-- Queue Control Panel -->
     <div class="card" style="margin-bottom: 24px;">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 12px;">
-            <div class="section-title" style="margin:0;">Queue Control (Pending & Failed Jobs)</div>
+            <div class="section-title" style="margin:0;">Global Queue Monitor</div>
             <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
                 <select id="queueStatusSelect" onchange="loadQueueJobs()" style="padding: 4px 8px; font-size: 0.75rem;">
                     <option value="all">Pending & Failed</option>
                     <option value="pending">Pending Only</option>
                     <option value="failed">Failed Only</option>
+                    <option value="completed">Completed Only</option>
+                    <option value="running">Running Only</option>
                 </select>
-                <button onclick="retrySelectedJobs()" style="background-color: #1e3a5f; border-color: var(--accent-blue);">Retry Selected</button>
-                <button onclick="cancelSelectedJobs()" class="btn-danger">Cancel Selected</button>
+                <button id="btnRetrySelected" onclick="retrySelectedJobs()" style="background-color: #1e3a5f; border-color: var(--accent-blue); display: none;">Retry Selected</button>
+                <button id="btnCancelSelected" onclick="cancelSelectedJobs()" class="btn-danger" style="display: none;">Cancel Selected</button>
                 <span id="queueActionStatus" style="font-size: 0.75rem; color: var(--accent-green); margin-left: 8px;"></span>
             </div>
         </div>
@@ -286,25 +331,32 @@
             <table>
                 <thead>
                     <tr>
-                        <th style="width: 32px;"><input type="checkbox" id="selectAllJobs" onchange="toggleSelectAllJobs(this.checked)"></th>
+                        <th id="thSelectAll" style="width: 32px; display: none;"><input type="checkbox" id="selectAllJobs" onchange="toggleSelectAllJobs(this.checked)"></th>
                         <th>ID</th>
                         <th>Created</th>
+                        <th>Key / Tenant</th>
                         <th>Agent</th>
                         <th>Model</th>
                         <th>Attempts</th>
                         <th>Status</th>
-                        <th>Error / Exit Code</th>
-                        <th>Actions</th>
+                        <th>Error</th>
+                        <th id="thActions" style="display: none;">Actions</th>
                     </tr>
                 </thead>
                 <tbody id="queueTableBody">
-                    <tr><td colspan="9">Loading queue jobs...</td></tr>
+                    <tr><td colspan="10">Loading queue jobs...</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
     <script>
+        // Derive BASE from current URL path (supports prefix mounting, e.g. /prefix/dashboard -> BASE = /prefix)
+        const BASE = location.pathname.replace(/\/dashboard\/?$/, '');
+
+        let currentCaller = { key_name: "", scopes: [] };
+        let isAdmin = false;
+
         function getApiKey() {
             let key = sessionStorage.getItem("AGENT_API_KEY");
             return key || "";
@@ -315,19 +367,50 @@
             let key = getApiKey();
             if (key) headers["X-API-Key"] = key;
 
+            let fullUrl = url.startsWith("http") ? url : `${BASE}${url}`;
             let opts = { ...options, headers };
-            let res = await fetch(url, opts);
+            let res = await fetch(fullUrl, opts);
+
             if (res.status === 401) {
-                let promptKey = prompt("API Key Required for tunnel access:");
+                let promptKey = prompt("API Key Required for access:");
                 if (promptKey) {
                     sessionStorage.setItem("AGENT_API_KEY", promptKey);
                     headers["X-API-Key"] = promptKey;
                     opts.headers = headers;
-                    res = await fetch(url, opts);
+                    res = await fetch(fullUrl, opts);
                 }
             }
             if (!res.ok) throw new Error("HTTP " + res.status);
             return await res.json();
+        }
+
+        async function loadAuth() {
+            try {
+                let me = await fetchAPI("/v1/me");
+                currentCaller = me;
+                isAdmin = Array.isArray(me.scopes) && me.scopes.includes("admin");
+
+                let badge = document.getElementById("authBadge");
+                if (badge) {
+                    badge.innerHTML = `<span class="badge" style="background:#334155; color:var(--text-main); font-size:0.7rem;">Caller: ${me.key_name} [${me.scopes.join(", ")}]</span>`;
+                }
+            } catch(e) {
+                console.error("Auth me error:", e);
+                isAdmin = false;
+            }
+            updateAdminControls();
+        }
+
+        function updateAdminControls() {
+            let displayVal = isAdmin ? "" : "none";
+            let btnRetry = document.getElementById("btnRetrySelected");
+            if (btnRetry) btnRetry.style.display = displayVal;
+            let btnCancel = document.getElementById("btnCancelSelected");
+            if (btnCancel) btnCancel.style.display = displayVal;
+            let thSelect = document.getElementById("thSelectAll");
+            if (thSelect) thSelect.style.display = displayVal;
+            let thActions = document.getElementById("thActions");
+            if (thActions) thActions.style.display = displayVal;
         }
 
         async function loadSummary() {
@@ -397,8 +480,7 @@
                 let gridContainer = document.getElementById("heatmapGrid");
                 gridContainer.innerHTML = "";
 
-                // Header hours
-                gridContainer.appendChild(document.createElement("div")); // Top-left empty cell
+                gridContainer.appendChild(document.createElement("div"));
                 for(let h=0; h<24; h++) {
                     let hdr = document.createElement("div");
                     hdr.className = "hm-header";
@@ -435,6 +517,97 @@
             } catch(e) { console.error("Heatmap error:", e); }
         }
 
+        async function loadAgyQuota() {
+            let container = document.getElementById("agyQuotaContainer");
+            let timeSpan = document.getElementById("agyQuotaTime");
+            try {
+                let data = await fetchAPI("/v1/stats/agy-quota");
+                if (data.fetched_at) {
+                    timeSpan.innerText = `Updated: ${new Date(data.fetched_at).toLocaleTimeString()}`;
+                }
+
+                if (!data.available) {
+                    container.innerHTML = `
+                        <div style="padding: 16px; border: 1px solid var(--border-color); border-radius: 6px; color: var(--accent-red); background: rgba(248, 113, 113, 0.1);">
+                            <strong>agy Quota Unavailable</strong>
+                            <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">${data.error || 'Quota information could not be retrieved'}</div>
+                        </div>
+                    `;
+                    return;
+                }
+
+                let buckets = data.buckets || [];
+                if (buckets.length === 0) {
+                    container.innerHTML = "<div style='color: var(--text-muted);'>No active quota buckets reported.</div>";
+                    return;
+                }
+
+                let html = '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">';
+                buckets.forEach(b => {
+                    let pct = b.remaining_percent;
+                    let barColor = pct < 20 ? "var(--accent-red)" : (pct < 50 ? "#fde047" : "var(--accent-green)");
+                    let resetDateStr = b.reset_at ? new Date(b.reset_at).toLocaleString() : "-";
+
+                    html += `
+                        <div style="background: #090d16; padding: 14px; border-radius: 6px; border: 1px solid var(--border-color);">
+                            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                <span style="font-weight: 600; font-size: 0.9rem;">${b.bucket}</span>
+                                <span style="font-weight: 700; font-size: 1.1rem; color: ${barColor};">${pct}%</span>
+                            </div>
+                            <div style="width: 100%; height: 8px; background: #334155; border-radius: 4px; overflow: hidden; margin-bottom: 8px;">
+                                <div style="width: ${pct}%; height: 100%; background: ${barColor}; border-radius: 4px;"></div>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: var(--text-muted);">
+                                <span>Group: ${b.group}</span>
+                                <span>Resets: ${resetDateStr}</span>
+                            </div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+                container.innerHTML = html;
+            } catch(e) {
+                console.error("Agy quota error:", e);
+                container.innerHTML = `
+                    <div style="padding: 16px; border: 1px solid var(--border-color); border-radius: 6px; color: var(--accent-red); background: rgba(248, 113, 113, 0.1);">
+                        <strong>agy Quota Unavailable</strong>
+                        <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">${e.message}</div>
+                    </div>
+                `;
+            }
+        }
+
+        async function loadConsumers() {
+            try {
+                let data = await fetchAPI("/v1/stats/sources?by=key");
+                let tbody = document.getElementById("consumersTableBody");
+                tbody.innerHTML = "";
+
+                if (!data || data.length === 0) {
+                    tbody.innerHTML = "<tr><td colspan='6' style='color:var(--text-muted);'>No consumer records found</td></tr>";
+                    return;
+                }
+
+                data.forEach(c => {
+                    let tr = document.createElement("tr");
+                    let lastSeenStr = c.last_seen ? new Date(c.last_seen * 1000).toLocaleString() : "-";
+                    let keyBadge = c.api_key_name === "bypass"
+                        ? `<span class="badge" style="background: rgba(56, 189, 248, 0.2); color: var(--accent-blue);">bypass</span>`
+                        : `<code>${c.api_key_name}</code>`;
+
+                    tr.innerHTML = `
+                        <td>${keyBadge}</td>
+                        <td>${c.total_jobs}</td>
+                        <td>${c.completed_jobs}</td>
+                        <td style="${c.failed_jobs > 0 ? 'color:var(--accent-red);' : ''}">${c.failed_jobs}</td>
+                        <td>${(c.total_tokens || 0).toLocaleString()}</td>
+                        <td style="font-size: 0.75rem; color: var(--text-muted);">${lastSeenStr}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch(e) { console.error("Consumers error:", e); }
+        }
+
         async function loadSources() {
             try {
                 let data = await fetchAPI("/v1/stats/sources");
@@ -442,7 +615,7 @@
                 tbody.innerHTML = "";
 
                 if (!data || data.length === 0) {
-                    tbody.innerHTML = "<tr><td colspan='5'>No source records</td></tr>";
+                    tbody.innerHTML = "<tr><td colspan='5' style='color:var(--text-muted);'>No source records</td></tr>";
                     return;
                 }
 
@@ -461,7 +634,12 @@
                 tbody.innerHTML = "";
 
                 let tax = data.taxonomy || {};
-                Object.keys(tax).forEach(cat => {
+                let keys = Object.keys(tax);
+                if (keys.length === 0) {
+                    tbody.innerHTML = "<tr><td colspan='2' style='color:var(--text-muted);'>No errors recorded</td></tr>";
+                    return;
+                }
+                keys.forEach(cat => {
                     let tr = document.createElement("tr");
                     tr.innerHTML = `<td>${cat}</td><td>${tax[cat]}</td>`;
                     tbody.appendChild(tr);
@@ -503,7 +681,7 @@
                 tbody.innerHTML = "";
 
                 if (!data || data.length === 0) {
-                    tbody.innerHTML = "<tr><td colspan='7'>No model statistics found</td></tr>";
+                    tbody.innerHTML = "<tr><td colspan='7' style='color:var(--text-muted);'>No model statistics found</td></tr>";
                     return;
                 }
 
@@ -562,49 +740,68 @@
             try {
                 let filter = document.getElementById("queueStatusSelect").value;
                 let tbody = document.getElementById("queueTableBody");
-                tbody.innerHTML = "<tr><td colspan='9'>Loading...</td></tr>";
+                let colspan = isAdmin ? 10 : 8;
+                tbody.innerHTML = `<tr><td colspan='${colspan}'>Loading queue jobs...</td></tr>`;
 
-                let jobs = [];
-                if (filter === "all") {
-                    let [pRes, fRes] = await Promise.all([
-                        fetchAPI("/v1/jobs?status=pending&limit=50"),
-                        fetchAPI("/v1/jobs?status=failed&limit=50"),
-                    ]);
-                    jobs = [...(pRes || []), ...(fRes || [])];
-                    jobs.sort((a, b) => b.created_at - a.created_at);
+                let url = "/v1/stats/queue";
+                if (filter && filter !== "all") {
+                    url += `?status=${filter}&limit=100`;
                 } else {
-                    jobs = await fetchAPI(`/v1/jobs?status=${filter}&limit=100`);
+                    url += `?limit=100`;
+                }
+
+                let rawJobs = await fetchAPI(url);
+                let jobs = rawJobs || [];
+
+                if (filter === "all") {
+                    // For "all", prioritize pending & failed
+                    let pendingOrFailed = jobs.filter(j => j.status === "pending" || j.status === "failed");
+                    if (pendingOrFailed.length > 0) {
+                        jobs = pendingOrFailed;
+                    }
                 }
 
                 tbody.innerHTML = "";
                 let selectAll = document.getElementById("selectAllJobs");
                 if (selectAll) selectAll.checked = false;
 
+                updateAdminControls();
+
                 if (!jobs || jobs.length === 0) {
-                    tbody.innerHTML = "<tr><td colspan='9' style='color:var(--text-muted); text-align:center;'>No pending or failed jobs in queue.</td></tr>";
+                    tbody.innerHTML = `<tr><td colspan='${colspan}' style='color:var(--text-muted); text-align:center;'>No jobs matching filter.</td></tr>`;
                     return;
                 }
 
                 jobs.forEach(j => {
                     let tr = document.createElement("tr");
                     let dateStr = new Date(j.created_at * 1000).toISOString().replace("T", " ").substring(0, 19);
-                    let badgeCls = j.status === "pending" ? "badge-pending" : "badge-failed";
-                    let errSnippet = j.error ? j.error.substring(0, 60) : (j.exit_code !== null ? `Exit code ${j.exit_code}` : "-");
+                    let badgeCls = "badge-pending";
+                    if (j.status === "failed") badgeCls = "badge-failed";
+                    else if (j.status === "completed") badgeCls = "badge-completed";
+                    else if (j.status === "canceled") badgeCls = "badge-canceled";
+                    else if (j.status === "running") badgeCls = "badge-running";
+
+                    let errSnippet = j.error ? (j.error.length > 60 ? j.error.substring(0, 60) + "..." : j.error) : "-";
                     let modelStr = j.model ? j.model : "(default)";
+                    let tenantStr = j.api_key_name || "default";
+
+                    let selectTd = isAdmin ? `<td><input type="checkbox" class="job-checkbox" value="${j.id}"></td>` : "";
+                    let actionTd = isAdmin ? `<td>
+                        <button onclick="retryJobSingle('${j.id}')" class="btn-sm" style="margin-right: 4px;">Retry</button>
+                        <button onclick="cancelJobSingle('${j.id}')" class="btn-sm btn-danger">Cancel</button>
+                    </td>` : "";
 
                     tr.innerHTML = `
-                        <td><input type="checkbox" class="job-checkbox" value="${j.id}"></td>
+                        ${selectTd}
                         <td title="${j.id}"><code>${j.id.substring(0, 8)}...</code></td>
-                        <td>${dateStr}</td>
+                        <td style="font-size: 0.75rem;">${dateStr}</td>
+                        <td><code>${tenantStr}</code></td>
                         <td>${j.agent}</td>
                         <td><code>${modelStr}</code></td>
                         <td>${j.attempts}</td>
                         <td><span class="badge ${badgeCls}">${j.status}</span></td>
                         <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${j.error || ''}">${errSnippet}</td>
-                        <td>
-                            <button onclick="retryJobSingle('${j.id}')" class="btn-sm" style="margin-right: 4px;">Retry</button>
-                            <button onclick="cancelJobSingle('${j.id}')" class="btn-sm btn-danger">Cancel</button>
-                        </td>
+                        ${actionTd}
                     `;
                     tbody.appendChild(tr);
                 });
@@ -692,10 +889,13 @@
             loadSummary();
         }
 
-        function refreshAll() {
+        async function refreshAll() {
+            await loadAuth();
             loadSummary();
+            loadAgyQuota();
             loadTimeseries();
             loadHeatmap();
+            loadConsumers();
             loadSources();
             loadModelStats();
             loadQuotaEvents();
