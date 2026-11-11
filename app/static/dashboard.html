@@ -372,15 +372,33 @@
             let res = await fetch(fullUrl, opts);
 
             if (res.status === 401) {
-                let promptKey = prompt("API Key Required for access:");
-                if (promptKey) {
-                    sessionStorage.setItem("AGENT_API_KEY", promptKey);
-                    headers["X-API-Key"] = promptKey;
-                    opts.headers = headers;
-                    res = await fetch(fullUrl, opts);
+                if (BASE !== "") {
+                    // Proxied mode: session expired. Reload top window once to trigger auth flow.
+                    let reloaded = sessionStorage.getItem("AGENT_API_PROXIED_RELOADED");
+                    if (!reloaded) {
+                        sessionStorage.setItem("AGENT_API_PROXIED_RELOADED", "1");
+                        try {
+                            if (window.top && window.top.location) {
+                                window.top.location.reload();
+                                return;
+                            }
+                        } catch (_) {
+                            location.reload();
+                            return;
+                        }
+                    }
+                } else {
+                    let promptKey = prompt("API Key Required for access:");
+                    if (promptKey) {
+                        sessionStorage.setItem("AGENT_API_KEY", promptKey);
+                        headers["X-API-Key"] = promptKey;
+                        opts.headers = headers;
+                        res = await fetch(fullUrl, opts);
+                    }
                 }
             }
             if (!res.ok) throw new Error("HTTP " + res.status);
+            sessionStorage.removeItem("AGENT_API_PROXIED_RELOADED");
             return await res.json();
         }
 
