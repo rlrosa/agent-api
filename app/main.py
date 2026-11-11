@@ -152,9 +152,9 @@ def get_security_stats(since: Optional[float] = None) -> Dict[str, Any]:
 from app.security import ALL_SCOPES, AuthContext, authenticate_key_info, rate_limiter
 
 
-def verify_api_key(
+def _auth_context_for(
     request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    x_api_key: Optional[str] = None,
 ) -> AuthContext:
     settings = get_settings()
     client_ip = request.client.host if request.client else "unknown"
@@ -179,8 +179,9 @@ def verify_api_key(
             )
         auth_ctx = AuthContext(name=key_info.name, scopes=key_info.scopes)
         logger.info(f"Auth OK (Key name '{key_info.name}' provided by {client_ip}) for {request.url.path}")
+        return auth_ctx
     elif trusted:
-        auth_ctx = AuthContext(name="bypass", scopes=ALL_SCOPES)
+        return AuthContext(name="bypass", scopes=ALL_SCOPES)
     else:
         reason = "Missing or invalid X-API-Key"
         record_auth_failure(client_ip, reason, request.url.path)
@@ -190,9 +191,18 @@ def verify_api_key(
             detail="Unauthorized: Missing or invalid X-API-Key header",
         )
 
+
+def verify_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+) -> AuthContext:
+    auth_ctx = _auth_context_for(request, x_api_key)
+
     # Sliding-window rate limit (skip for /healthz and /dashboard)
     if request.url.path not in ("/healthz", "/dashboard"):
+        client_ip = request.client.host if request.client else "unknown"
         caller_id = auth_ctx.name if auth_ctx.name != "bypass" else f"ip_{client_ip}"
+        settings = get_settings()
         is_limited, retry_after = rate_limiter.is_rate_limited(caller_id, settings.rate_limit_per_min)
         if is_limited:
             logger.warning(f"Rate limit exceeded for caller '{caller_id}' (IP: {client_ip}) on {request.url.path}")
@@ -418,7 +428,7 @@ async def create_job_endpoint(
         job_id=job_id,
         client_ip=client_ip,
         auth_mode=auth_mode_str,
-        api_key_name=auth,
+        api_key_name=auth.name,
     )
 
 
@@ -655,25 +665,14 @@ async def dashboard_endpoint(
     request: Request,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
 ):
-    settings = get_settings()
-    client_ip = request.client.host if request.client else "unknown"
-
-    has_cf_header = any(
-        k.lower() in ("cf-connecting-ip", "cf-ray", "cf-visitor")
-        for k in request.headers.keys()
-    )
-
-    trusted = (not has_cf_header) and is_trusted_peer(client_ip, settings.trusted_networks)
-
-    if not trusted:
-        from app.security import authenticate_key_info
-        key_info = authenticate_key_info(x_api_key)
-        if not key_info or "stats" not in key_info.scopes:
-            record_auth_failure(client_ip, "Unauthorized dashboard access", request.url.path)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Unauthorized: Dashboard requires valid key with 'stats' scope",
-            )
+    auth_ctx = _auth_context_for(request, x_api_key)
+    if "stats" not in auth_ctx.scopes:
+        client_ip = request.client.host if request.client else "unknown"
+        record_auth_failure(client_ip, "Unauthorized dashboard access", request.url.path)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Dashboard requires valid key with 'stats' scope",
+        )
 
     dash_path = os.path.join(os.path.dirname(__file__), "static", "dashboard.html")
     if os.path.exists(dash_path):

@@ -98,8 +98,8 @@ def test_f1_no_default_key_when_api_keys_only(tmp_path):
     try:
         keys_map = parse_api_keys()
         assert "default" not in keys_map
-        assert keys_map.get("alice") == "key1"
-        assert keys_map.get("bob") == "key2"
+        assert keys_map.get("alice").secret == "key1"
+        assert keys_map.get("bob").secret == "key2"
     finally:
         os.environ.pop("API_KEYS", None)
         if old_key:
@@ -517,6 +517,20 @@ def test_dashboard_gating():
             )
             assert r_cf_jobs.status_code == 401
 
+            # 5. Trusted peer with invalid key -> 401 (judged by key, not bypassed)
+            r_trusted_bad_key = client.get(
+                "/dashboard",
+                headers={"X-API-Key": "invalid-secret-key"},
+            )
+            assert r_trusted_bad_key.status_code == 401
+
+            # 6. Trusted peer with jobs-only key -> 401
+            r_trusted_jobs_key = client.get(
+                "/dashboard",
+                headers={"X-API-Key": "key-jobs"},
+            )
+            assert r_trusted_jobs_key.status_code == 401
+
     finally:
         if old_key is not None:
             os.environ["API_KEY"] = old_key
@@ -587,6 +601,7 @@ def test_parse_agy_usage_tsv_cases():
     b1 = res["buckets"][0]
     assert b1["group"] == "Gemini Models"
     assert b1["bucket"] == "Weekly Limit Remaining"
+    assert "bucket_name" not in b1
     assert b1["period"] == "weekly"
     assert b1["remaining_percent"] == 80
     assert b1["reset_at"] == "2026-11-14T06:29:14Z"
@@ -724,22 +739,27 @@ def test_sources_stats_by_key(tmp_path):
         data_key = res_by_key.json()
         assert isinstance(data_key, list)
 
-        key_map = {r["api_key_name"]: r for r in data_key}
+        key_map = {r["key_name"]: r for r in data_key}
         assert "rondeau-int-wpp" in key_map
         assert "bypass" in key_map
         assert "rondeau-int-admin" in key_map
 
         wpp = key_map["rondeau-int-wpp"]
-        assert wpp["total_jobs"] == 2
-        assert wpp["completed_jobs"] == 1
-        assert wpp["failed_jobs"] == 1
+        assert wpp["jobs"] == 2
+        assert wpp["completed"] == 1
+        assert wpp["failed"] == 1
         assert wpp["total_tokens"] == 100
         assert wpp["error_rate"] == 0.5
         assert "last_seen" in wpp
+        # check old aliases are dropped
+        assert "total_jobs" not in wpp
+        assert "api_key_name" not in wpp
+        assert "completed_jobs" not in wpp
+        assert "failed_jobs" not in wpp
 
         byp = key_map["bypass"]
-        assert byp["total_jobs"] == 1
-        assert byp["completed_jobs"] == 1
+        assert byp["jobs"] == 1
+        assert byp["completed"] == 1
         assert byp["total_tokens"] == 250
 
         # default sources without by=key returns list grouped by client_ip, auth_mode

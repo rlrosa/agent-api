@@ -83,7 +83,6 @@ def parse_agy_usage_tsv(stdout: Optional[str]) -> Optional[Dict[str, Any]]:
         buckets.append({
             "group": group,
             "bucket": bucket_name,
-            "bucket_name": bucket_name,
             "period": period,
             "remaining_percent": percent,
             "reset_at": reset_at_str,

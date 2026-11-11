@@ -260,12 +260,18 @@ def get_sources_stats(
                 d = dict(r)
                 tot = d["total_jobs"]
                 fail = d["failed_jobs"]
-                d["error_rate"] = round(fail / tot, 4) if tot > 0 else 0.0
-                d["jobs"] = d["total_jobs"]
-                d["completed"] = d["completed_jobs"]
-                d["failed"] = d["failed_jobs"]
-                d["key_name"] = d["api_key_name"]
-                res.append(d)
+                err_rate = round(fail / tot, 4) if tot > 0 else 0.0
+                res.append({
+                    "key_name": d["api_key_name"],
+                    "jobs": tot,
+                    "completed": d["completed_jobs"],
+                    "failed": fail,
+                    "input_tokens": d["input_tokens"],
+                    "output_tokens": d["output_tokens"],
+                    "total_tokens": d["total_tokens"],
+                    "last_seen": d["last_seen"],
+                    "error_rate": err_rate,
+                })
 
         _set_cached(cache_key, res)
         return res

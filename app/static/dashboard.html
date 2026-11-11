@@ -591,15 +591,15 @@
                 data.forEach(c => {
                     let tr = document.createElement("tr");
                     let lastSeenStr = c.last_seen ? new Date(c.last_seen * 1000).toLocaleString() : "-";
-                    let keyBadge = c.api_key_name === "bypass"
+                    let keyBadge = c.key_name === "bypass"
                         ? `<span class="badge" style="background: rgba(56, 189, 248, 0.2); color: var(--accent-blue);">bypass</span>`
-                        : `<code>${c.api_key_name}</code>`;
+                        : `<code>${c.key_name}</code>`;
 
                     tr.innerHTML = `
                         <td>${keyBadge}</td>
-                        <td>${c.total_jobs}</td>
-                        <td>${c.completed_jobs}</td>
-                        <td style="${c.failed_jobs > 0 ? 'color:var(--accent-red);' : ''}">${c.failed_jobs}</td>
+                        <td>${c.jobs}</td>
+                        <td>${c.completed}</td>
+                        <td style="${c.failed > 0 ? 'color:var(--accent-red);' : ''}">${c.failed}</td>
                         <td>${(c.total_tokens || 0).toLocaleString()}</td>
                         <td style="font-size: 0.75rem; color: var(--text-muted);">${lastSeenStr}</td>
                     `;

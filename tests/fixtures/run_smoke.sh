@@ -4,10 +4,14 @@ set -e
 WORKTREE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEMP_DB="/tmp/smoke_agent_api_$$_.db"
 EVIDENCE_DIR="/tmp/prl-rondeau/members/worker/evidence"
-SMOKE_OUT="$EVIDENCE_DIR/32-04-smoke.txt"
+SMOKE_OUT="$EVIDENCE_DIR/33-03-m31-smoke.txt"
 
 mkdir -p "$EVIDENCE_DIR"
 rm -f "$TEMP_DB"
+
+# Ensure ports are free
+fuser -k 18090/tcp 18091/tcp 2>/dev/null || true
+sleep 0.5
 
 echo "=== Seeding scratch database at $TEMP_DB ==="
 export API_KEY="test-key"

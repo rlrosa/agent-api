@@ -16,8 +16,8 @@ async function run() {
   console.log('Navigating to http://127.0.0.1:18090/dashboard ...');
   await page1.goto('http://127.0.0.1:18090/dashboard', { waitUntil: 'networkidle' });
   await page1.waitForTimeout(2000);
-  await page1.screenshot({ path: '/tmp/prl-rondeau/members/worker/evidence/32-dashboard.png', fullPage: true });
-  console.log('Saved 32-dashboard.png');
+  await page1.screenshot({ path: '/tmp/prl-rondeau/members/worker/evidence/33-dashboard.png', fullPage: true });
+  console.log('Saved 33-dashboard.png');
   console.log('Direct Dashboard Console Logs:', logs1);
 
   // 2. Prefixed dashboard (:18091/prefix/dashboard) - proxy with stats key only, admin controls hidden
@@ -29,8 +29,8 @@ async function run() {
   console.log('Navigating to http://127.0.0.1:18091/prefix/dashboard ...');
   await page2.goto('http://127.0.0.1:18091/prefix/dashboard', { waitUntil: 'networkidle' });
   await page2.waitForTimeout(2000);
-  await page2.screenshot({ path: '/tmp/prl-rondeau/members/worker/evidence/32-dashboard-prefixed.png', fullPage: true });
-  console.log('Saved 32-dashboard-prefixed.png');
+  await page2.screenshot({ path: '/tmp/prl-rondeau/members/worker/evidence/33-dashboard-prefixed.png', fullPage: true });
+  console.log('Saved 33-dashboard-prefixed.png');
   console.log('Prefixed Dashboard Console Logs:', logs2);
 
   await browser.close();

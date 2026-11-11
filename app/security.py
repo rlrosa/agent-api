@@ -5,61 +5,30 @@ import time
 from typing import Dict, Optional, Set, Tuple
 from app.config import get_settings
 
+from dataclasses import dataclass
+
 VALID_SCOPES: Set[str] = {"jobs", "stats", "admin"}
 DEFAULT_SCOPES: Set[str] = {"jobs", "stats"}
 ALL_SCOPES: Set[str] = {"jobs", "stats", "admin"}
 
 
-class KeyInfo(str):
-    """
-    Represents an API key with associated name and scopes.
-    Inherits from str so that keys_map[name] == secret remains True
-    for backward compatibility with existing tests and callers.
-    """
+@dataclass(frozen=True)
+class KeyInfo:
+    """Represents an API key with associated name and scopes."""
+    name: str
     secret: str
     scopes: Set[str]
-    name: str
-
-    def __new__(cls, secret: str, scopes: Set[str], name: str = ""):
-        instance = super().__new__(cls, secret)
-        instance.secret = secret
-        instance.scopes = set(scopes)
-        instance.name = name
-        return instance
-
-    def __eq__(self, other):
-        if isinstance(other, str):
-            return self.secret == str(other)
-        if isinstance(other, KeyInfo):
-            return self.secret == other.secret and self.scopes == other.scopes and self.name == other.name
-        return False
 
 
-class AuthContext(str):
-    """
-    Represents authenticated identity in request context.
-    Inherits from str so that auth == "bypass" or passing auth as api_key_name
-    remains completely compatible.
-    """
+@dataclass(frozen=True)
+class AuthContext:
+    """Represents authenticated identity in request context."""
     name: str
     scopes: Set[str]
-
-    def __new__(cls, name: str, scopes: Set[str]):
-        instance = super().__new__(cls, name)
-        instance.name = name
-        instance.scopes = set(scopes)
-        return instance
 
     @property
     def key_name(self) -> str:
         return self.name
-
-    def __eq__(self, other):
-        if isinstance(other, str):
-            return self.name == str(other)
-        if isinstance(other, AuthContext):
-            return self.name == other.name and self.scopes == other.scopes
-        return False
 
 
 def _parse_entry(entry: str) -> Optional[Tuple[str, str, Set[str]]]:
@@ -111,7 +80,7 @@ def parse_api_keys() -> Dict[str, KeyInfo]:
     if settings.api_key:
         secret = settings.api_key.strip()
         if secret:
-            keys_map["default"] = KeyInfo(secret, scopes=set(DEFAULT_SCOPES), name="default")
+            keys_map["default"] = KeyInfo(name="default", secret=secret, scopes=set(DEFAULT_SCOPES))
 
     # Named API_KEYS (e.g. "laptop:key1,rondeau:key2:stats")
     if settings.api_keys:
@@ -119,7 +88,7 @@ def parse_api_keys() -> Dict[str, KeyInfo]:
             parsed = _parse_entry(entry)
             if parsed:
                 name, secret, scopes = parsed
-                keys_map[name] = KeyInfo(secret, scopes=scopes, name=name)
+                keys_map[name] = KeyInfo(name=name, secret=secret, scopes=scopes)
 
     return keys_map
 
