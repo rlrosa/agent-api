@@ -60,7 +60,7 @@ def get_summary_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = 
                 SUM(COALESCE(input_tokens, 0)) as total_input_tokens,
                 SUM(COALESCE(output_tokens, 0)) as total_output_tokens,
                 SUM(COALESCE(total_tokens, 0)) as total_tokens,
-                SUM(COALESCE(cost_usd, 0.0)) as total_cost_usd
+                SUM(cost_usd) as total_cost_usd
             FROM jobs {where_sql};
         """, params).fetchone()
 
@@ -87,6 +87,9 @@ def get_summary_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = 
 
         db_size = get_db_file_size(path)
 
+        raw_cost = d.get("total_cost_usd")
+        total_cost_usd = round(raw_cost, 4) if raw_cost is not None else None
+
         res = {
             "total_jobs": total,
             "completed_jobs": d.get("completed_jobs") or 0,
@@ -99,7 +102,7 @@ def get_summary_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = 
             "total_input_tokens": d.get("total_input_tokens") or 0,
             "total_output_tokens": d.get("total_output_tokens") or 0,
             "total_tokens": d.get("total_tokens") or 0,
-            "total_cost_usd": round(d.get("total_cost_usd") or 0.0, 4),
+            "total_cost_usd": total_cost_usd,
             "db_size": db_size,
         }
 
@@ -211,10 +214,15 @@ def get_load_stats(by: str = "dow_hour", db_path: Optional[str] = None) -> Dict[
     return res
 
 
-def get_sources_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def get_sources_stats(
+    by: Optional[str] = None,
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     settings = get_settings()
     path = db_path or settings.db_path
-    cache_key = f"sources:{from_ts}:{to_ts}:{path}"
+    cache_key = f"sources:{by}:{from_ts}:{to_ts}:{path}"
     cached = _get_cached(cache_key)
     if cached is not None:
         return cached
@@ -228,6 +236,45 @@ def get_sources_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = 
         where_clauses.append("created_at <= ?")
         params.append(to_ts)
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    if by == "key":
+        sql = f"""
+            SELECT 
+                COALESCE(api_key_name, CASE WHEN auth_mode = 'bypass' THEN 'bypass' ELSE 'default' END) as api_key_name,
+                COUNT(*) as total_jobs,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_jobs,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_jobs,
+                SUM(COALESCE(input_tokens, 0)) as input_tokens,
+                SUM(COALESCE(output_tokens, 0)) as output_tokens,
+                SUM(COALESCE(total_tokens, 0)) as total_tokens,
+                MAX(created_at) as last_seen
+            FROM jobs
+            {where_sql}
+            GROUP BY COALESCE(api_key_name, CASE WHEN auth_mode = 'bypass' THEN 'bypass' ELSE 'default' END)
+            ORDER BY total_jobs DESC;
+        """
+        with _connect_ro(path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+            res = []
+            for r in rows:
+                d = dict(r)
+                tot = d["total_jobs"]
+                fail = d["failed_jobs"]
+                err_rate = round(fail / tot, 4) if tot > 0 else 0.0
+                res.append({
+                    "key_name": d["api_key_name"],
+                    "jobs": tot,
+                    "completed": d["completed_jobs"],
+                    "failed": fail,
+                    "input_tokens": d["input_tokens"],
+                    "output_tokens": d["output_tokens"],
+                    "total_tokens": d["total_tokens"],
+                    "last_seen": d["last_seen"],
+                    "error_rate": err_rate,
+                })
+
+        _set_cached(cache_key, res)
+        return res
 
     sql = f"""
         SELECT 
@@ -251,6 +298,89 @@ def get_sources_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = 
             fail = d["failed_jobs"]
             d["error_rate"] = round(fail / tot, 4) if tot > 0 else 0.0
             res.append(d)
+
+    _set_cached(cache_key, res)
+    return res
+
+
+def get_model_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = None, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    settings = get_settings()
+    path = db_path or settings.db_path
+    cache_key = f"models:{from_ts}:{to_ts}:{path}"
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    where_clauses = []
+    params: List[Any] = []
+    if from_ts is not None:
+        where_clauses.append("created_at >= ?")
+        params.append(from_ts)
+    if to_ts is not None:
+        where_clauses.append("created_at <= ?")
+        params.append(to_ts)
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    sql = f"""
+        SELECT 
+            COALESCE(agent, 'unknown') as agent,
+            model,
+            COUNT(*) as total_jobs,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_jobs,
+            SUM(COALESCE(total_tokens, 0)) as total_tokens,
+            AVG(COALESCE(input_tokens, 0)) as avg_input_tokens
+        FROM jobs
+        {where_sql}
+        GROUP BY agent, model
+        ORDER BY total_jobs DESC;
+    """
+
+    with _connect_ro(path) as conn:
+        rows = conn.execute(sql, params).fetchall()
+        res = []
+        for r in rows:
+            d = dict(r)
+            agent_val = d["agent"]
+            model_val = d["model"]
+
+            # Duration percentiles for completed jobs for this agent/model
+            dur_params = list(params)
+            dur_where = list(where_clauses)
+            dur_where.append("status = 'completed'")
+            dur_where.append("started_at IS NOT NULL")
+            dur_where.append("finished_at IS NOT NULL")
+            if agent_val == "unknown":
+                dur_where.append("agent IS NULL")
+            else:
+                dur_where.append("agent = ?")
+                dur_params.append(agent_val)
+
+            if model_val is None:
+                dur_where.append("model IS NULL")
+            else:
+                dur_where.append("model = ?")
+                dur_params.append(model_val)
+
+            dur_sql = f"SELECT (finished_at - started_at) as dur FROM jobs WHERE {' AND '.join(dur_where)} ORDER BY dur ASC;"
+            dur_rows = conn.execute(dur_sql, dur_params).fetchall()
+            durations = [dr[0] for dr in dur_rows if dr[0] is not None]
+            if durations:
+                n = len(durations)
+                p50 = round(durations[int(n * 0.50)], 2)
+                p95 = round(durations[min(int(n * 0.95), n - 1)], 2)
+            else:
+                p50 = p95 = 0.0
+
+            res.append({
+                "agent": agent_val,
+                "model": model_val,
+                "total_jobs": d["total_jobs"],
+                "failed_jobs": d["failed_jobs"],
+                "total_tokens": d["total_tokens"],
+                "avg_input_tokens": round(d["avg_input_tokens"] or 0.0, 1),
+                "duration_p50_s": p50,
+                "duration_p95_s": p95,
+            })
 
     _set_cached(cache_key, res)
     return res

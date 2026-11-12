@@ -314,6 +314,30 @@ def test_unparseable_stdout_falls_back_safely():
     assert is_rate_limit_error(stdout="not json 4429", stderr="", exit_code=1) is False
 
 
+@pytest.mark.asyncio
+async def test_claude_upstream_cost_reporting(tmp_env):
+    from app.db import create_job, claim_next_job, get_job
+
+    job = create_job("claude", "Cost test", db_path=tmp_env["db_path"])
+    claimed = claim_next_job(db_path=tmp_env["db_path"])
+
+    claude_json = json.dumps({
+        "result": "Hello from Claude",
+        "usage": {"input_tokens": 1200, "output_tokens": 300},
+        "total_cost_usd": 0.0425,
+    })
+    custom_argv = ["python3", "-c", f"import sys; sys.stdout.write({json.dumps(claude_json)})"]
+    result = await run_job(claimed, custom_argv=custom_argv)
+
+    assert result["status"] == "completed"
+    assert result["cost_usd"] == 0.0425
+
+    # Check database persistence
+    fetched = get_job(job["id"], db_path=tmp_env["db_path"])
+    assert fetched["cost_usd"] == 0.0425
+
+
+
 
 
 

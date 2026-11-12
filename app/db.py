@@ -260,21 +260,24 @@ def schedule_retry(
     job_id: str,
     next_attempt_at: float,
     db_path: Optional[str] = None,
+    reset_attempts: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     path = _get_db_path(db_path)
 
     with _db_lock:
         with _connect(path) as conn:
-            cur = conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'pending',
-                    next_attempt_at = ?
-                WHERE id = ?
-                RETURNING *;
-                """,
-                (next_attempt_at, job_id),
-            )
+            query = "UPDATE jobs SET status = 'pending', next_attempt_at = ?"
+            params = [next_attempt_at]
+            if reset_attempts:
+                query += ", attempts = 0"
+            if metadata is not None:
+                query += ", metadata = ?"
+                params.append(json.dumps(metadata))
+            query += " WHERE id = ? RETURNING *;"
+            params.append(job_id)
+
+            cur = conn.execute(query, tuple(params))
             row = cur.fetchone()
             conn.commit()
             return _row_to_dict(row)
@@ -357,6 +360,43 @@ def list_jobs(
             cur = conn.execute(sql, params)
             rows = cur.fetchall()
             return [_row_to_dict(r) for r in rows]
+
+
+def list_queue_jobs(
+    status: Optional[str] = None,
+    limit: int = 50,
+    db_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    path = _get_db_path(db_path)
+
+    with _db_lock:
+        with _connect(path) as conn:
+            where_clauses = []
+            params: List[Any] = []
+
+            if status is not None:
+                where_clauses.append("status = ?")
+                params.append(status)
+
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            params.append(min(max(1, limit), 500))
+
+            sql = f"""
+                SELECT id, agent, model, status, attempts, created_at, started_at, finished_at, api_key_name, error
+                FROM jobs
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT ?;
+            """
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                if d.get("error") and len(d["error"]) > 300:
+                    d["error"] = d["error"][:300] + "... (truncated)"
+                results.append(d)
+            return results
 
 
 def reset_orphans(db_path: Optional[str] = None) -> int:

@@ -162,16 +162,44 @@ The server is configured via environment variables.
 
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |
-| `API_KEY` | *(Required)* | Secret key required in the `X-API-Key` HTTP header. |
+| `API_KEY` | *(Optional)* | Legacy single API key; granted default scopes (`jobs,stats`). |
+| `API_KEYS` | *(Optional)* | Named API keys with optional scopes: `name:secret[:scope+scope],...`. Scopes: `jobs`, `stats`, `admin`. Defaults to `jobs+stats`. |
 | `HOST` | `0.0.0.0` | Server bind IP address. |
 | `PORT` | `8090` | Server HTTP port. |
-| `TRUSTED_NETWORKS` | `127.0.0.1/32,::1/128,127.0.0.0/8` | Trusted CIDR networks for API key auth bypass (Loopback only). Note: adding subnets here grants them full auth bypass. |
+| `TRUSTED_NETWORKS` | `127.0.0.1/32,::1/128,127.0.0.0/8` | Trusted CIDR networks for API key auth bypass when no key header is sent. |
 | `DB_PATH` | `./data/jobs.db` | SQLite database filepath. |
 | `WORK_ROOT` | `/var/tmp/agent-api/jobs` | Directory for per-job isolated workspaces. |
 | `BWRAP_ENABLED` | `1` | Enable Bubblewrap OS sandboxing for `agy` and `claude` (1=true, 0=false). |
 | `JOB_TIMEOUT` | `120` | Max job execution timeout in seconds. |
 | `MAX_CONCURRENT_JOBS` | `3` | Maximum worker concurrency for background jobs. |
 | `PURGE_AFTER_HOURS` | `24` | Automated background purge window for old job records. |
+| `AGY_USAGE_CMD` | `agy -p /usage` | Shell command executed to retrieve raw agy usage TSV. |
+| `AGY_QUOTA_TTL_S` | `1800` | In-memory cache TTL for agy quota query in seconds (30m). |
+
+---
+
+## Authentication, Scopes & Dashboard Gating
+
+### API Key Scopes
+Named keys configured in `API_KEYS` support explicit scopes:
+- **Format**: `name:secret[:scope+scope],...`
+- **Valid Scopes**:
+  - `jobs`: Submit, retrieve, list, and cancel caller's own jobs (`/v1/jobs`, `/v1/jobs/{id}`).
+  - `stats`: Access metrics, server logs, and the dashboard (`/v1/stats/*`, `/v1/logs`, `/dashboard`).
+  - `admin`: Cross-tenant job operations and full administrative controls on the dashboard.
+- **Default Scopes**: If no scope suffix is specified in `name:secret`, keys default to `jobs+stats`. Legacy single `API_KEY` also receives `jobs+stats`.
+
+### Loopback Authentication Rule
+- Callers connecting from trusted loopback/peer socket IPs (`TRUSTED_NETWORKS`) **without** an `X-API-Key` header receive bypass mode (`key_name="bypass"`, with full permissions `["admin", "jobs", "stats"]`).
+- **Strict key evaluation**: If a loopback caller sends an `X-API-Key` header, the request is judged strictly by that key. An invalid key returns **HTTP 401 Unauthorized** (it does not fall back to bypass). A key missing the required scope returns **HTTP 403 Forbidden** (or HTTP 401 for `/dashboard`).
+- Requests bearing Cloudflare Tunnel headers (`CF-Connecting-IP`, `CF-Ray`, `CF-Visitor`) always require a valid API key, even if connecting over loopback.
+
+### Dashboard Gating Rule (`/dashboard`)
+Access to `/dashboard` requires either:
+1. Trusted loopback peer without a key (grants full administrator controls).
+2. A valid API key with at least `stats` scope.
+
+When accessed by a key with `stats` scope (without `admin` scope), the dashboard renders in read-only mode, hiding administrative controls (such as canceling or retrying other callers' jobs). Callers without `stats` scope receive **HTTP 401 Unauthorized**.
 
 ---
 
@@ -281,6 +309,78 @@ curl -s -X POST http://192.168.87.132:8090/v1/jobs \
   }' | jq -r .stdout
 ```
 
+
+### 7. Inspect Caller Identity & Scopes
+`GET /v1/me` (Requires any valid API key or trusted loopback)
+
+Returns the authenticated key name and its associated scopes:
+
+```bash
+curl -s http://127.0.0.1:8090/v1/me -H "X-API-Key: $AGENT_API_KEY" | jq .
+```
+```json
+{
+  "key_name": "rondeau-int-admin",
+  "scopes": ["stats"]
+}
+```
+
+### 8. agy Quota Limits
+`GET /v1/stats/agy-quota` (Requires `stats` scope)
+
+Queries CLI usage (`AGY_USAGE_CMD`, default `agy -p /usage`) and returns weekly and 5-hour quota percentages. Results are cached in memory for `AGY_QUOTA_TTL_S` (default 1800s / 30m). **Does NOT create a job record in the database.**
+
+```bash
+curl -s http://127.0.0.1:8090/v1/stats/agy-quota -H "X-API-Key: $AGENT_API_KEY" | jq .
+```
+```json
+{
+  "available": true,
+  "buckets": [
+    {
+      "group": "Gemini Models",
+      "bucket": "Weekly Limit Remaining",
+      "period": "weekly",
+      "remaining_percent": 80,
+      "reset_at": "2026-11-14T06:29:14Z"
+    }
+  ],
+  "fetched_at": "2026-11-11T13:45:00Z"
+}
+```
+
+### 9. Queue Depth & Redacted Statistics
+`GET /v1/stats/queue` (Requires `stats` scope)
+
+Returns high-water mark, queue depth, and running/pending jobs with prompts and arguments strictly redacted to avoid leaking sensitive contents.
+
+```bash
+curl -s http://127.0.0.1:8090/v1/stats/queue -H "X-API-Key: $AGENT_API_KEY" | jq .
+```
+
+### 10. Consumer Usage Aggregation
+`GET /v1/stats/sources?by=key` (Requires `stats` scope)
+
+Aggregates job counts, completions, failures, error rates, and token consumption by API key name (`bypass` for unauthenticated loopback callers):
+
+```bash
+curl -s http://127.0.0.1:8090/v1/stats/sources?by=key -H "X-API-Key: $AGENT_API_KEY" | jq .
+```
+```json
+[
+  {
+    "key_name": "rondeau-int-wpp",
+    "jobs": 150,
+    "completed": 148,
+    "failed": 2,
+    "input_tokens": 120500,
+    "output_tokens": 45000,
+    "total_tokens": 165500,
+    "last_seen": 1731360000.0,
+    "error_rate": 0.0133
+  }
+]
+```
 
 ---
 

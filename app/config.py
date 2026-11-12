@@ -1,6 +1,7 @@
+import json
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("agent-api.config")
@@ -31,6 +32,7 @@ class Settings(BaseModel):
     keep_workspace_on_failure: bool = Field(default=False)
     sandbox_enabled: bool = Field(default=True)
     agent_flags: Dict[str, str] = Field(default_factory=dict)
+    model_prices: Dict[str, Any] = Field(default_factory=dict)
     claude_disallowed_tools: str = Field(default="Bash,WebFetch")
     rate_limit_patterns: List[str] = Field(
         default_factory=lambda: [
@@ -55,6 +57,8 @@ class Settings(BaseModel):
     log_level: str = Field(default="INFO")
     log_prompt_chars: int = Field(default=200)
     job_retention_days: int = Field(default=30)
+    agy_usage_cmd: str = Field(default="agy -p /usage")
+    agy_quota_ttl_s: int = Field(default=300)
 
 
 def get_settings() -> Settings:
@@ -83,6 +87,16 @@ def get_settings() -> Settings:
             agent_name = key[len("AGENT_FLAGS_"):].lower()
             agent_flags[agent_name] = value
 
+    model_prices: Dict[str, Any] = {}
+    raw_model_prices = os.environ.get("MODEL_PRICES", "")
+    if raw_model_prices:
+        try:
+            parsed = json.loads(raw_model_prices)
+            if isinstance(parsed, dict):
+                model_prices = {k.lower(): v for k, v in parsed.items()}
+        except Exception as exc:
+            logger.warning(f"Failed to parse MODEL_PRICES JSON: {exc}")
+
     return Settings(
         api_key=api_key,
         host=os.environ.get("HOST", "0.0.0.0"),
@@ -106,6 +120,7 @@ def get_settings() -> Settings:
         keep_workspace_on_failure=os.environ.get("KEEP_WORKSPACE_ON_FAILURE", "0").lower() in ("1", "true", "yes"),
         sandbox_enabled=os.environ.get("SANDBOX_ENABLED", "1").lower() in ("1", "true", "yes"),
         agent_flags=agent_flags,
+        model_prices=model_prices,
         claude_disallowed_tools=os.environ.get("CLAUDE_DISALLOWED_TOOLS", "Bash,WebFetch"),
         recover_successes=int(os.environ.get("RECOVER_SUCCESSES", "3")),
         allow_mock_agent=os.environ.get("ALLOW_MOCK_AGENT", "0").lower() in ("1", "true", "yes"),
@@ -118,6 +133,8 @@ def get_settings() -> Settings:
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         log_prompt_chars=int(os.environ.get("LOG_PROMPT_CHARS", "200")),
         job_retention_days=job_retention_days,
+        agy_usage_cmd=os.environ.get("AGY_USAGE_CMD", "agy -p /usage"),
+        agy_quota_ttl_s=int(os.environ.get("AGY_QUOTA_TTL_S", "300")),
     )
 
 

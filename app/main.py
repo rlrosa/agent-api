@@ -38,6 +38,8 @@ from app.db import (
     get_job,
     init_db,
     list_jobs,
+    list_queue_jobs,
+    schedule_retry,
 )
 from app.dispatcher import (
     register_waiter,
@@ -147,10 +149,13 @@ def get_security_stats(since: Optional[float] = None) -> Dict[str, Any]:
     }
 
 
-def verify_api_key(
+from app.security import ALL_SCOPES, AuthContext, authenticate_key_info, rate_limiter
+
+
+def _auth_context_for(
     request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-):
+    x_api_key: Optional[str] = None,
+) -> AuthContext:
     settings = get_settings()
     client_ip = request.client.host if request.client else "unknown"
 
@@ -162,13 +167,9 @@ def verify_api_key(
 
     trusted = (not has_cf_header) and is_trusted_peer(client_ip, settings.trusted_networks)
 
-    from app.security import authenticate_key, rate_limiter
-
-    if trusted:
-        key_name = "bypass"
-    else:
-        key_name = authenticate_key(x_api_key)
-        if not key_name:
+    if x_api_key:
+        key_info = authenticate_key_info(x_api_key)
+        if not key_info:
             reason = "Missing or invalid X-API-Key"
             record_auth_failure(client_ip, reason, request.url.path)
             logger.warning(f"Auth DENIED (peer IP: {client_ip}, CF header: {has_cf_header}) for {request.url.path}")
@@ -176,11 +177,32 @@ def verify_api_key(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized: Missing or invalid X-API-Key header",
             )
-        logger.info(f"Auth OK (Key name '{key_name}' provided by {client_ip}) for {request.url.path}")
+        auth_ctx = AuthContext(name=key_info.name, scopes=key_info.scopes)
+        logger.info(f"Auth OK (Key name '{key_info.name}' provided by {client_ip}) for {request.url.path}")
+        return auth_ctx
+    elif trusted:
+        return AuthContext(name="bypass", scopes=ALL_SCOPES)
+    else:
+        reason = "Missing or invalid X-API-Key"
+        record_auth_failure(client_ip, reason, request.url.path)
+        logger.warning(f"Auth DENIED (peer IP: {client_ip}, CF header: {has_cf_header}) for {request.url.path}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Missing or invalid X-API-Key header",
+        )
+
+
+def verify_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+) -> AuthContext:
+    auth_ctx = _auth_context_for(request, x_api_key)
 
     # Sliding-window rate limit (skip for /healthz and /dashboard)
     if request.url.path not in ("/healthz", "/dashboard"):
-        caller_id = key_name if key_name != "bypass" else f"ip_{client_ip}"
+        client_ip = request.client.host if request.client else "unknown"
+        caller_id = auth_ctx.name if auth_ctx.name != "bypass" else f"ip_{client_ip}"
+        settings = get_settings()
         is_limited, retry_after = rate_limiter.is_rate_limited(caller_id, settings.rate_limit_per_min)
         if is_limited:
             logger.warning(f"Rate limit exceeded for caller '{caller_id}' (IP: {client_ip}) on {request.url.path}")
@@ -190,7 +212,36 @@ def verify_api_key(
                 headers={"Retry-After": str(retry_after)},
             )
 
-    return key_name
+    return auth_ctx
+
+
+def require_scope(scope: str):
+    def dependency(auth: AuthContext = Depends(verify_api_key)) -> AuthContext:
+        if scope not in auth.scopes:
+            logger.warning(f"Forbidden: Caller '{auth.name}' missing required scope '{scope}' on request")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Forbidden: Missing required scope '{scope}'",
+            )
+        return auth
+    return dependency
+
+
+def check_job_modify_auth(auth: AuthContext) -> str:
+    """
+    Returns the api_key_name filter for db operations.
+    If caller has admin scope, returns 'bypass' (allowing cross-tenant modify).
+    If caller has jobs scope, returns auth.name (enforcing tenant isolation).
+    If caller has neither, raises 403 Forbidden.
+    """
+    if "admin" in auth.scopes:
+        return "bypass"
+    if "jobs" in auth.scopes:
+        return auth.name
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Forbidden: Missing required scope ('jobs' or 'admin')",
+    )
 
 
 
@@ -220,7 +271,7 @@ async def healthz():
 @app.post("/v1/jobs")
 async def create_job_endpoint(
     request: Request,
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("jobs")),
 ):
     settings = get_settings()
     content_type = request.headers.get("content-type", "")
@@ -377,7 +428,7 @@ async def create_job_endpoint(
         job_id=job_id,
         client_ip=client_ip,
         auth_mode=auth_mode_str,
-        api_key_name=auth,
+        api_key_name=auth.name,
     )
 
 
@@ -411,10 +462,11 @@ async def create_job_endpoint(
 @app.get("/v1/jobs/{job_id}")
 async def get_job_endpoint(
     job_id: str,
-    api_key: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("jobs")),
 ):
     settings = get_settings()
-    job = get_job(job_id, db_path=settings.db_path, api_key_name=api_key)
+    tenant_filter = "bypass" if "admin" in auth.scopes else auth.name
+    job = get_job(job_id, db_path=settings.db_path, api_key_name=tenant_filter)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
     return job
@@ -424,27 +476,56 @@ async def get_job_endpoint(
 async def list_jobs_endpoint(
     status_filter: Optional[str] = Query(None, alias="status"),
     limit: int = Query(default=50, ge=1, le=500),
-    api_key: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("jobs")),
 ):
     settings = get_settings()
-    return list_jobs(status=status_filter, limit=limit, db_path=settings.db_path, api_key_name=api_key)
+    return list_jobs(status=status_filter, limit=limit, db_path=settings.db_path, api_key_name=auth.name)
 
 
 @app.delete("/v1/jobs/{job_id}")
 async def cancel_job_endpoint(
     job_id: str,
-    api_key: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(verify_api_key),
 ):
     settings = get_settings()
-    job = get_job(job_id, db_path=settings.db_path, api_key_name=api_key)
+    tenant_filter = check_job_modify_auth(auth)
+    job = get_job(job_id, db_path=settings.db_path, api_key_name=tenant_filter)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
     from app.runner import kill_active_job_process
     kill_active_job_process(job_id)
 
-    canceled = cancel_job(job_id, db_path=settings.db_path, api_key_name=api_key)
+    canceled = cancel_job(job_id, db_path=settings.db_path, api_key_name=tenant_filter)
     return canceled
+
+
+@app.post("/v1/jobs/{job_id}/retry")
+async def retry_job_endpoint(
+    job_id: str,
+    auth: AuthContext = Depends(verify_api_key),
+):
+    settings = get_settings()
+    tenant_filter = check_job_modify_auth(auth)
+    job = get_job(job_id, db_path=settings.db_path, api_key_name=tenant_filter)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    job_status = job.get("status")
+    if job_status in ("pending", "running"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot retry job '{job_id}' in non-terminal state '{job_status}'. Only terminal states ('failed', 'canceled', 'completed') may be retried.",
+        )
+
+    requeued = schedule_retry(
+        job_id,
+        next_attempt_at=time.time(),
+        db_path=settings.db_path,
+        reset_attempts=True,
+    )
+    wake_dispatcher()
+    return requeued
 
 
 from app.stats import (
@@ -452,15 +533,26 @@ from app.stats import (
     get_timeseries_stats,
     get_load_stats,
     get_sources_stats,
+    get_model_stats,
     get_error_stats,
 )
+
+
+@app.get("/v1/me")
+async def me_endpoint(
+    auth: AuthContext = Depends(verify_api_key),
+):
+    return {
+        "key_name": auth.name,
+        "scopes": sorted(list(auth.scopes)),
+    }
 
 
 @app.get("/v1/stats/summary")
 async def stats_summary_endpoint(
     from_ts: Optional[float] = Query(None, alias="from"),
     to_ts: Optional[float] = Query(None, alias="to"),
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("stats")),
 ):
     settings = get_settings()
     return await asyncio.to_thread(get_summary_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
@@ -471,7 +563,7 @@ async def stats_timeseries_endpoint(
     bucket: str = Query("day"),
     from_ts: Optional[float] = Query(None, alias="from"),
     to_ts: Optional[float] = Query(None, alias="to"),
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("stats")),
 ):
     settings = get_settings()
     return await asyncio.to_thread(get_timeseries_stats, bucket=bucket, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
@@ -480,7 +572,7 @@ async def stats_timeseries_endpoint(
 @app.get("/v1/stats/load")
 async def stats_load_endpoint(
     by: str = Query("dow_hour"),
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("stats")),
 ):
     settings = get_settings()
     return await asyncio.to_thread(get_load_stats, by=by, db_path=settings.db_path)
@@ -488,19 +580,30 @@ async def stats_load_endpoint(
 
 @app.get("/v1/stats/sources")
 async def stats_sources_endpoint(
+    by: Optional[str] = Query(None),
     from_ts: Optional[float] = Query(None, alias="from"),
     to_ts: Optional[float] = Query(None, alias="to"),
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("stats")),
 ):
     settings = get_settings()
-    return await asyncio.to_thread(get_sources_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+    return await asyncio.to_thread(get_sources_stats, by=by, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
+
+
+@app.get("/v1/stats/models")
+async def stats_models_endpoint(
+    from_ts: Optional[float] = Query(None, alias="from"),
+    to_ts: Optional[float] = Query(None, alias="to"),
+    auth: AuthContext = Depends(require_scope("stats")),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(get_model_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
 
 
 @app.get("/v1/stats/errors")
 async def stats_errors_endpoint(
     from_ts: Optional[float] = Query(None, alias="from"),
     to_ts: Optional[float] = Query(None, alias="to"),
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("stats")),
 ):
     settings = get_settings()
     return await asyncio.to_thread(get_error_stats, from_ts=from_ts, to_ts=to_ts, db_path=settings.db_path)
@@ -509,9 +612,34 @@ async def stats_errors_endpoint(
 @app.get("/v1/stats/security")
 async def stats_security_endpoint(
     since: Optional[float] = Query(None),
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("stats")),
 ):
     return get_security_stats(since=since)
+
+
+from app.agy_quota import get_agy_quota
+
+
+@app.get("/v1/stats/agy-quota")
+async def stats_agy_quota_endpoint(
+    auth: AuthContext = Depends(require_scope("stats")),
+):
+    return await get_agy_quota()
+
+
+@app.get("/v1/stats/queue")
+async def stats_queue_endpoint(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=500),
+    auth: AuthContext = Depends(require_scope("stats")),
+):
+    settings = get_settings()
+    return await asyncio.to_thread(
+        list_queue_jobs,
+        status=status_filter,
+        limit=limit,
+        db_path=settings.db_path,
+    )
 
 
 from app.events import get_logs
@@ -524,7 +652,7 @@ async def get_logs_endpoint(
     since: Optional[float] = Query(None),
     job_id: Optional[str] = Query(None),
     limit: int = Query(default=100, ge=1, le=500),
-    auth: str = Depends(verify_api_key),
+    auth: AuthContext = Depends(require_scope("stats")),
 ):
     return await asyncio.to_thread(get_logs, level=level, since=since, job_id=job_id, limit=limit)
 
@@ -533,7 +661,19 @@ from fastapi.responses import HTMLResponse
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_endpoint():
+async def dashboard_endpoint(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+):
+    auth_ctx = _auth_context_for(request, x_api_key)
+    if "stats" not in auth_ctx.scopes:
+        client_ip = request.client.host if request.client else "unknown"
+        record_auth_failure(client_ip, "Unauthorized dashboard access", request.url.path)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Dashboard requires valid key with 'stats' scope",
+        )
+
     dash_path = os.path.join(os.path.dirname(__file__), "static", "dashboard.html")
     if os.path.exists(dash_path):
         with open(dash_path, "r", encoding="utf-8") as f:

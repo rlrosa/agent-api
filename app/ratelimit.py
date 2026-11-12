@@ -67,6 +67,40 @@ def is_rate_limit_error(
     return False
 
 
+def parse_reset_hint(text: Optional[str]) -> Optional[float]:
+    """
+    Parse an upstream quota reset hint duration into seconds.
+    Handles 'Resets in 1h45m23s', '2h20m35s', '45m', '90s', and combinations.
+    Returns None if no reset hint is present.
+    """
+    if not text:
+        return None
+
+    m = re.search(r"\bresets?\s+in\s+([0-9hms\s]+)", text, re.IGNORECASE)
+    duration_str = None
+    if m:
+        duration_str = m.group(1).strip()
+    else:
+        cleaned = text.strip()
+        if re.match(r"^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?$", cleaned, re.IGNORECASE):
+            if any(c in cleaned.lower() for c in ("h", "m", "s")):
+                duration_str = cleaned
+
+    if not duration_str:
+        return None
+
+    h_m = re.search(r"(\d+)\s*h", duration_str, re.IGNORECASE)
+    m_m = re.search(r"(\d+)\s*m", duration_str, re.IGNORECASE)
+    s_m = re.search(r"(\d+)\s*s", duration_str, re.IGNORECASE)
+
+    if not (h_m or m_m or s_m):
+        return None
+
+    hours = float(h_m.group(1)) if h_m else 0.0
+    minutes = float(m_m.group(1)) if m_m else 0.0
+    seconds = float(s_m.group(1)) if s_m else 0.0
+
+    return hours * 3600.0 + minutes * 60.0 + seconds
 
 
 class RateLimitManager:
