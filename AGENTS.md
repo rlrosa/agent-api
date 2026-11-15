@@ -118,6 +118,21 @@ re-opens it.
   a caller on one of them if similar names are requested. The cheapest-first ordering of both model lists
   (`VALID_AGY_MODELS` and `VALID_CLAUDE_MODELS`) is load-bearing for cost safety: `resolve_model` uses a
   cheapest-wins tie-break among candidates scoring within 0.10 of the best fuzzy match.
+- **`agy` file-based token storage vs `gnome-keyring-daemon` (D-Bus migration trap).** Inside
+  `bwrap`, `/run/user/<uid>/bus` is not mounted and `~/.gemini` is `--ro-bind`. `agy` reads
+  `~/.gemini/antigravity-cli/antigravity-oauth-token` and uses its `refresh_token` to mint a fresh
+  `access_token` in memory on every invocation (ignoring the read-only filesystem warning when
+  saving). However, on hosts running `gnome-keyring-daemon` (`org.freedesktop.secrets` on
+  `/run/user/<uid>/bus`), any `agy` process spawned *outside* `bwrap` without `SSH_CONNECTION` set
+  will detect D-Bus, switch to OS Keyring storage, and `composite_token_storage.go` will
+  **migrate and delete** `antigravity-oauth-token` from disk — immediately breaking all subsequent
+  `bwrap` jobs with `Authentication required`. Consequently:
+  1. `build_scrubbed_env()` in `app/runner.py` strips `DBUS_SESSION_BUS_ADDRESS` and explicitly
+     sets `SSH_CONNECTION="1"` (forcing `Using file-based token storage because SSH session detected`).
+  2. Every `agy` subprocess — including `get_agy_quota()` in `app/agy_quota.py` — **must** pass
+     `env=build_scrubbed_env(settings)`.
+  3. On desktop hosts, initial `agy` login or local terminal invocations must run with
+     `SSH_CONNECTION=1`.
 - **Virtualenv dependency residual drift.** `requirements.txt` and `requirements-dev.txt` define
   the exact runtime closure. The running host virtualenv retains residual extra packages (such as
   `gTTS`, `pillow`, `reportlab`, `requests`, `urllib3`, `charset-normalizer`,

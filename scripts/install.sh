@@ -63,8 +63,14 @@ mkdir -p "${CONFIG_DIR}"
 if [ ! -f "${ENV_FILE}" ]; then
     echo "Generating new API_KEY in ${ENV_FILE}..."
     GENERATED_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-    cat << EOF > "${ENV_FILE}"
+    (
+        umask 077
+        cat << EOF > "${ENV_FILE}"
 # Agent API Environment Configuration
+PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# Force agy to use file-based token storage (~/.gemini/antigravity-cli/antigravity-oauth-token)
+# instead of migrating/deleting the file token into gnome-keyring-daemon over D-Bus.
+SSH_CONNECTION="1"
 API_KEY="${GENERATED_KEY}"
 HOST="0.0.0.0"
 PORT="8090"
@@ -73,10 +79,25 @@ MAX_CONCURRENCY="3"
 JOB_TIMEOUT="120"
 LOG_LEVEL="INFO"
 EOF
-    chmod 0600 "${ENV_FILE}"
+    )
     echo "[OK] Generated configuration at ${ENV_FILE} (mode 0600)."
 else
     echo "[OK] Configuration file already exists at ${ENV_FILE}."
+fi
+
+# 3b. Verify agy file-based OAuth token (required for bwrap --ro-bind ~/.gemini)
+AGY_TOKEN_FILE="${HOME}/.gemini/antigravity-cli/antigravity-oauth-token"
+if command -v agy &>/dev/null; then
+    if [ ! -s "${AGY_TOKEN_FILE}" ]; then
+        echo ""
+        echo "WARNING: ${AGY_TOKEN_FILE} is missing or empty."
+        echo "  Inside bwrap, ~/.gemini is mounted read-only and D-Bus / gnome-keyring-daemon"
+        echo "  is not reachable. Authenticate agy in file-storage mode by running:"
+        echo "    SSH_CONNECTION=1 agy login"
+        echo ""
+    else
+        echo "[OK] agy file-based token present at ${AGY_TOKEN_FILE}."
+    fi
 fi
 
 # 4. Systemd User Service Setup

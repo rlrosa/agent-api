@@ -645,9 +645,13 @@ def test_agy_quota_endpoint_and_caching(tmp_path):
     old_cmd = os.environ.get("AGY_USAGE_CMD")
     old_counter = os.environ.get("COUNTER_FILE")
     old_fail = os.environ.get("SIMULATE_FAIL")
+    old_passthrough = os.environ.get("PASSTHROUGH_ENV")
+    old_dbus = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
 
     os.environ["AGY_USAGE_CMD"] = fixture_script
     os.environ["COUNTER_FILE"] = counter_file
+    os.environ["PASSTHROUGH_ENV"] = "COUNTER_FILE,SIMULATE_FAIL"
+    os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
     os.environ.pop("SIMULATE_FAIL", None)
     clear_quota_cache()
 
@@ -711,6 +715,14 @@ def test_agy_quota_endpoint_and_caching(tmp_path):
             os.environ["SIMULATE_FAIL"] = old_fail
         else:
             os.environ.pop("SIMULATE_FAIL", None)
+        if old_passthrough is not None:
+            os.environ["PASSTHROUGH_ENV"] = old_passthrough
+        else:
+            os.environ.pop("PASSTHROUGH_ENV", None)
+        if old_dbus is not None:
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = old_dbus
+        else:
+            os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
 
 
 def test_sources_stats_by_key(tmp_path):

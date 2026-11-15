@@ -40,6 +40,7 @@ async def test_run_job_mock_success(tmp_env):
 
 @pytest.mark.asyncio
 async def test_env_scrubbing(tmp_env):
+    os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
     job = create_job("agy", "Print env", db_path=tmp_env["db_path"])
     claimed = claim_next_job(db_path=tmp_env["db_path"])
 
@@ -55,7 +56,9 @@ async def test_env_scrubbing(tmp_env):
 
     assert "API_KEY" not in env_dump
     assert "CANARY_SECRET" not in env_dump
+    assert "DBUS_SESSION_BUS_ADDRESS" not in env_dump
     assert "PATH=" in env_dump
+    assert "SSH_CONNECTION=1" in env_dump
 
 
 @pytest.mark.asyncio

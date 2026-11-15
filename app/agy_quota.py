@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from app.agents import get_agent_flags
 from app.config import get_settings
+from app.runner import build_scrubbed_env
 
 logger = logging.getLogger("agent-api.agy_quota")
 
@@ -133,9 +134,11 @@ async def get_agy_quota(cmd_override: Optional[str] = None) -> Dict[str, Any]:
                 if not os.path.isabs(argv[0]) and os.path.exists(argv[0]):
                     argv[0] = os.path.abspath(argv[0])
 
+            env = build_scrubbed_env(settings)
             logger.info(f"Running agy quota command: {argv}")
             proc = await asyncio.create_subprocess_exec(
                 *argv,
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

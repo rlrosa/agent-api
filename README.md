@@ -48,6 +48,8 @@ Create `~/.config/agent-api/env` with mode `0600`:
 ```bash
 mkdir -p ~/.config/agent-api
 cat << 'EOF' > ~/.config/agent-api/env
+PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+SSH_CONNECTION="1"
 API_KEY="YOUR_GENERATED_SECURE_API_KEY"
 HOST="0.0.0.0"
 PORT="8090"
@@ -58,6 +60,20 @@ LOG_LEVEL="INFO"
 EOF
 chmod 0600 ~/.config/agent-api/env
 ```
+
+#### 3b. `agy` CLI Authentication & Desktop Keyring Trap
+Inside `bwrap`, `~/.gemini` is mounted read-only (`--ro-bind`) and `/run/user/<uid>/bus` is not mounted. `agy` therefore reads `~/.gemini/antigravity-cli/antigravity-oauth-token` and uses its long-lived `refresh_token` to refresh expired access tokens in memory on every job run (even though saving the refreshed access token back to the read-only mount logs a harmless warning).
+
+> [!CAUTION]
+> **Desktop Hosts Running `gnome-keyring-daemon`**:
+> On non-headless machines where `gnome-keyring-daemon` (`org.freedesktop.secrets`) is listening on `/run/user/<uid>/bus`, running `agy` **outside** `bwrap` without `SSH_CONNECTION` set causes `agy` (`composite_token_storage.go`) to switch to OS Keyring mode and **migrate/delete** `~/.gemini/antigravity-cli/antigravity-oauth-token` from disk, breaking all subsequent `bwrap`-confined jobs with `Authentication required`.
+>
+> - Always authenticate `agy` in file-storage mode:
+>   ```bash
+>   SSH_CONNECTION=1 agy login
+>   ```
+> - If running `agy` interactively from a local desktop terminal (non-SSH) on the server host, export `SSH_CONNECTION=1` in your shell profile (`~/.bashrc`) so local invocations never migrate the file token into `gnome-keyring-daemon`.
+> - Within `agent-api`, `build_scrubbed_env()` strips `DBUS_SESSION_BUS_ADDRESS` and injects `SSH_CONNECTION="1"` for both job subprocesses (`app/runner.py`) and `/usage` quota checks (`app/agy_quota.py`).
 
 #### 4. Persistent Service Management (`systemd --user` & Linger)
 Install the systemd user unit and enable user process lingering so `agent-api` survives logouts and system reboots:

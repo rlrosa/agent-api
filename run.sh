@@ -9,6 +9,20 @@ if [ ! -d ".venv" ]; then
     .venv/bin/python -m pip install -r requirements.txt
 fi
 
+if [ -z "${API_KEY:-}" ] && [ -z "${API_KEYS:-}" ]; then
+    if [ -f "$HOME/.config/agent-api/env" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$HOME/.config/agent-api/env"
+        set +a
+    elif [ -f "$DIR/.env" ]; then
+        set -a
+        # shellcheck disable=SC1091
+        source "$DIR/.env"
+        set +a
+    fi
+fi
+
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8090}"
 LOG_LEVEL_LOWER=$(echo "${LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')
