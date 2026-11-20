@@ -52,7 +52,7 @@ class Settings(BaseModel):
     allow_unconfined: bool = Field(default=False)
     egress_restrict: bool = Field(default=False)
     api_keys: str = Field(default="")
-    rate_limit_per_min: int = Field(default=600)
+    rate_limit_per_min: int = Field(default=60)
     max_pending_jobs: int = Field(default=100)
     log_level: str = Field(default="INFO")
     log_prompt_chars: int = Field(default=200)
@@ -128,7 +128,7 @@ def get_settings() -> Settings:
         allow_unconfined=os.environ.get("ALLOW_UNCONFINED", "0").lower() in ("1", "true", "yes"),
         egress_restrict=os.environ.get("EGRESS_RESTRICT", "0").lower() in ("1", "true", "yes"),
         api_keys=os.environ.get("API_KEYS", ""),
-        rate_limit_per_min=int(os.environ.get("RATE_LIMIT_PER_MIN", "600")),
+        rate_limit_per_min=int(os.environ.get("RATE_LIMIT_PER_MIN", "60")),
         max_pending_jobs=int(os.environ.get("MAX_PENDING_JOBS", "100")),
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         log_prompt_chars=int(os.environ.get("LOG_PROMPT_CHARS", "200")),

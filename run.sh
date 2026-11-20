@@ -9,17 +9,34 @@ if [ ! -d ".venv" ]; then
     .venv/bin/python -m pip install -r requirements.txt
 fi
 
+load_env_file() {
+    local env_file="$1"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [ -z "$line" ] || [[ "$line" == \#* ]]; then
+            continue
+        fi
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local val="${BASH_REMATCH[2]}"
+            if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            if [ -z "${!key+x}" ]; then
+                export "$key=$val"
+            fi
+        fi
+    done < "$env_file"
+}
+
 if [ -z "${API_KEY:-}" ] && [ -z "${API_KEYS:-}" ]; then
     if [ -f "$HOME/.config/agent-api/env" ]; then
-        set -a
-        # shellcheck disable=SC1090
-        source "$HOME/.config/agent-api/env"
-        set +a
+        load_env_file "$HOME/.config/agent-api/env"
     elif [ -f "$DIR/.env" ]; then
-        set -a
-        # shellcheck disable=SC1091
-        source "$DIR/.env"
-        set +a
+        load_env_file "$DIR/.env"
     fi
 fi
 

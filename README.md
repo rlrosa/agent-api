@@ -43,11 +43,11 @@ python3 -m venv .venv
 ```
 
 #### 3. Configuration & Security Key Setup
-Create `~/.config/agent-api/env` with mode `0600`:
+Create `~/.config/agent-api/env` with mode `0600` (using an unquoted `EOF` heredoc so `${HOME}` expands to an absolute path, as systemd `EnvironmentFile=` does not expand `${HOME}` at runtime):
 
 ```bash
 mkdir -p ~/.config/agent-api
-cat << 'EOF' > ~/.config/agent-api/env
+cat << EOF > ~/.config/agent-api/env
 PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 SSH_CONNECTION="1"
 API_KEY="YOUR_GENERATED_SECURE_API_KEY"

@@ -100,6 +100,7 @@ def build_scrubbed_env(settings) -> Dict[str, str]:
 
     # Force agy to use file-based token storage (~/.gemini/antigravity-cli/antigravity-oauth-token)
     # instead of probing D-Bus / gnome-keyring-daemon and migrating/deleting the file token.
+    scrubbed.pop("DBUS_SESSION_BUS_ADDRESS", None)
     scrubbed["SSH_CONNECTION"] = "1"
 
     return scrubbed
