@@ -40,22 +40,29 @@ async def test_run_job_mock_success(tmp_env):
 
 @pytest.mark.asyncio
 async def test_env_scrubbing(tmp_env):
-    job = create_job("agy", "Print env", db_path=tmp_env["db_path"])
-    claimed = claim_next_job(db_path=tmp_env["db_path"])
+    os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
+    os.environ["PASSTHROUGH_ENV"] = "DBUS_SESSION_BUS_ADDRESS"
+    try:
+        job = create_job("agy", "Print env", db_path=tmp_env["db_path"])
+        claimed = claim_next_job(db_path=tmp_env["db_path"])
 
-    custom_argv = [
-        "python3",
-        "-c",
-        "import os; [print(f'{k}={v}') for k, v in os.environ.items()]",
-    ]
-    result = await run_job(claimed, custom_argv=custom_argv)
+        custom_argv = [
+            "python3",
+            "-c",
+            "import os; [print(f'{k}={v}') for k, v in os.environ.items()]",
+        ]
+        result = await run_job(claimed, custom_argv=custom_argv)
 
-    assert result["status"] == "completed"
-    env_dump = result["stdout"]
+        assert result["status"] == "completed"
+        env_dump = result["stdout"]
 
-    assert "API_KEY" not in env_dump
-    assert "CANARY_SECRET" not in env_dump
-    assert "PATH=" in env_dump
+        assert "API_KEY" not in env_dump
+        assert "CANARY_SECRET" not in env_dump
+        assert "DBUS_SESSION_BUS_ADDRESS" not in env_dump
+        assert "PATH=" in env_dump
+        assert "SSH_CONNECTION=1" in env_dump
+    finally:
+        os.environ.pop("PASSTHROUGH_ENV", None)
 
 
 @pytest.mark.asyncio

@@ -98,6 +98,11 @@ def build_scrubbed_env(settings) -> Dict[str, str]:
     if "HOME" not in scrubbed and "HOME" in os.environ:
         scrubbed["HOME"] = os.environ["HOME"]
 
+    # Force agy to use file-based token storage (~/.gemini/antigravity-cli/antigravity-oauth-token)
+    # instead of probing D-Bus / gnome-keyring-daemon and migrating/deleting the file token.
+    scrubbed.pop("DBUS_SESSION_BUS_ADDRESS", None)
+    scrubbed["SSH_CONNECTION"] = "1"
+
     return scrubbed
 
 
@@ -146,37 +151,50 @@ def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List
         if os.path.exists(path):
             bwrap_cmd.extend(["--ro-bind", path, path])
 
+    home_dir = os.environ.get("HOME") or os.path.expanduser("~")
     bwrap_cmd.extend([
         "--dev", "/dev",
         "--proc", "/proc",
         "--share-net",
         "--tmpfs", "/tmp",
-        "--tmpfs", "/home/ubuntu",
-        "--ro-bind", "/home/ubuntu/.local", "/home/ubuntu/.local",
+        "--tmpfs", home_dir,
     ])
+    local_dir = os.path.join(home_dir, ".local")
+    if os.path.exists(local_dir):
+        bwrap_cmd.extend(["--ro-bind", local_dir, local_dir])
 
     if agent == "agy":
-        if os.path.exists("/home/ubuntu/.gemini"):
+        gemini_dir = os.path.join(home_dir, ".gemini")
+        if os.path.exists(gemini_dir):
             bwrap_cmd.extend([
-                "--ro-bind", "/home/ubuntu/.gemini", "/home/ubuntu/.gemini",
-                "--tmpfs", "/home/ubuntu/.gemini/antigravity-cli/brain",
-                "--tmpfs", "/home/ubuntu/.gemini/antigravity-cli/conversations",
-                "--tmpfs", "/home/ubuntu/.gemini/antigravity-cli/cache",
-                "--tmpfs", "/home/ubuntu/.gemini/antigravity-cli/log",
+                "--ro-bind", gemini_dir, gemini_dir,
+                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/brain"),
+                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/conversations"),
+                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/cache"),
+                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/log"),
+            ])
+        antigravity_config = os.path.join(home_dir, ".config", "antigravity")
+        if os.path.exists(antigravity_config):
+            bwrap_cmd.extend([
+                "--ro-bind", antigravity_config, antigravity_config,
             ])
     elif agent == "claude":
-        bwrap_cmd.extend(["--tmpfs", "/home/ubuntu/.claude"])
-        if os.path.exists("/home/ubuntu/.claude/.credentials.json"):
+        claude_dir = os.path.join(home_dir, ".claude")
+        bwrap_cmd.extend(["--tmpfs", claude_dir])
+        cred_file = os.path.join(claude_dir, ".credentials.json")
+        if os.path.exists(cred_file):
             bwrap_cmd.extend([
-                "--ro-bind", "/home/ubuntu/.claude/.credentials.json", "/home/ubuntu/.claude/.credentials.json",
+                "--ro-bind", cred_file, cred_file,
             ])
-        if os.path.exists("/home/ubuntu/.claude/settings.json"):
+        settings_file = os.path.join(claude_dir, "settings.json")
+        if os.path.exists(settings_file):
             bwrap_cmd.extend([
-                "--ro-bind", "/home/ubuntu/.claude/settings.json", "/home/ubuntu/.claude/settings.json",
+                "--ro-bind", settings_file, settings_file,
             ])
-        if os.path.exists("/home/ubuntu/.claude.json"):
+        claude_json = os.path.join(home_dir, ".claude.json")
+        if os.path.exists(claude_json):
             bwrap_cmd.extend([
-                "--ro-bind", "/home/ubuntu/.claude.json", "/home/ubuntu/.claude.json",
+                "--ro-bind", claude_json, claude_json,
             ])
 
 

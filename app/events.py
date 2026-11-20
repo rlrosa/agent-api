@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import logging.handlers
@@ -20,7 +21,8 @@ def _get_events_db_path(db_path: Optional[str] = None) -> str:
     return events_path
 
 
-def _connect_events(path: str) -> sqlite3.Connection:
+@contextlib.contextmanager
+def _connect_events(path: str):
     dirname = os.path.dirname(os.path.abspath(path))
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -28,16 +30,24 @@ def _connect_events(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
-def _connect_events_ro(path: str) -> sqlite3.Connection:
+@contextlib.contextmanager
+def _connect_events_ro(path: str):
     abs_path = os.path.abspath(path)
     uri_path = f"file:{abs_path}?mode=ro"
     conn = sqlite3.connect(uri_path, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000;")
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def init_events_db(db_path: Optional[str] = None) -> None:

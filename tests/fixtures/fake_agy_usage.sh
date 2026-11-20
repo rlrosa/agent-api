@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -e
 
+if [ -n "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    echo "ERROR: DBUS_SESSION_BUS_ADDRESS leaked into agy_quota subprocess" >&2
+    exit 2
+fi
+
+if [ "$SSH_CONNECTION" != "1" ]; then
+    echo "ERROR: SSH_CONNECTION=1 not set in agy_quota subprocess" >&2
+    exit 3
+fi
+
 if [ -n "$COUNTER_FILE" ]; then
     count=0
     if [ -f "$COUNTER_FILE" ]; then
