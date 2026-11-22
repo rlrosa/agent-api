@@ -1,6 +1,8 @@
 import difflib
 import logging
+import os
 import shutil
+import sys
 from typing import Any, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 from app.config import get_settings
@@ -68,10 +70,10 @@ def resolve_model(agent: str, raw_model: Optional[str]) -> str:
     Returns a safe, hardcoded literal string from the supported set.
     """
     settings = get_settings()
-    if agent == "agy":
+    if agent in ("agy", "mock_agy_session"):
         supported = VALID_AGY_MODELS
         default = settings.agy_default_model or "gemini-3.8-flash-low"
-    elif agent == "claude":
+    elif agent in ("claude", "mock_claude_session"):
         supported = VALID_CLAUDE_MODELS
         default = settings.claude_default_model or "claude-sonnet-5"
     else:
@@ -318,6 +320,42 @@ AGENTS: Dict[str, Dict] = {
         "argv_builder": None,
         "session_argv_builder": None,
     },
+    "mock_agy_session": {
+        "spec": AgentSpec(
+            name="mock_agy_session",
+            binary_name="python3",
+            prompt_delivery="stdin",
+            supports_model_flag=True,
+            default_model=None,
+            default_flags="",
+        ),
+        "argv_builder": None,
+        "session_argv_builder": lambda model=None, effort=None, workspace_path=None: [
+            sys.executable,
+            "-u",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "mock_stream_agent.py")),
+            "--mode",
+            "agy",
+        ],
+    },
+    "mock_claude_session": {
+        "spec": AgentSpec(
+            name="mock_claude_session",
+            binary_name="python3",
+            prompt_delivery="stdin",
+            supports_model_flag=True,
+            default_model=None,
+            default_flags="",
+        ),
+        "argv_builder": None,
+        "session_argv_builder": lambda model=None, effort=None, workspace_path=None: [
+            sys.executable,
+            "-u",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "mock_stream_agent.py")),
+            "--mode",
+            "claude",
+        ],
+    },
 }
 
 
@@ -326,10 +364,10 @@ def get_agent_availability() -> Dict[str, Dict[str, Any]]:
     settings = get_settings()
 
     for agent_name, info in AGENTS.items():
-        if agent_name == "mock_429":
+        if agent_name in ("mock_429", "mock_agy_session", "mock_claude_session"):
             result[agent_name] = {
                 "available": settings.allow_mock_agent,
-                "path": "/bin/mock_429" if settings.allow_mock_agent else None,
+                "path": sys.executable if settings.allow_mock_agent else None,
             }
             continue
 
@@ -347,10 +385,10 @@ def ensure_available(agent_name: str) -> str:
         raise ValueError(f"Unknown agent: '{agent_name}'")
 
     settings = get_settings()
-    if agent_name == "mock_429":
+    if agent_name in ("mock_429", "mock_agy_session", "mock_claude_session"):
         if not settings.allow_mock_agent:
             raise ValueError(f"Agent '{agent_name}' is unavailable (ALLOW_MOCK_AGENT disabled)")
-        return "/bin/mock_429"
+        return sys.executable
 
     cmd = AGENTS[agent_name]["spec"].binary_name
     path = shutil.which(cmd)

@@ -934,6 +934,16 @@ def reset_orphan_sessions(db_path: Optional[str] = None) -> int:
 
     with _db_lock:
         with _connect(path) as conn:
+            conn.execute(
+                """
+                UPDATE session_turns
+                SET status = 'failed',
+                    finished_at = ?,
+                    error = 'Interrupted by server restart'
+                WHERE status = 'running';
+                """,
+                (now,),
+            )
             cur = conn.execute(
                 """
                 UPDATE sessions

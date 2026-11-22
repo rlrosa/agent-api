@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["agy", "claude"], default="agy")
+    args = parser.parse_args()
+
+    turn = 0
+    conv_id = f"mock-conv-{os.getpid()}"
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            sys.exit(0)
+
+        turn += 1
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if args.mode == "agy":
+            prompt = data.get("message", {}).get("content", "")
+        else:
+            content_list = data.get("message", {}).get("content", [])
+            prompt = content_list[0].get("text", "") if content_list else ""
+
+        if "CRASH" in prompt:
+            sys.exit(1)
+        if "TIMEOUT" in prompt:
+            time.sleep(30)
+        if "CHATTY_STDERR" in prompt:
+            sys.stderr.write("E" * (130 * 1024) + "\n")
+            sys.stderr.flush()
+
+        resp_text = f"Echo [turn {turn}]: {prompt}"
+        if "LARGE_OUTPUT" in prompt:
+            resp_text = "L" * (256 * 1024)
+        elif "OCR_429" in prompt:
+            resp_text = "The receipt says $ 429,00 and store address is AV ITALIA 4429"
+        elif "UNREADABLE" in prompt:
+            resp_text = "Error: attachment file missing and could not be found or read from disk"
+        elif "CHECK_ATTACHMENT:" in prompt:
+            att_name = prompt.split("CHECK_ATTACHMENT:", 1)[1].split()[0].strip()
+            att_path = os.path.join(os.getcwd(), "attachments", att_name)
+            if os.path.exists(att_path):
+                resp_text = f"ATTACHMENT_FOUND: {att_name} ({os.path.getsize(att_path)} bytes)"
+            else:
+                resp_text = f"ATTACHMENT_NOT_FOUND: {att_name}"
+
+        if args.mode == "agy":
+            if turn == 1:
+                sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv_id}) + "\n")
+            sys.stdout.write(json.dumps({"event": "step_update", "step": turn}) + "\n")
+            result_evt = {
+                "event": "result",
+                "status": "SUCCESS",
+                "conversation_id": conv_id,
+                "response": resp_text,
+                "usage": {
+                    "input_tokens": 100 * turn,
+                    "output_tokens": 50 * turn,
+                    "cache_read_tokens": 20 * turn,
+                    "total_tokens": 170 * turn,
+                },
+            }
+            sys.stdout.write(json.dumps(result_evt) + "\n")
+            sys.stdout.flush()
+        else:
+            if turn == 1:
+                sys.stdout.write(json.dumps({"type": "system", "session_id": conv_id}) + "\n")
+            result_evt = {
+                "type": "result",
+                "subtype": "success",
+                "session_id": conv_id,
+                "result": resp_text,
+                "usage": {
+                    "input_tokens": 80,
+                    "output_tokens": 40,
+                    "cache_read_input_tokens": 15,
+                },
+                "total_cost_usd": round(0.0012 * turn, 6),
+            }
+            sys.stdout.write(json.dumps(result_evt) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

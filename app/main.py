@@ -23,6 +23,7 @@ from fastapi import (
 )
 
 from app.agents import (
+    AGENTS,
     ensure_available,
     get_agent_availability,
     resolve_effort,
@@ -83,11 +84,16 @@ async def lifespan(app: FastAPI):
     # Ensure DB tables exist
     init_db(settings.db_path)
 
+    # Start session manager
+    from app.sessions import session_manager
+    await session_manager.start()
+
     # Start background worker dispatcher pool
     await start_dispatcher()
     yield
     # Stop background worker dispatcher pool
     await stop_dispatcher()
+    await session_manager.stop()
     stop_async_logging()
 
 
@@ -254,6 +260,7 @@ async def healthz():
 
     from app.ratelimit import rate_limit_manager
     from app.runner import check_bwrap_confinement
+    from app.sessions import session_manager
 
     return HealthResponse(
         version="0.1.0",
@@ -263,6 +270,8 @@ async def healthz():
         effective_concurrency=rate_limit_manager.effective_concurrency,
         agents=get_agent_availability(),
         confinement=check_bwrap_confinement(),
+        active_sessions=session_manager.active_session_count(),
+        max_active_sessions=settings.max_active_sessions,
     )
 
 
@@ -625,6 +634,346 @@ async def stats_agy_quota_endpoint(
     auth: AuthContext = Depends(require_scope("stats")),
 ):
     return await get_agy_quota()
+
+
+# ==============================================================================
+# SESSIONS API (/v1/sessions)
+# ==============================================================================
+
+from app.models import CreateSessionRequest, SessionMessageRequest
+from app.sessions import session_manager
+from app.db import get_session, list_sessions, list_session_turns
+
+
+@app.post("/v1/sessions")
+async def create_session_endpoint(
+    request: Request,
+    auth: AuthContext = Depends(require_scope("jobs")),
+):
+    settings = get_settings()
+    content_type = request.headers.get("content-type", "")
+
+    agent_name: Optional[str] = None
+    prompt: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    attachments_input: List[AttachmentSpec] = []
+    idle_timeout: Optional[int] = None
+    turn_timeout: Optional[int] = None
+    wait_time: int = settings.wait_default
+    metadata: Optional[Dict[str, Any]] = None
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        agent_name = form.get("agent")
+        prompt = form.get("prompt")
+        model = form.get("model")
+        effort = form.get("effort")
+        if form.get("idle_timeout") is not None:
+            try:
+                idle_timeout = int(form.get("idle_timeout"))
+            except ValueError:
+                pass
+        if form.get("turn_timeout") is not None:
+            try:
+                turn_timeout = int(form.get("turn_timeout"))
+            except ValueError:
+                pass
+        if form.get("wait") is not None:
+            try:
+                wait_time = int(form.get("wait"))
+            except ValueError:
+                pass
+        if form.get("metadata"):
+            try:
+                metadata = json.loads(form.get("metadata"))
+            except Exception:
+                pass
+
+        import base64
+        for field_name, field_value in form.multi_items():
+            if hasattr(field_value, "filename") and getattr(field_value, "filename", None):
+                file_bytes = await field_value.read()
+                attachments_input.append(
+                    AttachmentSpec(
+                        filename=field_value.filename or "uploaded_file.bin",
+                        content_b64=base64.b64encode(file_bytes).decode("ascii"),
+                    )
+                )
+    else:
+        body = await request.json() if await request.body() else {}
+        req_obj = CreateSessionRequest(**body)
+        agent_name = req_obj.agent
+        prompt = req_obj.prompt
+        model = req_obj.model
+        effort = req_obj.effort
+        attachments_input = req_obj.attachments or []
+        idle_timeout = req_obj.idle_timeout
+        turn_timeout = req_obj.turn_timeout
+        wait_time = req_obj.wait
+        metadata = req_obj.metadata
+
+    agent = agent_name or settings.default_agent
+    if agent not in AGENTS and not (settings.allow_mock_agent and agent in ("mock_agy_session", "mock_claude_session")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported agent: '{agent}'",
+        )
+
+    resolved_model = resolve_model(agent, model) if model else None
+    resolved_effort = resolve_effort(effort) if effort else None
+
+    eff_idle = idle_timeout if idle_timeout is not None else settings.session_idle_timeout
+    eff_idle = max(5, min(eff_idle, settings.session_idle_max))
+    eff_turn = turn_timeout if turn_timeout is not None else settings.session_turn_timeout
+    eff_wait = max(0, min(wait_time, settings.wait_max))
+
+    api_key_name = auth.name if auth.name != "bypass" else None
+    client_ip = request.client.host if request.client else "unknown"
+
+    live_session = await session_manager.create_session(
+        agent=agent,
+        model=resolved_model,
+        effort=resolved_effort,
+        idle_timeout=eff_idle,
+        turn_timeout=eff_turn,
+        metadata=metadata,
+        client_ip=client_ip,
+        auth_mode="bypass" if auth.name == "bypass" else "api_key",
+        api_key_name=api_key_name,
+        db_path=settings.db_path,
+    )
+
+    sess_dict = get_session(live_session.id, db_path=settings.db_path)
+    if sess_dict:
+        sess_dict["expires_at"] = sess_dict["last_active_at"] + sess_dict["idle_timeout"]
+
+    if prompt is None:
+        return Response(
+            content=json.dumps(sess_dict),
+            status_code=status.HTTP_201_CREATED,
+            media_type="application/json",
+        )
+
+    if eff_wait == 0:
+        asyncio.create_task(
+            session_manager.execute_turn(
+                session_id=live_session.id,
+                prompt=prompt,
+                attachments=attachments_input,
+                turn_timeout=eff_turn,
+                api_key_name=api_key_name,
+                db_path=settings.db_path,
+            )
+        )
+        return Response(
+            content=json.dumps(sess_dict),
+            status_code=status.HTTP_202_ACCEPTED,
+            media_type="application/json",
+        )
+
+    turn_task = asyncio.create_task(
+        session_manager.execute_turn(
+            session_id=live_session.id,
+            prompt=prompt,
+            attachments=attachments_input,
+            turn_timeout=eff_turn,
+            api_key_name=api_key_name,
+            db_path=settings.db_path,
+        )
+    )
+
+    try:
+        turn_res = await asyncio.wait_for(asyncio.shield(turn_task), timeout=float(eff_wait))
+        return turn_res
+    except asyncio.TimeoutError:
+        fresh_sess = get_session(live_session.id, db_path=settings.db_path)
+        if fresh_sess:
+            fresh_sess["expires_at"] = fresh_sess["last_active_at"] + fresh_sess["idle_timeout"]
+        return Response(
+            content=json.dumps(fresh_sess),
+            status_code=status.HTTP_202_ACCEPTED,
+            media_type="application/json",
+        )
+
+
+@app.post("/v1/sessions/{session_id}/messages")
+async def session_message_endpoint(
+    session_id: str,
+    request: Request,
+    auth: AuthContext = Depends(require_scope("jobs")),
+):
+    settings = get_settings()
+    tenant = auth.name if auth.name != "bypass" else "bypass"
+    sess_row = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
+    if not sess_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found",
+        )
+
+    if sess_row.get("status") in ("expired", "closed", "failed") or not session_manager.is_session_active(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Session '{session_id}' is {sess_row.get('status', 'closed')} and cannot accept new messages",
+        )
+
+    content_type = request.headers.get("content-type", "")
+    prompt: str = ""
+    attachments_input: List[AttachmentSpec] = []
+    turn_timeout: Optional[int] = None
+    wait_time: int = settings.wait_default
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        prompt = form.get("prompt", "")
+        if form.get("turn_timeout") is not None:
+            try:
+                turn_timeout = int(form.get("turn_timeout"))
+            except ValueError:
+                pass
+        if form.get("wait") is not None:
+            try:
+                wait_time = int(form.get("wait"))
+            except ValueError:
+                pass
+
+        import base64
+        for field_name, field_value in form.multi_items():
+            if hasattr(field_value, "filename") and getattr(field_value, "filename", None):
+                file_bytes = await field_value.read()
+                attachments_input.append(
+                    AttachmentSpec(
+                        filename=field_value.filename or "uploaded_file.bin",
+                        content_b64=base64.b64encode(file_bytes).decode("ascii"),
+                    )
+                )
+    else:
+        body = await request.json() if await request.body() else {}
+        req_obj = SessionMessageRequest(**body)
+        prompt = req_obj.prompt
+        attachments_input = req_obj.attachments or []
+        turn_timeout = req_obj.turn_timeout
+        wait_time = req_obj.wait
+
+    eff_wait = max(0, min(wait_time, settings.wait_max))
+    api_key_name = auth.name if auth.name != "bypass" else None
+
+    if eff_wait == 0:
+        asyncio.create_task(
+            session_manager.execute_turn(
+                session_id=session_id,
+                prompt=prompt,
+                attachments=attachments_input,
+                turn_timeout=turn_timeout,
+                api_key_name=api_key_name,
+                db_path=settings.db_path,
+            )
+        )
+        sess_dict = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
+        if sess_dict:
+            sess_dict["expires_at"] = sess_dict["last_active_at"] + sess_dict["idle_timeout"]
+        return Response(
+            content=json.dumps(sess_dict),
+            status_code=status.HTTP_202_ACCEPTED,
+            media_type="application/json",
+        )
+
+    turn_task = asyncio.create_task(
+        session_manager.execute_turn(
+            session_id=session_id,
+            prompt=prompt,
+            attachments=attachments_input,
+            turn_timeout=turn_timeout,
+            api_key_name=api_key_name,
+            db_path=settings.db_path,
+        )
+    )
+
+    try:
+        turn_res = await asyncio.wait_for(asyncio.shield(turn_task), timeout=float(eff_wait))
+        return turn_res
+    except asyncio.TimeoutError:
+        fresh_sess = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
+        if fresh_sess:
+            fresh_sess["expires_at"] = fresh_sess["last_active_at"] + fresh_sess["idle_timeout"]
+        return Response(
+            content=json.dumps(fresh_sess),
+            status_code=status.HTTP_202_ACCEPTED,
+            media_type="application/json",
+        )
+
+
+@app.get("/v1/sessions/{session_id}")
+async def get_session_endpoint(
+    session_id: str,
+    include_turns: bool = Query(default=False),
+    auth: AuthContext = Depends(require_scope("jobs")),
+):
+    settings = get_settings()
+    tenant = "bypass" if "admin" in auth.scopes else auth.name
+    sess = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
+    if not sess:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found",
+        )
+
+    if sess.get("status") in ("starting", "idle", "busy"):
+        sess["expires_at"] = sess["last_active_at"] + sess["idle_timeout"]
+    else:
+        sess["expires_at"] = None
+
+    if include_turns:
+        turns = list_session_turns(session_id, db_path=settings.db_path, api_key_name=tenant)
+        sess["turns"] = turns or []
+
+    return sess
+
+
+@app.get("/v1/sessions")
+async def list_sessions_endpoint(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=500),
+    auth: AuthContext = Depends(require_scope("jobs")),
+):
+    settings = get_settings()
+    tenant = "bypass" if "admin" in auth.scopes else auth.name
+    sessions = list_sessions(
+        status=status_filter,
+        limit=limit,
+        db_path=settings.db_path,
+        api_key_name=tenant,
+    )
+    for s in sessions:
+        if s.get("status") in ("starting", "idle", "busy"):
+            s["expires_at"] = s["last_active_at"] + s["idle_timeout"]
+        else:
+            s["expires_at"] = None
+    return sessions
+
+
+@app.delete("/v1/sessions/{session_id}")
+async def delete_session_endpoint(
+    session_id: str,
+    auth: AuthContext = Depends(verify_api_key),
+):
+    settings = get_settings()
+    tenant_filter = check_job_modify_auth(auth)
+    sess = get_session(session_id, db_path=settings.db_path, api_key_name=tenant_filter)
+    if not sess:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found",
+        )
+
+    closed = await session_manager.close_session(
+        session_id=session_id,
+        reason="closed",
+        api_key_name=tenant_filter,
+        db_path=settings.db_path,
+    )
+    return closed or sess
 
 
 @app.get("/v1/stats/queue")

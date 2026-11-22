@@ -375,14 +375,21 @@ def test_session_sql_tenant_scoping(tmp_db_path):
 
 
 def test_reset_orphan_sessions(tmp_db_path):
-    """Verify reset_orphan_sessions transitions active sessions to closed on startup."""
+    """Verify reset_orphan_sessions transitions active sessions and running turns on startup."""
     s1 = create_session_row(agent="agy", status="starting", db_path=tmp_db_path)
     s2 = create_session_row(agent="agy", status="idle", db_path=tmp_db_path)
     s3 = create_session_row(agent="claude", status="busy", db_path=tmp_db_path)
     s4 = create_session_row(agent="claude", status="closed", db_path=tmp_db_path)
 
+    t1 = create_session_turn(session_id=s1["id"], turn_index=0, prompt="Running turn", status="running", db_path=tmp_db_path)
+
     count = reset_orphan_sessions(db_path=tmp_db_path)
     assert count == 3
+
+    # Verify running turn was transitioned to failed
+    turns = list_session_turns(s1["id"], db_path=tmp_db_path)
+    assert turns[0]["status"] == "failed"
+    assert "Interrupted by server restart" in turns[0]["error"]
 
     for sid in [s1["id"], s2["id"], s3["id"]]:
         s = get_session(sid, db_path=tmp_db_path)
@@ -422,7 +429,492 @@ def test_purge_old_sessions(tmp_db_path):
     assert get_session(s_old["id"], db_path=tmp_db_path) is None
     # s_old turns are also deleted from session_turns table
     assert list_session_turns(s_old["id"], db_path=tmp_db_path) is None
+    import sqlite3
+    conn = sqlite3.connect(tmp_db_path)
+    child_turn_count = conn.execute("SELECT COUNT(*) FROM session_turns WHERE session_id = ?", (s_old["id"],)).fetchone()[0]
+    conn.close()
+    assert child_turn_count == 0
 
     # s_recent and s_active survive
     assert get_session(s_recent["id"], db_path=tmp_db_path) is not None
     assert get_session(s_active["id"], db_path=tmp_db_path) is not None
+
+
+# ==============================================================================
+# 4. End-to-End HTTP Integration Tests
+# ==============================================================================
+
+from concurrent.futures import ThreadPoolExecutor
+from fastapi.testclient import TestClient
+from app.main import app
+from app.sessions import session_manager, sweep_orphaned_session_workspaces
+from app.runner import sweep_orphaned_workspaces, wrap_cmd_with_bwrap
+
+
+@pytest.fixture
+def http_client(tmp_path, monkeypatch):
+    test_db = str(tmp_path / "test_sessions_api.db")
+    sess_work_root = str(tmp_path / "sessions_work")
+    jobs_work_root = str(tmp_path / "jobs_work")
+    os.makedirs(sess_work_root, exist_ok=True)
+    os.makedirs(jobs_work_root, exist_ok=True)
+
+    monkeypatch.setenv("DB_PATH", test_db)
+    monkeypatch.setenv("SESSION_WORK_ROOT", sess_work_root)
+    monkeypatch.setenv("WORK_ROOT", jobs_work_root)
+    monkeypatch.setenv("API_KEY", "test-secret-key")
+    monkeypatch.setenv("API_KEYS", "alice:key-alice:jobs,bob:key-bob:jobs,monitor:key-monitor:stats,admin:key-admin:jobs+stats+admin")
+    monkeypatch.setenv("ALLOW_MOCK_AGENT", "1")
+    monkeypatch.setenv("BWRAP_ENABLED", "0")
+    monkeypatch.setenv("MODEL_PRICES", '{"gemini-3.8-flash-low": {"input": 0.50, "output": 2.00}}')
+
+    init_db(test_db)
+    with TestClient(app) as client:
+        yield client
+
+
+def test_e2e_agy_session_lifecycle(http_client):
+    """Test full multi-turn agy stream-json lifecycle, PID stability, deltas, and DELETE."""
+    # 1. Turn 1
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "agent": "mock_agy_session",
+            "model": "gemini-3.8-flash-low",
+            "prompt": "Hello Turn 1",
+            "idle_timeout": 60,
+        },
+    )
+    assert r1.status_code == 200, r1.text
+    d1 = r1.json()
+    session_id = d1["id"]
+    assert d1["status"] == "idle"
+    assert d1["turn_count"] == 1
+    assert "Echo [turn 1]: Hello Turn 1" in d1["latest_turn"]["response"]
+    assert d1["latest_turn"]["input_tokens"] == 100
+    assert d1["latest_turn"]["output_tokens"] == 50
+    # Cost: 100 * 0.5/1M + 50 * 2.0/1M = 0.00005 + 0.00010 = 0.00015
+    assert d1["latest_turn"]["cost_usd"] == 0.00015
+    assert d1["cost_usd"] == 0.00015
+
+    # Check child process PID
+    assert session_manager.is_session_active(session_id)
+    child_pid = session_manager._sessions[session_id].proc.pid
+
+    # 2. Turn 2
+    r2 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Follow-up Turn 2"},
+    )
+    assert r2.status_code == 200, r2.text
+    d2 = r2.json()
+    assert d2["turn_count"] == 2
+    assert "Echo [turn 2]: Follow-up Turn 2" in d2["latest_turn"]["response"]
+    # Per-turn delta: cumulative was 200 input, 100 output -> delta = 100 in, 50 out
+    assert d2["latest_turn"]["input_tokens"] == 100
+    assert d2["latest_turn"]["output_tokens"] == 50
+    assert d2["input_tokens"] == 200
+    assert d2["output_tokens"] == 100
+    assert d2["cost_usd"] == 0.00030
+    # Process continuity: identical PID!
+    assert session_manager._sessions[session_id].proc.pid == child_pid
+
+    # 3. Turn 3
+    r3 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Turn 3 message"},
+    )
+    assert r3.status_code == 200, r3.text
+    d3 = r3.json()
+    assert d3["turn_count"] == 3
+    assert session_manager._sessions[session_id].proc.pid == child_pid
+
+    # 4. Inspect turns via GET
+    r_get = http_client.get(
+        f"/v1/sessions/{session_id}?include_turns=true",
+        headers={"X-API-Key": "key-alice"},
+    )
+    assert r_get.status_code == 200
+    d_get = r_get.json()
+    assert len(d_get["turns"]) == 3
+    assert d_get["turns"][0]["turn_index"] == 0
+    assert d_get["turns"][1]["turn_index"] == 1
+    assert d_get["turns"][2]["turn_index"] == 2
+
+    # 5. Close session via DELETE
+    ws_path = session_manager._sessions[session_id].workspace_path
+    r_del = http_client.delete(
+        f"/v1/sessions/{session_id}",
+        headers={"X-API-Key": "key-alice"},
+    )
+    assert r_del.status_code == 200
+    assert r_del.json()["status"] == "closed"
+    # Session no longer active in memory, workspace reaped
+    assert not session_manager.is_session_active(session_id)
+    assert not os.path.exists(ws_path)
+
+
+def test_e2e_claude_session_lifecycle(http_client):
+    """Test full multi-turn claude stream-json lifecycle and upstream cost delta."""
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "agent": "mock_claude_session",
+            "prompt": "Hello Claude",
+        },
+    )
+    assert r1.status_code == 200, r1.text
+    d1 = r1.json()
+    session_id = d1["id"]
+    assert d1["turn_count"] == 1
+    assert "Echo [turn 1]: Hello Claude" in d1["latest_turn"]["response"]
+    assert d1["latest_turn"]["cost_usd"] == 0.0012
+
+    # Turn 2: upstream cost reports 0.0024 -> per-turn cost = 0.0012
+    r2 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Turn 2 Claude"},
+    )
+    assert r2.status_code == 200
+    d2 = r2.json()
+    assert d2["turn_count"] == 2
+    assert d2["latest_turn"]["cost_usd"] == 0.0012
+    assert d2["cost_usd"] == 0.0024
+
+    # Close
+    r_del = http_client.delete(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
+    assert r_del.status_code == 200
+
+
+def test_spawn_without_initial_prompt_and_wait_zero(http_client):
+    """Test session creation without prompt (201 Created) and wait=0 execution (202 Accepted)."""
+    # 1. 201 Created when prompt is omitted
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r1.status_code == 201, r1.text
+    d1 = r1.json()
+    session_id = d1["id"]
+    assert d1["status"] == "idle"
+    assert d1["turn_count"] == 0
+    assert d1.get("expires_at") is not None
+
+    # 2. POST /messages with wait=0 -> 202 Accepted
+    r2 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Background turn", "wait": 0},
+    )
+    assert r2.status_code == 202, r2.text
+
+    # Poll briefly for completion
+    completed = False
+    for _ in range(50):
+        time.sleep(0.05)
+        r_chk = http_client.get(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
+        if r_chk.status_code == 200 and r_chk.json()["turn_count"] == 1:
+            completed = True
+            break
+    assert completed, "Background turn did not complete in time"
+
+    http_client.delete(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
+
+
+def test_session_idle_auto_expiration(http_client):
+    """Test idle reaper auto-expiration, child termination, and 409 Conflict rejection."""
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "idle_timeout": 5},
+    )
+    assert r1.status_code == 201
+    session_id = r1.json()["id"]
+
+    live = session_manager._sessions[session_id]
+    child_proc = live.proc
+    ws_path = live.workspace_path
+    assert os.path.exists(ws_path)
+
+    # Fast-forward last_active_at by 10s to trigger reaper immediately
+    live.last_active_at = time.time() - 10.0
+    time.sleep(1.2)
+
+    # Session is reaped
+    assert not session_manager.is_session_active(session_id)
+    assert not os.path.exists(ws_path)
+
+    # GET returns expired
+    r_get = http_client.get(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
+    assert r_get.status_code == 200
+    assert r_get.json()["status"] == "expired"
+
+    # Subsequent POST /messages returns 409 Conflict
+    r_msg = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Revive?"},
+    )
+    assert r_msg.status_code == 409
+    assert "is expired and cannot accept new messages" in r_msg.json()["detail"]
+
+
+def test_workspace_isolation_between_jobs_and_sessions(tmp_path, http_client):
+    """Verify jobs sweeper does not touch session workspaces, and session sweeper reaps orphans."""
+    settings = get_settings()
+
+    # Active session
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    active_id = r1.json()["id"]
+    active_ws = session_manager._sessions[active_id].workspace_path
+
+    # Orphaned session folder (closed session)
+    orphan_id = "orphan-session-123"
+    orphan_ws = os.path.join(settings.session_work_root, orphan_id)
+    os.makedirs(orphan_ws, exist_ok=True)
+    # Set old mtime
+    os.utime(orphan_ws, (time.time() - 400, time.time() - 400))
+
+    # 1. sweep_orphaned_workspaces (for /v1/jobs) MUST NEVER touch SESSION_WORK_ROOT
+    sweep_orphaned_workspaces(db_path=settings.db_path)
+    assert os.path.exists(active_ws)
+    assert os.path.exists(orphan_ws)
+
+    # 2. sweep_orphaned_session_workspaces reaps orphan, preserves active
+    reaped = sweep_orphaned_session_workspaces(db_path=settings.db_path, min_age_seconds=300)
+    assert reaped == 1
+    assert not os.path.exists(orphan_ws)
+    assert os.path.exists(active_ws)
+
+    http_client.delete(f"/v1/sessions/{active_id}", headers={"X-API-Key": "key-alice"})
+
+
+def test_fifo_turn_serialization_and_queue_depth_cap(http_client):
+    """Test FIFO sequential execution and queue depth rejection (429)."""
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    session_id = r1.json()["id"]
+
+    # 2 concurrent turns execute sequentially
+    def send_turn(turn_text):
+        return http_client.post(
+            f"/v1/sessions/{session_id}/messages",
+            headers={"X-API-Key": "key-alice"},
+            json={"prompt": turn_text},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(send_turn, "Msg 1")
+        f2 = executor.submit(send_turn, "Msg 2")
+        res1 = f1.result()
+        res2 = f2.result()
+
+    assert res1.status_code == 200
+    assert res2.status_code == 200
+
+    # Max queued turns guard: artificially set queued_waiters to max (3)
+    live = session_manager._sessions[session_id]
+    live.queued_waiters = 3
+    r_over = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Rejected overflow"},
+    )
+    assert r_over.status_code == 429
+    assert "Session turn queue full" in r_over.json()["detail"]
+    assert r_over.headers.get("Retry-After") == "5"
+    live.queued_waiters = 0
+
+    http_client.delete(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
+
+
+def test_max_active_sessions_cap(http_client, monkeypatch):
+    """Test max_active_sessions rejection with HTTP 429."""
+    monkeypatch.setenv("MAX_ACTIVE_SESSIONS", "1")
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r1.status_code == 201
+    sid1 = r1.json()["id"]
+
+    # Second session creation exceeds limit
+    r2 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r2.status_code == 429
+    assert "Max active sessions limit reached" in r2.json()["detail"]
+    assert r2.headers.get("Retry-After") == "10"
+
+    http_client.delete(f"/v1/sessions/{sid1}", headers={"X-API-Key": "key-alice"})
+
+
+def test_multiturn_attachments_and_cumulative_byte_cap(http_client):
+    """Test attachment persistence across turns, cumulative bytes check, and validation guards."""
+    import base64
+    content1 = b"Invoice #1: $100"
+    b64_1 = base64.b64encode(content1).decode("ascii")
+
+    # Turn 1 uploads invoice.txt
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "agent": "mock_agy_session",
+            "prompt": "CHECK_ATTACHMENT: invoice.txt",
+            "attachments": [{"filename": "invoice.txt", "content_b64": b64_1}],
+        },
+    )
+    assert r1.status_code == 200, r1.text
+    session_id = r1.json()["id"]
+    assert "ATTACHMENT_FOUND: invoice.txt" in r1.json()["latest_turn"]["response"]
+
+    # Turn 2 asks about invoice.txt WITHOUT re-uploading
+    r2 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "CHECK_ATTACHMENT: invoice.txt"},
+    )
+    assert r2.status_code == 200
+    assert "ATTACHMENT_FOUND: invoice.txt" in r2.json()["latest_turn"]["response"]
+
+    # Output validation guard: agent response containing unreadable pattern fails cleanly
+    r_unreadable = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "UNREADABLE"},
+    )
+    assert r_unreadable.status_code == 500
+    assert "Output validation guard failed" in r_unreadable.json()["detail"]
+
+
+def test_multi_tenant_http_isolation(http_client):
+    """Security Invariant #2: Verify 404 tenant isolation on GET, POST /messages, and DELETE."""
+    # Alice creates a session
+    r_alice = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "Alice's secret session"},
+    )
+    assert r_alice.status_code == 200
+    alice_id = r_alice.json()["id"]
+
+    # Bob tries to GET Alice's session -> 404 Not Found (never 403)
+    r_bob_get = http_client.get(
+        f"/v1/sessions/{alice_id}",
+        headers={"X-API-Key": "key-bob"},
+    )
+    assert r_bob_get.status_code == 404
+
+    # Bob tries to POST message to Alice's session -> 404
+    r_bob_msg = http_client.post(
+        f"/v1/sessions/{alice_id}/messages",
+        headers={"X-API-Key": "key-bob"},
+        json={"prompt": "Intrusion attempt"},
+    )
+    assert r_bob_msg.status_code == 404
+
+    # Bob tries to DELETE Alice's session -> 404
+    r_bob_del = http_client.delete(
+        f"/v1/sessions/{alice_id}",
+        headers={"X-API-Key": "key-bob"},
+    )
+    assert r_bob_del.status_code == 404
+
+    # Monitor key has 'stats' scope only (no 'jobs' scope) -> 403 Forbidden
+    r_mon = http_client.get("/v1/sessions", headers={"X-API-Key": "key-monitor"})
+    assert r_mon.status_code == 403
+
+    # Admin key has 'admin' scope -> can GET and DELETE across tenants
+    r_admin_get = http_client.get(
+        f"/v1/sessions/{alice_id}",
+        headers={"X-API-Key": "key-admin"},
+    )
+    assert r_admin_get.status_code == 200
+    assert r_admin_get.json()["id"] == alice_id
+
+    r_admin_del = http_client.delete(
+        f"/v1/sessions/{alice_id}",
+        headers={"X-API-Key": "key-admin"},
+    )
+    assert r_admin_del.status_code == 200
+
+
+def test_turn_timeout_crash_large_output_and_chatty_stderr(http_client):
+    """Test turn timeout (504), child crash (500), 256 KiB output, 130 KiB stderr, and OCR 429."""
+    # 1. Turn timeout
+    r_to = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "TIMEOUT", "turn_timeout": 1},
+    )
+    assert r_to.status_code == 504
+    assert "timed out" in r_to.json()["detail"]
+
+    # 2. Mid-turn crash
+    r_crash = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "CRASH"},
+    )
+    assert r_crash.status_code == 500
+
+    # 3. Large output (>64 KiB, specifically 256 KiB) does not raise LimitOverrunError
+    r_large = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "LARGE_OUTPUT"},
+    )
+    assert r_large.status_code == 200
+    assert len(r_large.json()["latest_turn"]["response"]) >= 256 * 1024
+    large_id = r_large.json()["id"]
+    http_client.delete(f"/v1/sessions/{large_id}", headers={"X-API-Key": "key-alice"})
+
+    # 4. Chatty stderr (>128 KiB, specifically 130 KiB) does not deadlock pipe buffer
+    r_stderr = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "CHATTY_STDERR"},
+    )
+    assert r_stderr.status_code == 200
+    stderr_id = r_stderr.json()["id"]
+    http_client.delete(f"/v1/sessions/{stderr_id}", headers={"X-API-Key": "key-alice"})
+
+    # 5. Security Invariant #8: $ 429,00 OCR in response payload is NEVER rate-limited
+    r_ocr = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "OCR_429"},
+    )
+    assert r_ocr.status_code == 200
+    assert "$ 429,00" in r_ocr.json()["latest_turn"]["response"]
+    ocr_id = r_ocr.json()["id"]
+    http_client.delete(f"/v1/sessions/{ocr_id}", headers={"X-API-Key": "key-alice"})
+
+
+def test_session_spawn_bwrap_fail_closed(monkeypatch, tmp_path):
+    """Test fail-closed confinement error when bwrap is missing and allow_unconfined=0."""
+    monkeypatch.setenv("BWRAP_ENABLED", "1")
+    monkeypatch.setenv("ALLOW_UNCONFINED", "0")
+    monkeypatch.setattr("shutil.which", lambda cmd: None if cmd == "bwrap" else "/bin/python3")
+
+    with pytest.raises(Exception) as excinfo:
+        wrap_cmd_with_bwrap(["echo", "hi"], str(tmp_path), "mock_agy_session")
+    assert "Confinement error: bubblewrap (bwrap) binary missing" in str(excinfo.value)
+

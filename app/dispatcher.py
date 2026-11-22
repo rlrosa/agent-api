@@ -210,6 +210,15 @@ async def _retention_loop() -> None:
             else:
                 logger.debug(f"Scheduled retention purge: 0 rows removed (cutoff: {cutoff:.0f})")
 
+            from app.db import purge_old_sessions
+            from app.sessions import sweep_orphaned_session_workspaces
+
+            purged_sessions = purge_old_sessions(cutoff, db_path=settings.db_path)
+            if purged_sessions > 0:
+                logger.info(
+                    f"Scheduled retention purge: removed {purged_sessions} session rows older than {settings.job_retention_days} days (cutoff: {cutoff:.0f})"
+                )
+
             # Build daily rollups on schedule
             rollups_cnt = build_daily_rollups(db_path=settings.db_path)
             logger.info(f"Scheduled daily rollups built: updated {rollups_cnt} hourly buckets")
@@ -217,6 +226,10 @@ async def _retention_loop() -> None:
             reaped_ws = sweep_orphaned_workspaces(db_path=settings.db_path)
             if reaped_ws > 0:
                 logger.info(f"Scheduled retention purge: reaped {reaped_ws} orphaned workspace directories")
+
+            reaped_session_ws = sweep_orphaned_session_workspaces(db_path=settings.db_path)
+            if reaped_session_ws > 0:
+                logger.info(f"Scheduled retention purge: reaped {reaped_session_ws} orphaned session workspace directories")
 
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
