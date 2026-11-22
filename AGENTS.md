@@ -24,8 +24,10 @@ untrusted.**
 | `app/ratelimit.py` | The 5-layer rate-limit classifier and AIMD concurrency manager |
 | `app/dispatcher.py` | The claim/run loop; drives AIMD backoff/recovery |
 | `app/attachments.py` | URL fetching, the SSRF guard, filename sanitisation |
+| `app/sessions.py` | Warm multi-turn session runtime, stream-json drivers, FIFO lock, idle reaper |
 | `app/db.py` | SQLite access. Every job query must be scoped — see Invariants |
 | `app/static/dashboard.html` | Unauthenticated monitoring page |
+| `doc/sessions.md` | Comprehensive guide and protocol diagrams for warm /v1/sessions |
 | `doc/security-review-2026-08-10.md` | Full security review: findings, evidence, what's fixed |
 
 ## Running it
@@ -64,6 +66,18 @@ Job workspaces live under `WORK_ROOT` (`/var/tmp/agent-api/jobs/<job_id>`). Dele
 `sweep_orphaned_workspaces()` reaps directories with no live job on startup and on a retention
 sweep (`min_age_seconds` guards against racing a job that is mid-setup). Consequence worth
 holding in mind: caller-supplied attachments persist on disk longer than one job run.
+
+## Multi-turn sessions (/v1/sessions)
+
+Warm multi-turn sessions run long-lived agent processes sleeping on `stdin` inside `bwrap`:
+- **Workspace separation**: Warm sessions live under `SESSION_WORK_ROOT` (`/var/tmp/agent-api/sessions/<session_id>`).
+  `WORK_ROOT` sweeps and `SESSION_WORK_ROOT` sweeps are strictly isolated and never touch each other's trees.
+- **Wire format & cumulative usage**: `agy` emits nested `{"event": "result", "result": {"status": "SUCCESS", "usage": ...}}`.
+  The driver parses inside `result.result` and computes per-turn token deltas by subtracting previous cumulative usage.
+- **Stdio limits & draining**: `proc.stdout` uses a 16 MiB line limit; `proc.stderr` is drained continuously into a 200-item
+  rolling deque by `_drain_stderr` to prevent child pipe deadlocks. Stderr is wiped at the start of each turn.
+- **Pure in-memory tmpfs state**: Agent state (`brain`, `conversations`, `.claude`) is hosted in RAM via `--tmpfs`, completely
+  destroyed when the process group terminates on idle expiration or explicit close. Attachments live under `<session_ws>/attachments`.
 
 ## Security invariants — do not regress these
 

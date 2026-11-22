@@ -645,7 +645,7 @@ async def stats_agy_quota_endpoint(
 
 from app.models import CreateSessionRequest, SessionMessageRequest
 from app.sessions import session_manager
-from app.db import get_session, list_sessions, list_session_turns
+from app.db import get_session, list_sessions, list_session_turns, update_session_state
 
 
 @app.post("/v1/sessions")
@@ -758,19 +758,52 @@ async def create_session_endpoint(
         db_path=settings.db_path,
     )
 
-    sess_dict = get_session(live_session.id, db_path=settings.db_path)
-    if sess_dict:
-        sess_dict["expires_at"] = sess_dict["last_active_at"] + sess_dict["idle_timeout"]
+    host_allowlist_raw = os.environ.get("ATTACHMENT_HOST_ALLOWLIST", "")
+    allowlist = [h.strip() for h in host_allowlist_raw.split(",") if h.strip()] if host_allowlist_raw else None
 
-    if prompt is None:
+    if prompt is None or not prompt.strip():
+        if attachments_input:
+            try:
+                for att in attachments_input:
+                    att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
+                        att if isinstance(att, dict) else dict(att)
+                    )
+                    _, byte_count = await materialize_attachment(
+                        att_dict,
+                        live_session.workspace_path,
+                        total_bytes_so_far=live_session.total_attachment_bytes,
+                        allowlist=allowlist,
+                    )
+                    live_session.total_attachment_bytes += byte_count
+                    if live_session.total_attachment_bytes > settings.max_total_bytes:
+                        raise ValueError(
+                            f"Cumulative attachment size ({live_session.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
+                        )
+                update_session_state(
+                    session_id=live_session.id,
+                    total_attachment_bytes=live_session.total_attachment_bytes,
+                    db_path=settings.db_path,
+                )
+            except ValueError as att_err:
+                await session_manager.close_session(
+                    live_session.id,
+                    reason="failed",
+                    error=str(att_err),
+                    db_path=settings.db_path,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Attachment error: {att_err}",
+                )
+
+        sess_dict = get_session(live_session.id, db_path=settings.db_path)
+        if sess_dict:
+            sess_dict["expires_at"] = sess_dict["last_active_at"] + sess_dict["idle_timeout"]
         return Response(
             content=json.dumps(sess_dict),
             status_code=status.HTTP_201_CREATED,
             media_type="application/json",
         )
-
-    host_allowlist_raw = os.environ.get("ATTACHMENT_HOST_ALLOWLIST", "")
-    allowlist = [h.strip() for h in host_allowlist_raw.split(",") if h.strip()] if host_allowlist_raw else None
 
     if eff_wait == 0:
         asyncio.create_task(

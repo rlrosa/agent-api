@@ -1151,3 +1151,34 @@ def test_per_turn_stderr_isolation(http_client):
     http_client.delete(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"})
 
 
+def test_spawn_only_with_empty_prompt_and_preuploaded_attachments(http_client):
+    """Carry-over polish: Empty prompt string or null prompt on creation results in 201 Created spawn-only, and materializes attachments."""
+    import io
+    content = b"Pre-uploaded file content"
+    files = {"file": ("preload.txt", io.BytesIO(content), "text/plain")}
+    data = {"agent": "mock_agy_session", "prompt": "   "}
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        data=data,
+        files=files,
+    )
+    assert r1.status_code == 201, r1.text
+    sid = r1.json()["id"]
+    assert r1.json()["status"] == "idle"
+    assert r1.json()["turn_count"] == 0
+    assert r1.json()["total_attachment_bytes"] == len(content)
+
+    # Turn 1 asks about the preloaded attachment
+    r2 = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "CHECK_ATTACHMENT: preload.txt"},
+    )
+    assert r2.status_code == 200
+    assert "ATTACHMENT_FOUND: preload.txt" in r2.json()["latest_turn"]["response"]
+
+    http_client.delete(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"})
+
+
+
