@@ -228,6 +228,46 @@ def build_codex_argv(
     raise NotImplementedError("codex agent is not installed on this system")
 
 
+def build_agy_session_argv(
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> List[str]:
+    # Note: Do NOT pass -p in agy stream-json mode (agy drops -p and listens strictly on stdin).
+    cmd = ["agy", "--input-format", "stream-json", "--output-format", "stream-json"]
+    resolved_model = resolve_model("agy", model)
+    if effort:
+        base = strip_model_tier(resolved_model)
+        resolved_eff = resolve_effort(effort)
+        cmd.extend(["--model", base, "--effort", resolved_eff])
+    else:
+        cmd.extend(["--model", resolved_model])
+
+    cmd.extend(get_agent_flags("agy"))
+    if workspace_path:
+        cmd.extend(["--add-dir", workspace_path])
+    return cmd
+
+
+def build_claude_session_argv(
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> List[str]:
+    # Note: claude requires -p (--print) when using --input-format/--output-format stream-json.
+    spec = AGENTS["claude"]["spec"]
+    cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json"]
+
+    settings = get_settings()
+    raw_model = model or settings.claude_default_model or spec.default_model
+    if raw_model:
+        cmd.extend(["--model", resolve_model("claude", raw_model)])
+    if effort:
+        cmd.extend(["--effort", resolve_effort(effort)])
+
+    cmd.extend(get_agent_flags("claude"))
+    return cmd
+
 
 AGENTS: Dict[str, Dict] = {
     "agy": {
@@ -240,6 +280,7 @@ AGENTS: Dict[str, Dict] = {
             default_flags="--sandbox",
         ),
         "argv_builder": build_agy_argv,
+        "session_argv_builder": build_agy_session_argv,
     },
     "claude": {
         "spec": AgentSpec(
@@ -251,6 +292,7 @@ AGENTS: Dict[str, Dict] = {
             default_flags="--allowed-tools View,Read --permission-mode dontAsk",
         ),
         "argv_builder": build_claude_argv,
+        "session_argv_builder": build_claude_session_argv,
     },
     "codex": {
         "spec": AgentSpec(
@@ -262,6 +304,7 @@ AGENTS: Dict[str, Dict] = {
             default_flags="",
         ),
         "argv_builder": build_codex_argv,
+        "session_argv_builder": None,
     },
     "mock_429": {
         "spec": AgentSpec(
@@ -273,6 +316,7 @@ AGENTS: Dict[str, Dict] = {
             default_flags="",
         ),
         "argv_builder": None,
+        "session_argv_builder": None,
     },
 }
 

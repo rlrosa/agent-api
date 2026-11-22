@@ -59,6 +59,12 @@ class Settings(BaseModel):
     job_retention_days: int = Field(default=30)
     agy_usage_cmd: str = Field(default="agy -p /usage")
     agy_quota_ttl_s: int = Field(default=300)
+    session_work_root: str = Field(default="/var/tmp/agent-api/sessions")
+    session_idle_timeout: int = Field(default=900)
+    session_idle_max: int = Field(default=3600)
+    session_turn_timeout: int = Field(default=120)
+    max_active_sessions: int = Field(default=10)
+    max_queued_turns_per_session: int = Field(default=3)
 
 
 def get_settings() -> Settings:
@@ -135,6 +141,12 @@ def get_settings() -> Settings:
         job_retention_days=job_retention_days,
         agy_usage_cmd=os.environ.get("AGY_USAGE_CMD", "agy -p /usage"),
         agy_quota_ttl_s=int(os.environ.get("AGY_QUOTA_TTL_S", "300")),
+        session_work_root=os.environ.get("SESSION_WORK_ROOT", "/var/tmp/agent-api/sessions"),
+        session_idle_timeout=int(os.environ.get("SESSION_IDLE_TIMEOUT", "900")),
+        session_idle_max=int(os.environ.get("SESSION_IDLE_MAX", "3600")),
+        session_turn_timeout=int(os.environ.get("SESSION_TURN_TIMEOUT", "120")),
+        max_active_sessions=int(os.environ.get("MAX_ACTIVE_SESSIONS", "10")),
+        max_queued_turns_per_session=int(os.environ.get("MAX_QUEUED_TURNS_PER_SESSION", "3")),
     )
 
 

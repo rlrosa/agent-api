@@ -124,6 +124,65 @@ def init_db(db_path: Optional[str] = None) -> None:
             ON jobs(status);
             """)
             conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                model TEXT,
+                effort TEXT,
+                status TEXT NOT NULL,
+                upstream_conversation_id TEXT,
+                turn_count INTEGER NOT NULL DEFAULT 0,
+                idle_timeout INTEGER NOT NULL DEFAULT 900,
+                turn_timeout INTEGER NOT NULL DEFAULT 120,
+                total_attachment_bytes INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cached_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                cost_usd REAL,
+                error TEXT,
+                metadata TEXT,
+                created_at REAL NOT NULL,
+                last_active_at REAL NOT NULL,
+                closed_at REAL,
+                client_ip TEXT,
+                auth_mode TEXT,
+                api_key_name TEXT
+            );
+            """)
+            conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_status 
+            ON sessions(status);
+            """)
+            conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_api_key 
+            ON sessions(api_key_name);
+            """)
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_turns (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                turn_index INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                response TEXT,
+                stderr TEXT,
+                error TEXT,
+                status TEXT NOT NULL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cached_tokens INTEGER,
+                total_tokens INTEGER,
+                cost_usd REAL,
+                created_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            );
+            """)
+            conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_turns_session_id 
+            ON session_turns(session_id);
+            """)
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS job_daily (
                 day TEXT NOT NULL,
                 agent TEXT NOT NULL,
@@ -545,5 +604,378 @@ def build_daily_rollups(target_day: Optional[str] = None, db_path: Optional[str]
                 count += 1
             conn.commit()
             return count
+
+
+def create_session_row(
+    agent: str,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    idle_timeout: int = 900,
+    turn_timeout: int = 120,
+    metadata: Optional[Dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+    client_ip: Optional[str] = None,
+    auth_mode: Optional[str] = None,
+    api_key_name: Optional[str] = None,
+    status: str = "starting",
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    path = _get_db_path(db_path)
+    session_id = session_id or str(uuid.uuid4())
+    now = time.time()
+    meta_json = json.dumps(metadata) if metadata is not None else None
+
+    with _db_lock:
+        with _connect(path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO sessions (
+                    id, agent, model, effort, status, turn_count,
+                    idle_timeout, turn_timeout, total_attachment_bytes,
+                    input_tokens, output_tokens, cached_tokens, total_tokens,
+                    cost_usd, error, metadata, created_at, last_active_at,
+                    client_ip, auth_mode, api_key_name
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, 0, 0, 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                RETURNING *;
+                """,
+                (
+                    session_id,
+                    agent,
+                    model,
+                    effort,
+                    status,
+                    idle_timeout,
+                    turn_timeout,
+                    meta_json,
+                    now,
+                    now,
+                    client_ip,
+                    auth_mode,
+                    api_key_name,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return _row_to_dict(row)
+
+
+def update_session_state(
+    session_id: str,
+    status: Optional[str] = None,
+    upstream_conversation_id: Optional[str] = None,
+    turn_count: Optional[int] = None,
+    total_attachment_bytes: Optional[int] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    cost_usd: Optional[float] = None,
+    error: Optional[str] = None,
+    last_active_at: Optional[float] = None,
+    closed_at: Optional[float] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    path = _get_db_path(db_path)
+    updates = []
+    params: List[Any] = []
+
+    if status is not None:
+        updates.append("status = ?")
+        params.append(status)
+    if upstream_conversation_id is not None:
+        updates.append("upstream_conversation_id = ?")
+        params.append(upstream_conversation_id)
+    if turn_count is not None:
+        updates.append("turn_count = ?")
+        params.append(turn_count)
+    if total_attachment_bytes is not None:
+        updates.append("total_attachment_bytes = ?")
+        params.append(total_attachment_bytes)
+    if input_tokens is not None:
+        updates.append("input_tokens = ?")
+        params.append(input_tokens)
+    if output_tokens is not None:
+        updates.append("output_tokens = ?")
+        params.append(output_tokens)
+    if cached_tokens is not None:
+        updates.append("cached_tokens = ?")
+        params.append(cached_tokens)
+    if total_tokens is not None:
+        updates.append("total_tokens = ?")
+        params.append(total_tokens)
+    if cost_usd is not None:
+        updates.append("cost_usd = ?")
+        params.append(cost_usd)
+    if error is not None:
+        updates.append("error = ?")
+        params.append(error)
+    if last_active_at is not None:
+        updates.append("last_active_at = ?")
+        params.append(last_active_at)
+    if closed_at is not None:
+        updates.append("closed_at = ?")
+        params.append(closed_at)
+    if metadata is not None:
+        updates.append("metadata = ?")
+        params.append(json.dumps(metadata))
+
+    if not updates:
+        return get_session(session_id, db_path=db_path)
+
+    params.append(session_id)
+    set_clause = ", ".join(updates)
+
+    with _db_lock:
+        with _connect(path) as conn:
+            cur = conn.execute(
+                f"UPDATE sessions SET {set_clause} WHERE id = ? RETURNING *;",
+                tuple(params),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return _row_to_dict(row)
+
+
+def get_session(
+    session_id: str,
+    db_path: Optional[str] = None,
+    api_key_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    path = _get_db_path(db_path)
+    with _db_lock:
+        with _connect(path) as conn:
+            if api_key_name is not None and api_key_name != "bypass":
+                cur = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ? AND (api_key_name = ? OR (api_key_name IS NULL AND ? = 'default'));",
+                    (session_id, api_key_name, api_key_name),
+                )
+            else:
+                cur = conn.execute("SELECT * FROM sessions WHERE id = ?;", (session_id,))
+            row = cur.fetchone()
+            return _row_to_dict(row)
+
+
+def list_sessions(
+    status: Optional[str] = None,
+    limit: int = 50,
+    db_path: Optional[str] = None,
+    api_key_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    path = _get_db_path(db_path)
+    with _db_lock:
+        with _connect(path) as conn:
+            where_clauses = []
+            params: List[Any] = []
+
+            if status is not None:
+                where_clauses.append("status = ?")
+                params.append(status)
+
+            if api_key_name is not None and api_key_name != "bypass":
+                where_clauses.append("(api_key_name = ? OR (api_key_name IS NULL AND ? = 'default'))")
+                params.extend([api_key_name, api_key_name])
+
+            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+            params.append(limit)
+
+            sql = f"SELECT * FROM sessions {where_sql} ORDER BY created_at DESC LIMIT ?;"
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+
+def create_session_turn(
+    session_id: str,
+    turn_index: int,
+    prompt: str,
+    turn_id: Optional[str] = None,
+    status: str = "running",
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    path = _get_db_path(db_path)
+    turn_id = turn_id or str(uuid.uuid4())
+    now = time.time()
+
+    with _db_lock:
+        with _connect(path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO session_turns (
+                    id, session_id, turn_index, prompt, status, created_at, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                RETURNING *;
+                """,
+                (turn_id, session_id, turn_index, prompt, status, now, now),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return _row_to_dict(row)
+
+
+def finish_session_turn(
+    turn_id: str,
+    status: str,
+    response: Optional[str] = None,
+    stderr: Optional[str] = None,
+    error: Optional[str] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    cost_usd: Optional[float] = None,
+    finished_at: Optional[float] = None,
+    db_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    path = _get_db_path(db_path)
+    end_time = finished_at if finished_at is not None else time.time()
+
+    with _db_lock:
+        with _connect(path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE session_turns
+                SET status = ?,
+                    response = ?,
+                    stderr = ?,
+                    error = ?,
+                    finished_at = ?,
+                    input_tokens = ?,
+                    output_tokens = ?,
+                    cached_tokens = ?,
+                    total_tokens = ?,
+                    cost_usd = ?
+                WHERE id = ?
+                RETURNING *;
+                """,
+                (
+                    status,
+                    response,
+                    stderr,
+                    error,
+                    end_time,
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    total_tokens,
+                    cost_usd,
+                    turn_id,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return _row_to_dict(row)
+
+
+def list_session_turns(
+    session_id: str,
+    db_path: Optional[str] = None,
+    api_key_name: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    path = _get_db_path(db_path)
+    session = get_session(session_id, db_path=path, api_key_name=api_key_name)
+    if session is None:
+        return None
+
+    with _db_lock:
+        with _connect(path) as conn:
+            cur = conn.execute(
+                "SELECT * FROM session_turns WHERE session_id = ? ORDER BY turn_index ASC;",
+                (session_id,),
+            )
+            rows = cur.fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+
+def close_session_row(
+    session_id: str,
+    status: str = "closed",
+    error: Optional[str] = None,
+    db_path: Optional[str] = None,
+    api_key_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    path = _get_db_path(db_path)
+    now = time.time()
+
+    with _db_lock:
+        with _connect(path) as conn:
+            if api_key_name is not None and api_key_name != "bypass":
+                cur = conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?,
+                        error = COALESCE(?, error),
+                        closed_at = ?
+                    WHERE id = ? AND (api_key_name = ? OR (api_key_name IS NULL AND ? = 'default'))
+                    RETURNING *;
+                    """,
+                    (status, error, now, session_id, api_key_name, api_key_name),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?,
+                        error = COALESCE(?, error),
+                        closed_at = ?
+                    WHERE id = ?
+                    RETURNING *;
+                    """,
+                    (status, error, now, session_id),
+                )
+            row = cur.fetchone()
+            conn.commit()
+            return _row_to_dict(row)
+
+
+def reset_orphan_sessions(db_path: Optional[str] = None) -> int:
+    path = _get_db_path(db_path)
+    now = time.time()
+
+    with _db_lock:
+        with _connect(path) as conn:
+            cur = conn.execute(
+                """
+                UPDATE sessions
+                SET status = 'closed',
+                    closed_at = ?,
+                    error = 'Closed on server startup (orphaned session)'
+                WHERE status IN ('starting', 'idle', 'busy');
+                """,
+                (now,),
+            )
+            count = cur.rowcount
+            conn.commit()
+            return count
+
+
+def purge_old_sessions(before_ts: float, db_path: Optional[str] = None) -> int:
+    path = _get_db_path(db_path)
+
+    with _db_lock:
+        with _connect(path) as conn:
+            conn.execute(
+                """
+                DELETE FROM session_turns
+                WHERE session_id IN (
+                    SELECT id FROM sessions
+                    WHERE status IN ('closed', 'expired', 'failed')
+                      AND (closed_at < ? OR (closed_at IS NULL AND created_at < ?))
+                );
+                """,
+                (before_ts, before_ts),
+            )
+            cur = conn.execute(
+                """
+                DELETE FROM sessions
+                WHERE status IN ('closed', 'expired', 'failed')
+                  AND (closed_at < ? OR (closed_at IS NULL AND created_at < ?));
+                """,
+                (before_ts, before_ts),
+            )
+            count = cur.rowcount
+            conn.commit()
+            return count
+
 
 
