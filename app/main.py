@@ -50,8 +50,11 @@ from app.dispatcher import (
     wake_dispatcher,
 )
 from app.models import (
+    AttachmentSpec,
     CreateJobRequest,
+    CreateSessionRequest,
     HealthResponse,
+    SessionMessageRequest,
 )
 
 
@@ -701,8 +704,19 @@ async def create_session_endpoint(
                     )
                 )
     else:
-        body = await request.json() if await request.body() else {}
-        req_obj = CreateSessionRequest(**body)
+        try:
+            body = await request.json() if await request.body() else {}
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body")
+
+        try:
+            req_obj = CreateSessionRequest(**body)
+        except Exception as err:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid request parameters: {err}",
+            )
+
         agent_name = req_obj.agent
         prompt = req_obj.prompt
         model = req_obj.model
@@ -714,11 +728,11 @@ async def create_session_endpoint(
         metadata = req_obj.metadata
 
     agent = agent_name or settings.default_agent
-    if agent not in AGENTS and not (settings.allow_mock_agent and agent in ("mock_agy_session", "mock_claude_session")):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported agent: '{agent}'",
-        )
+    try:
+        ensure_available(agent)
+    except ValueError as err:
+        logger.error(f"Agent validation failed: {err}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
 
     resolved_model = resolve_model(agent, model) if model else None
     resolved_effort = resolve_effort(effort) if effort else None
@@ -728,7 +742,7 @@ async def create_session_endpoint(
     eff_turn = turn_timeout if turn_timeout is not None else settings.session_turn_timeout
     eff_wait = max(0, min(wait_time, settings.wait_max))
 
-    api_key_name = auth.name if auth.name != "bypass" else None
+    api_key_name = auth.name
     client_ip = request.client.host if request.client else "unknown"
 
     live_session = await session_manager.create_session(
@@ -755,6 +769,9 @@ async def create_session_endpoint(
             media_type="application/json",
         )
 
+    host_allowlist_raw = os.environ.get("ATTACHMENT_HOST_ALLOWLIST", "")
+    allowlist = [h.strip() for h in host_allowlist_raw.split(",") if h.strip()] if host_allowlist_raw else None
+
     if eff_wait == 0:
         asyncio.create_task(
             session_manager.execute_turn(
@@ -763,6 +780,7 @@ async def create_session_endpoint(
                 attachments=attachments_input,
                 turn_timeout=eff_turn,
                 api_key_name=api_key_name,
+                allowlist=allowlist,
                 db_path=settings.db_path,
             )
         )
@@ -779,6 +797,7 @@ async def create_session_endpoint(
             attachments=attachments_input,
             turn_timeout=eff_turn,
             api_key_name=api_key_name,
+            allowlist=allowlist,
             db_path=settings.db_path,
         )
     )
@@ -795,6 +814,9 @@ async def create_session_endpoint(
             status_code=status.HTTP_202_ACCEPTED,
             media_type="application/json",
         )
+    except Exception:
+        await session_manager.close_session(live_session.id, reason="failed", db_path=settings.db_path)
+        raise
 
 
 @app.post("/v1/sessions/{session_id}/messages")
@@ -804,7 +826,7 @@ async def session_message_endpoint(
     auth: AuthContext = Depends(require_scope("jobs")),
 ):
     settings = get_settings()
-    tenant = auth.name if auth.name != "bypass" else "bypass"
+    tenant = "bypass" if "admin" in auth.scopes else auth.name
     sess_row = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
     if not sess_row:
         raise HTTPException(
@@ -849,15 +871,36 @@ async def session_message_endpoint(
                     )
                 )
     else:
-        body = await request.json() if await request.body() else {}
-        req_obj = SessionMessageRequest(**body)
+        try:
+            body = await request.json() if await request.body() else {}
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid JSON body",
+            )
+        try:
+            req_obj = SessionMessageRequest(**body)
+        except Exception as err:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid request parameters: {err}",
+            )
         prompt = req_obj.prompt
         attachments_input = req_obj.attachments or []
         turn_timeout = req_obj.turn_timeout
         wait_time = req_obj.wait
 
+    if not prompt or not prompt.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Field 'prompt' is required and cannot be empty",
+        )
+
+    host_allowlist_raw = os.environ.get("ATTACHMENT_HOST_ALLOWLIST", "")
+    allowlist = [h.strip() for h in host_allowlist_raw.split(",") if h.strip()] if host_allowlist_raw else None
+
     eff_wait = max(0, min(wait_time, settings.wait_max))
-    api_key_name = auth.name if auth.name != "bypass" else None
+    api_key_name = tenant
 
     if eff_wait == 0:
         asyncio.create_task(
@@ -867,6 +910,7 @@ async def session_message_endpoint(
                 attachments=attachments_input,
                 turn_timeout=turn_timeout,
                 api_key_name=api_key_name,
+                allowlist=allowlist,
                 db_path=settings.db_path,
             )
         )
@@ -886,6 +930,7 @@ async def session_message_endpoint(
             attachments=attachments_input,
             turn_timeout=turn_timeout,
             api_key_name=api_key_name,
+            allowlist=allowlist,
             db_path=settings.db_path,
         )
     )

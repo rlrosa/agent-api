@@ -447,7 +447,11 @@ def test_purge_old_sessions(tmp_db_path):
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.testclient import TestClient
 from app.main import app
-from app.sessions import session_manager, sweep_orphaned_session_workspaces
+from app.sessions import (
+    AgyStreamDriver,
+    session_manager,
+    sweep_orphaned_session_workspaces,
+)
 from app.runner import sweep_orphaned_workspaces, wrap_cmd_with_bwrap
 
 
@@ -469,7 +473,7 @@ def http_client(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_PRICES", '{"gemini-3.8-flash-low": {"input": 0.50, "output": 2.00}}')
 
     init_db(test_db)
-    with TestClient(app) as client:
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
         yield client
 
 
@@ -917,4 +921,233 @@ def test_session_spawn_bwrap_fail_closed(monkeypatch, tmp_path):
     with pytest.raises(Exception) as excinfo:
         wrap_cmd_with_bwrap(["echo", "hi"], str(tmp_path), "mock_agy_session")
     assert "Confinement error: bubblewrap (bwrap) binary missing" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_agy_stream_driver_nested_wire_format():
+    """Finding 1: Verify AgyStreamDriver correctly extracts from nested {"event": "result", "result": {...}} wire format."""
+    import asyncio
+    import json
+    driver = AgyStreamDriver()
+    raw = json.dumps({
+        "event": "result",
+        "result": {
+            "status": "SUCCESS",
+            "response": "Hello from nested format",
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "cached_tokens": 12,
+                "total_tokens": 165,
+                "cost_usd": 0.00045,
+            },
+        },
+    })
+    reader = asyncio.StreamReader()
+    reader.feed_data(raw.encode("utf-8") + b"\n")
+    reader.feed_eof()
+
+    parsed = await driver.parse_response(
+        reader,
+        model="gemini-3.8-flash-low",
+        settings=get_settings(),
+        prev_cum_usage={},
+    )
+    assert parsed is not None
+    assert parsed["is_success"] is True
+    assert parsed["response"] == "Hello from nested format"
+    assert parsed["turn_usage"]["input_tokens"] == 120
+    assert parsed["turn_usage"]["output_tokens"] == 45
+    assert parsed["turn_usage"]["cached_tokens"] == 12
+    assert parsed["turn_usage"]["total_tokens"] == 165
+
+
+def test_bypass_tenant_isolation(http_client, monkeypatch):
+    """Finding 3: Bypass-created session is not accessible by 'default' API key (404), but accessible by bypass/admin."""
+    monkeypatch.setenv("TRUSTED_NETWORKS", "testclient,127.0.0.1")
+    # Bypass creation (no API key header from trusted host)
+    r_bypass = http_client.post(
+        "/v1/sessions",
+        json={"agent": "mock_agy_session", "prompt": "Bypass session"},
+    )
+    assert r_bypass.status_code == 200, r_bypass.text
+    session_id = r_bypass.json()["id"]
+
+    # 'default' API key caller tries to GET bypass session -> 404 Not Found
+    r_default_get = http_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-API-Key": "test-secret-key"},
+    )
+    assert r_default_get.status_code == 404
+
+    # 'default' API key caller tries to POST message to bypass session -> 404 Not Found
+    r_default_msg = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "test-secret-key"},
+        json={"prompt": "Hijack attempt"},
+    )
+    assert r_default_msg.status_code == 404
+
+    # 'default' API key caller tries to DELETE bypass session -> 404 Not Found
+    r_default_del = http_client.delete(
+        f"/v1/sessions/{session_id}",
+        headers={"X-API-Key": "test-secret-key"},
+    )
+    assert r_default_del.status_code == 404
+
+    # Bypass / loopback caller CAN access it
+    r_check = http_client.get(f"/v1/sessions/{session_id}")
+    assert r_check.status_code == 200
+    assert r_check.json()["id"] == session_id
+
+    # Clean up
+    http_client.delete(f"/v1/sessions/{session_id}")
+
+
+def test_multipart_attachments_and_unwedge_on_cap_exceeded(http_client, monkeypatch):
+    """Finding 4: Test multipart form-data upload and unwedging of session status if attachment fails."""
+    import io
+    # 1. Create session via multipart/form-data
+    file_content = b"Content from multipart upload 1"
+    files = {"file": ("report.txt", io.BytesIO(file_content), "text/plain")}
+    data = {"agent": "mock_agy_session", "prompt": "CHECK_ATTACHMENT: report.txt"}
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        data=data,
+        files=files,
+    )
+    assert r1.status_code == 200, r1.text
+    session_id = r1.json()["id"]
+    assert "ATTACHMENT_FOUND: report.txt" in r1.json()["latest_turn"]["response"]
+
+    # 2. Add message with multipart/form-data
+    file2_content = b"Content from multipart upload 2"
+    files2 = {"file": ("notes.txt", io.BytesIO(file2_content), "text/plain")}
+    data2 = {"prompt": "CHECK_ATTACHMENT: notes.txt"}
+    r2 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        data=data2,
+        files=files2,
+    )
+    assert r2.status_code == 200, r2.text
+    assert "ATTACHMENT_FOUND: notes.txt" in r2.json()["latest_turn"]["response"]
+
+    # 3. Simulate cumulative byte limit breach on Turn 3
+    monkeypatch.setenv("MAX_TOTAL_BYTES", "10")  # very small limit to trigger ValueError
+    r3 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Exceeding attachment limit",
+            "attachments": [{"filename": "huge.bin", "content_b64": "AQIDBAUGBwgJCgsMDQ4PEBES"}],
+        },
+    )
+    assert r3.status_code == 400
+    assert "exceeds" in r3.json()["detail"] or "limit" in r3.json()["detail"].lower()
+
+    # Verify session is NOT wedged in 'busy' status
+    live = session_manager._sessions[session_id]
+    assert live.status == "idle"
+
+    # Turn 4: Follow-up text prompt succeeds because session unwedged
+    r4 = http_client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Normal recovery turn"},
+    )
+    assert r4.status_code == 200
+    assert "Echo" in r4.json()["latest_turn"]["response"]
+
+    # Clean up
+    http_client.delete(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
+
+
+def test_validation_guards_and_empty_prompt_and_unavailable_agent(http_client):
+    """Finding 5: 400 on invalid JSON, 422 on extra params, 400 on empty prompt, 400 on unavailable agent."""
+    # 1. Invalid JSON body on POST /v1/sessions -> 400
+    r_inv_json = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice", "Content-Type": "application/json"},
+        content=b"{not valid json",
+    )
+    assert r_inv_json.status_code == 400
+    assert "Invalid JSON" in r_inv_json.json()["detail"]
+
+    # 2. Extra parameters on POST /v1/sessions -> 422
+    r_extra = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "unknown_forbidden_param": 123},
+    )
+    assert r_extra.status_code == 422
+
+    # 3. Unavailable agent -> 400
+    r_unavail = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "non_existent_agent"},
+    )
+    assert r_unavail.status_code == 400
+    assert "Unknown agent" in r_unavail.json()["detail"]
+
+    # Create a valid session to test /messages validation
+    r_sess = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r_sess.status_code == 201
+    sid = r_sess.json()["id"]
+
+    # 4. Invalid JSON on POST /messages -> 400
+    r_msg_inv_json = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice", "Content-Type": "application/json"},
+        content=b"{bad:json",
+    )
+    assert r_msg_inv_json.status_code == 400
+    assert "Invalid JSON" in r_msg_inv_json.json()["detail"]
+
+    # 5. Empty prompt on POST /messages -> 400
+    r_empty_p = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "   "},
+    )
+    assert r_empty_p.status_code == 400
+    assert "prompt" in r_empty_p.json()["detail"].lower()
+
+    # Clean up
+    http_client.delete(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"})
+
+
+def test_per_turn_stderr_isolation(http_client):
+    """Finding 6: Stderr from Turn 1 does not leak into Turn 2's latest_turn stderr."""
+    # Turn 1: Generates chatty stderr
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "CHATTY_STDERR"},
+    )
+    assert r1.status_code == 200
+    sid = r1.json()["id"]
+    turn1_err = r1.json()["latest_turn"]["stderr"]
+    assert "E" in turn1_err
+
+    # Turn 2: Normal prompt
+    r2 = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Clean turn 2"},
+    )
+    assert r2.status_code == 200
+    turn2_err = r2.json()["latest_turn"]["stderr"]
+    # Turn 2 stderr must NOT contain Turn 1 stderr lines
+    assert turn2_err == "" or "E" not in turn2_err
+
+    # Clean up
+    http_client.delete(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"})
+
 

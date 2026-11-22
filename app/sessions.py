@@ -93,13 +93,14 @@ class AgyStreamDriver:
             if event_type == "init":
                 conv_id = evt.get("conversation_id")
             elif event_type == "result":
-                conv_id = evt.get("conversation_id") or conv_id
-                response = evt.get("response", "")
-                status_val = evt.get("status")
+                res_dict = evt.get("result") if isinstance(evt.get("result"), dict) else evt
+                conv_id = res_dict.get("conversation_id") or evt.get("conversation_id") or conv_id
+                response = res_dict.get("response", "")
+                status_val = res_dict.get("status")
                 is_success = (status_val == "SUCCESS")
-                error_msg = evt.get("error") if not is_success else None
+                error_msg = res_dict.get("error") if not is_success else None
 
-                usage = evt.get("usage") or {}
+                usage = res_dict.get("usage") or {}
                 cum_input = usage.get("input_tokens", 0) or 0
                 cum_output = usage.get("output_tokens", 0) or 0
                 cum_cached = (
@@ -513,6 +514,7 @@ class SessionManager:
         attachments: Optional[List[AttachmentSpec]] = None,
         turn_timeout: Optional[int] = None,
         api_key_name: Optional[str] = None,
+        allowlist: Optional[List[str]] = None,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         settings = get_settings()
@@ -553,6 +555,7 @@ class SessionManager:
                 live.status = "busy"
                 now = time.time()
                 live.last_active_at = now
+                live.stderr_buffer.clear()
                 update_session_state(session_id, status="busy", last_active_at=now, db_path=db_path)
 
                 # AIMD cooldown wait
@@ -563,24 +566,35 @@ class SessionManager:
                 # Materialize attachments
                 attachment_filenames: List[str] = []
                 if attachments:
-                    for att in attachments:
-                        att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
-                            att if isinstance(att, dict) else dict(att)
-                        )
-                        saved_path, byte_count = await materialize_attachment(
-                            att_dict,
-                            live.workspace_path,
-                            total_bytes_so_far=live.total_attachment_bytes,
-                        )
-                        live.total_attachment_bytes += byte_count
-                        if live.total_attachment_bytes > settings.max_total_bytes:
-                            raise HTTPException(
-                                status_code=status.HTTP_400_BAD_REQUEST,
-                                detail=f"Cumulative attachment size exceeds max allowed limit ({settings.max_total_bytes} bytes)",
+                    try:
+                        for att in attachments:
+                            att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
+                                att if isinstance(att, dict) else dict(att)
                             )
-                        attachment_filenames.append(os.path.basename(saved_path))
+                            saved_path, byte_count = await materialize_attachment(
+                                att_dict,
+                                live.workspace_path,
+                                total_bytes_so_far=live.total_attachment_bytes,
+                                allowlist=allowlist,
+                            )
+                            live.total_attachment_bytes += byte_count
+                            if live.total_attachment_bytes > settings.max_total_bytes:
+                                raise ValueError(
+                                    f"Cumulative attachment size ({live.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
+                                )
+                            attachment_filenames.append(os.path.basename(saved_path))
+                    except ValueError as att_err:
+                        # Reset status to idle so session is not wedged
+                        live.status = "idle"
+                        now_idle = time.time()
+                        live.last_active_at = now_idle
+                        update_session_state(session_id, status="idle", last_active_at=now_idle, db_path=db_path)
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Attachment error: {att_err}",
+                        )
 
-                composed_prompt = compose_prompt(prompt, attachment_filenames)
+                composed_prompt = compose_prompt(prompt, attachment_filenames, workspace_path=live.workspace_path)
 
                 # Pre-execution attachment guard
                 declared = find_declared_attachments(composed_prompt, live.workspace_path)

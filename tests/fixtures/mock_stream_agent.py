@@ -58,11 +58,12 @@ def main():
             if turn == 1:
                 sys.stdout.write(json.dumps({"event": "init", "conversation_id": conv_id}) + "\n")
             sys.stdout.write(json.dumps({"event": "step_update", "step": turn}) + "\n")
-            result_evt = {
-                "event": "result",
-                "status": "SUCCESS",
+            result_payload = {
                 "conversation_id": conv_id,
+                "status": "SUCCESS",
                 "response": resp_text,
+                "duration_seconds": 0.5,
+                "num_turns": turn,
                 "usage": {
                     "input_tokens": 100 * turn,
                     "output_tokens": 50 * turn,
@@ -70,7 +71,7 @@ def main():
                     "total_tokens": 170 * turn,
                 },
             }
-            sys.stdout.write(json.dumps(result_evt) + "\n")
+            sys.stdout.write(json.dumps({"event": "result", "result": result_payload}) + "\n")
             sys.stdout.flush()
         else:
             if turn == 1:
