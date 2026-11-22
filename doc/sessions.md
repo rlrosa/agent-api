@@ -305,6 +305,45 @@ Terminates the warm `bwrap` process group immediately and reaps its workspace. I
 
 ---
 
+## Interactive Local Testing (`scripts/session-cli`)
+
+`scripts/session-cli` is a zero-dependency Python 3 client that caches server credentials (`url`, `api_key`) and the active `session_id` in `~/.cache/agent-api/session-cli.json` (mode `0600`).
+
+### 1. Interactive REPL Mode (`telnet`-style live chat)
+Run with no arguments to attach to the cached warm session (or spawn a fresh one):
+```bash
+./scripts/session-cli
+# Commands inside REPL:
+#   /status                        Show live server health & idle countdown
+#   /history                       Show all turns in the session
+#   /attach ./receipt.jpg <prompt> Upload a local file with your turn
+#   /new agy flash med             Start a fresh session with new model/effort
+#   /close                         Kill remote session & reap workspace
+#   /quit (or Ctrl+D)              Exit REPL while keeping session warm
+```
+
+### 2. Repeated One-Shot CLI Mode
+Each invocation automatically reuses the cached `session_id` (and transparently opens a fresh session if the previous one expired after 15m idle):
+```bash
+# Save target server & key once (if not already pre-configured):
+./scripts/session-cli --url http://127.0.0.1:8091 --key "$AGENT_API_KEY" --save-config
+
+# Turn 1 (spawns warm session & caches session_id):
+./scripts/session-cli "Remember codeword MANGO-42"
+
+# Turn 2 (reuses cached session_id):
+./scripts/session-cli "What codeword did I tell you?"
+
+# Attach a local file on any turn:
+./scripts/session-cli -f ./invoice.pdf "What is the total?"
+
+# Inspect or close:
+./scripts/session-cli --status
+./scripts/session-cli --close
+```
+
+---
+
 ## WhatsApp Bot Integration Guide
 
 A conversational bot (e.g. Baileys, WhatsApp Business API, Twilio) should implement the following state caching pattern:

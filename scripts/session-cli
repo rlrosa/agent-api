@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""
+session-cli — Stateful CLI & interactive REPL for agent-api /v1/sessions.
+
+Caches server URL, API key, default agent/model/effort, and the active session_id
+in ~/.cache/agent-api/session-cli.json (mode 0600) so you can either:
+  1. Run repeated one-shot commands across shell invocations:
+       ./scripts/session-cli "Remember codeword MANGO-42"
+       ./scripts/session-cli "What codeword did I tell you?"
+       ./scripts/session-cli -f ./receipt.jpg "What is the total?"
+       ./scripts/session-cli --status
+       ./scripts/session-cli --close
+  2. Run with no prompt argument for an interactive telnet/nc-style REPL:
+       ./scripts/session-cli
+"""
+
+import argparse
+import base64
+import json
+import os
+import readline  # noqa: F401 - enables arrow-key history in input()
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+DEFAULT_CACHE_PATH = os.path.expanduser("~/.cache/agent-api/session-cli.json")
+DEFAULT_STATE: Dict[str, Any] = {
+    "url": "http://127.0.0.1:8091",
+    "api_key": "",
+    "session_id": None,
+    "agent": "agy",
+    "model": "flash",
+    "effort": "low",
+    "idle_timeout": 900,
+    "wait": 90,
+}
+
+IS_TTY_ERR = sys.stderr.isatty()
+IS_TTY_OUT = sys.stdout.isatty()
+
+
+def _c(code: str, text: str, use_tty: bool = True) -> str:
+    if not use_tty:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def info(msg: str) -> None:
+    sys.stderr.write(_c("2;36", msg, IS_TTY_ERR) + "\n")
+    sys.stderr.flush()
+
+
+def warn(msg: str) -> None:
+    sys.stderr.write(_c("33", msg, IS_TTY_ERR) + "\n")
+    sys.stderr.flush()
+
+
+def err_print(msg: str) -> None:
+    sys.stderr.write(_c("31", msg, IS_TTY_ERR) + "\n")
+    sys.stderr.flush()
+
+
+def load_state(path: str) -> Dict[str, Any]:
+    state = dict(DEFAULT_STATE)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                state.update(loaded)
+        except Exception as exc:
+            warn(f"[warn] Could not parse state file {path}: {exc}")
+    if os.environ.get("AGENT_API_URL"):
+        state["url"] = os.environ["AGENT_API_URL"]
+    if os.environ.get("AGENT_API_KEY"):
+        state["api_key"] = os.environ["AGENT_API_KEY"]
+    return state
+
+
+def save_state(path: str, state: Dict[str, Any]) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def api_request(
+    base_url: str,
+    api_key: str,
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: float = 130.0,
+) -> Tuple[int, Dict[str, Any]]:
+    url = base_url.rstrip("/") + path
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["X-API-Key"] = api_key
+
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as http_err:
+        raw = http_err.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw) if raw.strip() else {"detail": raw}
+        except Exception:
+            parsed = {"detail": raw or str(http_err)}
+        return http_err.code, parsed
+    except urllib.error.URLError as url_err:
+        raise RuntimeError(f"Cannot reach {url}: {url_err.reason}") from url_err
+
+
+def encode_attachments(file_paths: List[str]) -> List[Dict[str, str]]:
+    specs: List[Dict[str, str]] = []
+    for p in file_paths:
+        expanded = os.path.expanduser(p)
+        if not os.path.isfile(expanded):
+            raise FileNotFoundError(f"Attachment file not found: {expanded}")
+        with open(expanded, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        specs.append({
+            "filename": os.path.basename(expanded),
+            "content_b64": b64,
+        })
+    return specs
+
+
+def format_turn_footer(sess: Dict[str, Any], elapsed_s: float) -> str:
+    sid = (sess.get("id") or "")[:8]
+    turn = sess.get("latest_turn") or {}
+    t_idx = sess.get("turn_count", "?")
+    in_t = turn.get("input_tokens")
+    cache_t = turn.get("cached_tokens")
+    out_t = turn.get("output_tokens")
+    cost = turn.get("cost_usd")
+    expires_at = sess.get("expires_at")
+    idle_left = f"{max(0, int(expires_at - time.time()))}s" if expires_at else (f"{sess.get('idle_timeout')}s" if sess.get("idle_timeout") else "?")
+
+    parts = [
+        f"session={sid}",
+        f"model={sess.get('model') or sess.get('agent')}",
+        f"turn={t_idx}",
+        f"{elapsed_s:.2f}s",
+        f"in={in_t} cached={cache_t} out={out_t}",
+    ]
+    if cost is not None:
+        parts.append(f"cost=${cost:.5f}")
+    parts.append(f"idle_left={idle_left}")
+    return "[" + " | ".join(parts) + "]"
+
+
+def send_message_or_spawn(
+    state: Dict[str, Any],
+    state_path: str,
+    prompt: str,
+    file_paths: Optional[List[str]] = None,
+    force_new: bool = False,
+) -> Optional[Dict[str, Any]]:
+    attachments = encode_attachments(file_paths or [])
+    wait_s = int(state.get("wait") or 90)
+    http_timeout = float(max(wait_s, state.get("turn_timeout", 120)) + 30)
+
+    if force_new and state.get("session_id"):
+        old_id = state["session_id"]
+        api_request(state["url"], state["api_key"], "DELETE", f"/v1/sessions/{old_id}", timeout=15.0)
+        state["session_id"] = None
+        save_state(state_path, state)
+
+    session_id = state.get("session_id")
+    t0 = time.time()
+
+    if session_id:
+        msg_payload: Dict[str, Any] = {"prompt": prompt, "wait": wait_s}
+        if attachments:
+            msg_payload["attachments"] = attachments
+        code, data = api_request(
+            state["url"],
+            state["api_key"],
+            "POST",
+            f"/v1/sessions/{session_id}/messages",
+            payload=msg_payload,
+            timeout=http_timeout,
+        )
+        if code == 200:
+            elapsed = time.time() - t0
+            return _emit_turn_output(data, elapsed)
+        if code == 202:
+            return _poll_until_turn_done(state, session_id, t0)
+        if code in (404, 409):
+            warn(f"[notice] Previous session {session_id[:8]} unavailable ({data.get('detail', code)}); starting fresh session...")
+            state["session_id"] = None
+            save_state(state_path, state)
+        else:
+            err_print(f"[error HTTP {code}] {data.get('detail') or data}")
+            return None
+
+    # Spawn a brand new warm session with Turn 1 prompt
+    t0 = time.time()
+    create_payload: Dict[str, Any] = {
+        "agent": state.get("agent") or "agy",
+        "prompt": prompt,
+        "idle_timeout": int(state.get("idle_timeout") or 900),
+        "wait": wait_s,
+    }
+    if state.get("model"):
+        create_payload["model"] = state["model"]
+    if state.get("effort"):
+        create_payload["effort"] = state["effort"]
+    if attachments:
+        create_payload["attachments"] = attachments
+
+    code, data = api_request(
+        state["url"],
+        state["api_key"],
+        "POST",
+        "/v1/sessions",
+        payload=create_payload,
+        timeout=http_timeout,
+    )
+    if code == 200:
+        state["session_id"] = data.get("id")
+        save_state(state_path, state)
+        elapsed = time.time() - t0
+        return _emit_turn_output(data, elapsed)
+    if code == 202:
+        sid = data.get("id")
+        if sid:
+            state["session_id"] = sid
+            save_state(state_path, state)
+            return _poll_until_turn_done(state, sid, t0)
+    err_print(f"[error HTTP {code}] {data.get('detail') or data}")
+    return None
+
+
+def _poll_until_turn_done(state: Dict[str, Any], session_id: str, t0: float) -> Optional[Dict[str, Any]]:
+    info(f"[waiting] Turn still running on session {session_id[:8]}... polling for completion")
+    prev_turns = None
+    while True:
+        time.sleep(1.5)
+        code, sdata = api_request(
+            state["url"],
+            state["api_key"],
+            "GET",
+            f"/v1/sessions/{session_id}?include_turns=true",
+            timeout=15.0,
+        )
+        if code != 200:
+            err_print(f"[error HTTP {code}] {sdata.get('detail') or sdata}")
+            return None
+        turns = sdata.get("turns") or []
+        if prev_turns is None:
+            prev_turns = len(turns)
+        if sdata.get("status") == "idle" and turns and turns[-1].get("status") == "completed":
+            sdata["latest_turn"] = turns[-1]
+            return _emit_turn_output(sdata, time.time() - t0)
+        if sdata.get("status") in ("failed", "closed", "expired"):
+            err_print(f"[session {sdata.get('status')}] {sdata.get('error') or ''}")
+            return None
+
+
+def _emit_turn_output(sess: Dict[str, Any], elapsed_s: float) -> Dict[str, Any]:
+    turn = sess.get("latest_turn") or {}
+    resp = (turn.get("response") or "").rstrip("\n")
+    print(resp)
+    sys.stdout.flush()
+    info(format_turn_footer(sess, elapsed_s))
+    return sess
+
+
+def cmd_status(state: Dict[str, Any]) -> int:
+    h_code, health = api_request(state["url"], state["api_key"], "GET", "/healthz", timeout=10.0)
+    print(_c("1;34", f"=== Server ({state['url']}) ===", IS_TTY_OUT))
+    if h_code == 200:
+        conf = (health.get("confinement") or {}).get("mode")
+        print(
+            f"  status=ok  active_sessions={health.get('active_sessions')}/{health.get('max_active_sessions')}  "
+            f"confinement={conf}"
+        )
+    else:
+        print(f"  healthz returned HTTP {h_code}: {health}")
+
+    sid = state.get("session_id")
+    print(_c("1;34", "=== Cached Session ===", IS_TTY_OUT))
+    print(f"  defaults: agent={state.get('agent')}  model={state.get('model')}  effort={state.get('effort')}  idle_timeout={state.get('idle_timeout')}s")
+    if not sid:
+        print("  session_id: (none — next message will spawn a warm session)")
+        return 0
+
+    code, sess = api_request(state["url"], state["api_key"], "GET", f"/v1/sessions/{sid}", timeout=10.0)
+    if code != 200:
+        print(f"  session_id: {sid} (server returned HTTP {code}: {sess.get('detail') or sess})")
+        return 1
+
+    exp = sess.get("expires_at")
+    idle_str = f"{max(0, int(exp - time.time()))}s remaining" if exp else "inactive"
+    print(f"  session_id:   {sess['id']}")
+    print(f"  upstream_id:  {sess.get('upstream_conversation_id')}")
+    print(f"  status:       {sess.get('status')} ({idle_str})")
+    print(f"  agent/model:  {sess.get('agent')} / {sess.get('model')} (effort={sess.get('effort')})")
+    print(f"  turns:        {sess.get('turn_count')}")
+    print(
+        f"  tokens:       in={sess.get('input_tokens')}  cached={sess.get('cached_tokens')}  "
+        f"out={sess.get('output_tokens')}  total={sess.get('total_tokens')}  cost=${sess.get('cost_usd')}"
+    )
+    return 0
+
+
+def cmd_history(state: Dict[str, Any]) -> int:
+    sid = state.get("session_id")
+    if not sid:
+        warn("No cached session_id.")
+        return 0
+    code, sess = api_request(
+        state["url"], state["api_key"], "GET", f"/v1/sessions/{sid}?include_turns=true", timeout=15.0
+    )
+    if code != 200:
+        err_print(f"[error HTTP {code}] {sess.get('detail') or sess}")
+        return 1
+    turns = sess.get("turns") or []
+    print(_c("1;34", f"=== Session {sid} ({sess.get('status')}, {len(turns)} turns) ===", IS_TTY_OUT))
+    for t in turns:
+        idx = t.get("turn_index", 0) + 1
+        print(_c("1;32", f"\n--- Turn {idx} (you) ---", IS_TTY_OUT))
+        print(t.get("prompt", ""))
+        print(_c("1;36", f"--- Turn {idx} ({sess.get('agent')} | in={t.get('input_tokens')} cached={t.get('cached_tokens')} out={t.get('output_tokens')}) ---", IS_TTY_OUT))
+        if t.get("status") == "completed":
+            print((t.get("response") or "").rstrip("\n"))
+        else:
+            print(f"[FAILED: {t.get('error')}]")
+    return 0
+
+
+def cmd_close(state: Dict[str, Any], state_path: str) -> int:
+    sid = state.get("session_id")
+    if not sid:
+        info("No active cached session to close.")
+        return 0
+    code, data = api_request(state["url"], state["api_key"], "DELETE", f"/v1/sessions/{sid}", timeout=15.0)
+    state["session_id"] = None
+    save_state(state_path, state)
+    if code == 200:
+        info(f"[closed] Session {sid[:8]} closed and workspace reaped.")
+        return 0
+    warn(f"[cleared local cache] Server returned HTTP {code}: {data.get('detail') or data}")
+    return 0
+
+
+def ensure_warm_idle_session(state: Dict[str, Any], state_path: str) -> Optional[str]:
+    sid = state.get("session_id")
+    if sid:
+        code, sdata = api_request(state["url"], state["api_key"], "GET", f"/v1/sessions/{sid}", timeout=10.0)
+        if code == 200 and sdata.get("status") in ("idle", "busy", "starting"):
+            exp = sdata.get("expires_at")
+            left = f"{max(0, int(exp - time.time()))}s" if exp else "?"
+            info(
+                f"[attached] Resumed warm session {sid[:8]} "
+                f"(agent={sdata.get('agent')}, model={sdata.get('model')}, turns={sdata.get('turn_count')}, idle_left={left})"
+            )
+            return sid
+        state["session_id"] = None
+        save_state(state_path, state)
+
+    payload: Dict[str, Any] = {
+        "agent": state.get("agent") or "agy",
+        "idle_timeout": int(state.get("idle_timeout") or 900),
+    }
+    if state.get("model"):
+        payload["model"] = state["model"]
+    if state.get("effort"):
+        payload["effort"] = state["effort"]
+
+    code, data = api_request(state["url"], state["api_key"], "POST", "/v1/sessions", payload=payload, timeout=30.0)
+    if code in (200, 201):
+        new_id = data.get("id")
+        state["session_id"] = new_id
+        save_state(state_path, state)
+        info(
+            f"[spawned] Warm session {new_id[:8]} ready on {state['url']} "
+            f"(agent={data.get('agent')}, model={data.get('model')}, effort={data.get('effort')}, idle_timeout={data.get('idle_timeout')}s)"
+        )
+        return new_id
+    err_print(f"[error HTTP {code}] Could not create warm session: {data.get('detail') or data}")
+    return None
+
+
+def run_repl(state: Dict[str, Any], state_path: str) -> int:
+    info(
+        "Interactive /v1/sessions REPL — commands: "
+        "/status  /history  /attach <file> <prompt>  /new [agent] [model] [effort]  /close  /quit (keeps session warm)"
+    )
+    ensure_warm_idle_session(state, state_path)
+
+    while True:
+        sid_short = (state.get("session_id") or "none")[:8]
+        prompt_label = _c("1;32", f"[{sid_short}] you> ", IS_TTY_OUT)
+        try:
+            line = input(prompt_label).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sid = state.get("session_id")
+            if sid:
+                info(f"[detached] Session {sid[:8]} stays warm on server (re-run ./scripts/session-cli to continue, or --close to kill).")
+            return 0
+
+        if not line:
+            continue
+
+        if line in ("/quit", "/exit", "/q"):
+            sid = state.get("session_id")
+            if sid:
+                info(f"[detached] Session {sid[:8]} stays warm on server (re-run ./scripts/session-cli to continue, or --close to kill).")
+            return 0
+
+        if line == "/help":
+            print(
+                "Commands:\n"
+                "  /status                         Show server health and active session stats\n"
+                "  /history                        Print all turns in the current session\n"
+                "  /attach <path> <prompt>         Upload a local file with your prompt\n"
+                "  /new [agent] [model] [effort]   Close current session and spawn a fresh one\n"
+                "  /close                          Close the remote session and reap its workspace\n"
+                "  /quit                           Exit REPL while leaving the session warm"
+            )
+            continue
+
+        if line == "/status":
+            cmd_status(state)
+            continue
+
+        if line == "/history":
+            cmd_history(state)
+            continue
+
+        if line == "/close":
+            cmd_close(state, state_path)
+            continue
+
+        if line.startswith("/new"):
+            parts = line.split()
+            if len(parts) >= 2:
+                state["agent"] = parts[1]
+            if len(parts) >= 3:
+                state["model"] = parts[2]
+            if len(parts) >= 4:
+                state["effort"] = parts[3]
+            cmd_close(state, state_path)
+            save_state(state_path, state)
+            ensure_warm_idle_session(state, state_path)
+            continue
+
+        if line.startswith("/attach "):
+            rest = line[len("/attach "):].strip()
+            parts = rest.split(maxsplit=1)
+            if len(parts) < 2:
+                warn("Usage: /attach <filepath> <prompt>")
+                continue
+            fpath, msg = parts[0], parts[1]
+            try:
+                send_message_or_spawn(state, state_path, prompt=msg, file_paths=[fpath])
+            except Exception as exc:
+                err_print(f"[error] {exc}")
+            continue
+
+        try:
+            send_message_or_spawn(state, state_path, prompt=line)
+        except Exception as exc:
+            err_print(f"[error] {exc}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Stateful multi-turn client & interactive REPL for agent-api /v1/sessions."
+    )
+    parser.add_argument("prompt", nargs="*", help="Prompt to send (omit to launch interactive REPL)")
+    parser.add_argument("--state-file", default=DEFAULT_CACHE_PATH, help=f"Cache file path (default: {DEFAULT_CACHE_PATH})")
+    parser.add_argument("--url", help="Override server URL (e.g. http://127.0.0.1:8091)")
+    parser.add_argument("--key", help="Override X-API-Key")
+    parser.add_argument("--agent", help="Agent for new sessions (agy or claude)")
+    parser.add_argument("--model", help="Model alias/name for new sessions (e.g. flash, sonnet)")
+    parser.add_argument("--effort", help="Effort template for new sessions (low, med, high)")
+    parser.add_argument("--idle-timeout", type=int, help="Idle timeout in seconds for new sessions (default: 900)")
+    parser.add_argument("--wait", type=int, help="Max synchronous HTTP wait per turn in seconds (default: 90)")
+    parser.add_argument("-f", "--attach", action="append", default=[], help="Attach local file path (repeatable)")
+    parser.add_argument("--new", action="store_true", help="Close any cached session and start a brand-new session")
+    parser.add_argument("--status", action="store_true", help="Show server & cached session status")
+    parser.add_argument("--history", action="store_true", help="Print full turn history of cached session")
+    parser.add_argument("--close", action="store_true", help="Close cached session on server and clear session_id")
+    parser.add_argument("--save-config", action="store_true", help="Persist --url/--key/--agent/--model/--effort into state file")
+
+    args = parser.parse_args()
+    state_path = os.path.expanduser(args.state_file)
+    state = load_state(state_path)
+
+    dirty = False
+    for flag_val, state_key in [
+        (args.url, "url"),
+        (args.key, "api_key"),
+        (args.agent, "agent"),
+        (args.model, "model"),
+        (args.effort, "effort"),
+        (args.idle_timeout, "idle_timeout"),
+        (args.wait, "wait"),
+    ]:
+        if flag_val is not None:
+            state[state_key] = flag_val
+            dirty = True
+
+    if args.save_config or (dirty and args.new):
+        save_state(state_path, state)
+        if args.save_config and not (args.prompt or args.status or args.history or args.close or args.new):
+            info(f"[saved] Configuration persisted to {state_path}")
+            return 0
+
+    try:
+        if args.close:
+            return cmd_close(state, state_path)
+        if args.status:
+            return cmd_status(state)
+        if args.history:
+            return cmd_history(state)
+
+        prompt_str = " ".join(args.prompt).strip()
+        if prompt_str:
+            res = send_message_or_spawn(
+                state,
+                state_path,
+                prompt=prompt_str,
+                file_paths=args.attach,
+                force_new=args.new,
+            )
+            return 0 if res is not None else 1
+
+        if args.new:
+            cmd_close(state, state_path)
+
+        return run_repl(state, state_path)
+    except RuntimeError as net_err:
+        err_print(f"[connection error] {net_err}")
+        return 2
+    except FileNotFoundError as fnf_err:
+        err_print(f"[attachment error] {fnf_err}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
