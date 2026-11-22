@@ -305,9 +305,20 @@ Terminates the warm `bwrap` process group immediately and reaps its workspace. I
 
 ---
 
-## Interactive Local Testing (`scripts/session-cli`)
+## Interactive Local Testing (`scripts/dev-server.sh` & `scripts/session-cli`)
 
-`scripts/session-cli` is a zero-dependency Python 3 client that caches server credentials (`url`, `api_key`) and the active `session_id` in `~/.cache/agent-api/session-cli.json` (mode `0600`).
+Two zero-dependency helper scripts live in `scripts/` for interactive testing without disturbing the deployed `:8090` service:
+
+- **`scripts/dev-server.sh`**: Starts/stops an isolated loopback `uvicorn` instance (default `127.0.0.1:8091`, refusing `8090`) backed by `/tmp/agent-api-dev-8091/` (`SSH_CONNECTION=1`, `BWRAP_ENABLED=1`) and automatically seeds `~/.cache/agent-api/session-cli.json` (`0600`).
+- **`scripts/session-cli`**: Stateful Python 3 client & interactive REPL that caches `url`, `api_key`, and the active `session_id` in `~/.cache/agent-api/session-cli.json` (defaulting to `http://127.0.0.1:8090` when no dev server is active).
+
+### 0. Spin Up (and Tear Down) a Side-by-Side Test Server
+```bash
+./scripts/dev-server.sh start          # starts 127.0.0.1:8091 & configures session-cli
+./scripts/dev-server.sh status         # check PID & /healthz
+./scripts/dev-server.sh logs           # view recent server logs
+./scripts/dev-server.sh stop           # closes sessions, stops :8091, wipes /tmp dir, resets URL to :8090
+```
 
 ### 1. Interactive REPL Mode (`telnet`-style live chat)
 Run with no arguments to attach to the cached warm session (or spawn a fresh one):

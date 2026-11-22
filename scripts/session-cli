@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_CACHE_PATH = os.path.expanduser("~/.cache/agent-api/session-cli.json")
 DEFAULT_STATE: Dict[str, Any] = {
-    "url": "http://127.0.0.1:8091",
+    "url": "http://127.0.0.1:8090",
     "api_key": "",
     "session_id": None,
     "agent": "agy",

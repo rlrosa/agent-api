@@ -27,6 +27,8 @@ untrusted.**
 | `app/sessions.py` | Warm multi-turn session runtime, stream-json drivers, FIFO lock, idle reaper |
 | `app/db.py` | SQLite access. Every job query must be scoped — see Invariants |
 | `app/static/dashboard.html` | Unauthenticated monitoring page |
+| `scripts/session-cli` | Stateful Python stdlib CLI & interactive REPL for `/v1/sessions` |
+| `scripts/dev-server.sh` | Isolated side-by-side loopback dev server manager (default `:8091`, refuses `:8090`) |
 | `doc/sessions.md` | Comprehensive guide and protocol diagrams for warm /v1/sessions |
 | `doc/security-review-2026-08-10.md` | Full security review: findings, evidence, what's fixed |
 

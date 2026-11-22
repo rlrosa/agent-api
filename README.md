@@ -422,6 +422,13 @@ curl -s http://127.0.0.1:8090/v1/stats/sources?by=key -H "X-API-Key: $AGENT_API_
 ### 11. Multi-Turn Conversational Sessions (/v1/sessions)
 For interactive WhatsApp bots and conversational frontends, `/v1/sessions` maintains warm `bwrap` agent processes across multiple turns with ~99% prompt cache hits. Full documentation lives in [doc/sessions.md](doc/sessions.md).
 
+For local testing without touching `:8090`, use the bundled helper scripts:
+```bash
+./scripts/dev-server.sh start   # isolated server on 127.0.0.1:8091 + auto-cached key
+./scripts/session-cli           # interactive REPL (or ./scripts/session-cli "Hello!")
+./scripts/dev-server.sh stop    # clean teardown when finished
+```
+
 #### Step 1: Start Session with Turn 1 Prompt & Attachment
 ```bash
 curl -s -X POST https://agent-api.rela.uy/v1/sessions \

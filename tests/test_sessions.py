@@ -1181,4 +1181,47 @@ def test_spawn_only_with_empty_prompt_and_preuploaded_attachments(http_client):
     http_client.delete(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"})
 
 
+def test_helper_utils_session_cli_and_dev_server_guard(tmp_path):
+    """Verify scripts/session-cli 0600 cache handling & default URL, and scripts/dev-server.sh port 8090 guard."""
+    import json
+    import stat
+    import subprocess
+    import sys
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    cli_path = os.path.join(repo_root, "scripts", "session-cli")
+    dev_srv_path = os.path.join(repo_root, "scripts", "dev-server.sh")
+
+    state_file = str(tmp_path / "cli-state.json")
+    clean_env = {k: v for k, v in os.environ.items() if k not in ("AGENT_API_URL", "AGENT_API_KEY")}
+
+    # 1. Saving config writes 0600 file and preserves default :8090 URL when --url is omitted
+    res_save = subprocess.run(
+        [sys.executable, cli_path, "--state-file", state_file, "--effort", "med", "--save-config"],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_save.returncode == 0, res_save.stderr
+    mode = stat.S_IMODE(os.stat(state_file).st_mode)
+    assert mode == 0o600
+    with open(state_file, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+    assert saved["url"] == "http://127.0.0.1:8090"
+    assert saved["effort"] == "med"
+
+    # 2. dev-server.sh refuses reserved port 8090 on both start and stop
+    for verb in ("start", "stop"):
+        res_guard = subprocess.run(
+            ["bash", dev_srv_path, verb, "8090"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_guard.returncode == 2
+        assert "refusing port 8090" in res_guard.stderr
+
+
+
 
