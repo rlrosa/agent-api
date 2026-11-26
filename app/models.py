@@ -49,6 +49,7 @@ class CreateSessionRequest(BaseModel):
     attachments: Optional[List[AttachmentSpec]] = None
     idle_timeout: Optional[int] = None
     turn_timeout: Optional[int] = None
+    max_lifetime: Optional[int] = None
     wait: int = 60
     metadata: Optional[Dict[str, Any]] = None
 

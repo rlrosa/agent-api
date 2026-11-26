@@ -134,6 +134,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 turn_count INTEGER NOT NULL DEFAULT 0,
                 idle_timeout INTEGER NOT NULL DEFAULT 900,
                 turn_timeout INTEGER NOT NULL DEFAULT 120,
+                max_lifetime INTEGER NOT NULL DEFAULT 86400,
                 total_attachment_bytes INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER DEFAULT 0,
                 output_tokens INTEGER DEFAULT 0,
@@ -150,6 +151,9 @@ def init_db(db_path: Optional[str] = None) -> None:
                 api_key_name TEXT
             );
             """)
+            sess_cols = [row[1] for row in conn.execute("PRAGMA table_info(sessions);").fetchall()]
+            if "max_lifetime" not in sess_cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN max_lifetime INTEGER NOT NULL DEFAULT 86400;")
             conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sessions_status 
             ON sessions(status);
@@ -612,6 +616,7 @@ def create_session_row(
     effort: Optional[str] = None,
     idle_timeout: int = 900,
     turn_timeout: int = 120,
+    max_lifetime: int = 86400,
     metadata: Optional[Dict[str, Any]] = None,
     session_id: Optional[str] = None,
     client_ip: Optional[str] = None,
@@ -631,11 +636,11 @@ def create_session_row(
                 """
                 INSERT INTO sessions (
                     id, agent, model, effort, status, turn_count,
-                    idle_timeout, turn_timeout, total_attachment_bytes,
+                    idle_timeout, turn_timeout, max_lifetime, total_attachment_bytes,
                     input_tokens, output_tokens, cached_tokens, total_tokens,
                     cost_usd, error, metadata, created_at, last_active_at,
                     client_ip, auth_mode, api_key_name
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, 0, 0, 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 0, 0, 0, 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?)
                 RETURNING *;
                 """,
                 (
@@ -646,6 +651,7 @@ def create_session_row(
                     status,
                     idle_timeout,
                     turn_timeout,
+                    max_lifetime,
                     meta_json,
                     now,
                     now,

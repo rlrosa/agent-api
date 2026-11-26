@@ -107,6 +107,7 @@ stateDiagram-v2
 - **`409 Conflict`**: Message posted to an inactive session (`expired`, `closed`, or `failed`). Signals the WhatsApp bot to spawn a fresh session.
 - **`422 Unprocessable Content`**: Request payload contains unknown fields (`extra="forbid"`).
 - **`429 Too Many Requests`**: `MAX_ACTIVE_SESSIONS` reached (system-wide) or `MAX_QUEUED_TURNS_PER_SESSION` reached (per-session).
+- **`503 Service Unavailable`**: Underlying agent CLI authentication/OAuth login is missing or expired (`Authentication required` / `Not logged in`). Dead session is closed immediately.
 - **`504 Gateway Timeout`**: Turn execution exceeded `turn_timeout` (process killed, session marked `"failed"`).
 
 ---
@@ -416,6 +417,8 @@ Configure the following environment variables in `~/.config/agent-api/env`:
 | `SESSION_IDLE_TIMEOUT` | `900` (15 min) | Inactivity threshold before warm process termination and workspace reaping. | `600` to `1200` seconds based on user interaction patterns. |
 | `SESSION_IDLE_MAX` | `3600` (60 min) | Maximum allowed `idle_timeout` configurable by client requests. | `1800` to `3600` seconds. |
 | `SESSION_TURN_TIMEOUT` | `120` (2 min) | Maximum execution time per individual turn before process group SIGKILL. | `120` to `180` seconds. |
+| `SESSION_MAX_LIFETIME` | `86400` (24 hr) | Hard wall-clock lifetime cap before a session expires regardless of activity (clamped min `5s` for testing). | `43200` to `86400` seconds. |
+| `DEFAULT_EFFORT` | `""` | Optional default reasoning effort (`low`, `med`, `high`) when requests omit `effort`. | `"low"` or `"med"`. |
 | `MAX_ACTIVE_SESSIONS` | `10` | Hard cap on total concurrently warm subprocesses across all tenants. | Set based on host RAM (~150 MB per warm `bwrap` process). |
 | `MAX_QUEUED_TURNS_PER_SESSION` | `3` | Maximum pending messages queued on a single session's FIFO lock. | `3` to `5` to prevent WhatsApp double-text buildup. |
 | `ATTACHMENT_HOST_ALLOWLIST` | `""` | Comma-separated list of allowed domains for URL attachment fetching. | Set to trusted S3 / WhatsApp CDN hostnames. |

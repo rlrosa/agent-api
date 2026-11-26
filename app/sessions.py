@@ -36,6 +36,26 @@ from app.runner import (
 logger = logging.getLogger("agent-api.sessions")
 
 
+AUTH_ERROR_PATTERNS = (
+    "authentication required",
+    "authentication failed",
+    "authentication timed out",
+    "not logged in",
+    "please run /login",
+    "oauth token expired",
+    "oauth token has expired",
+    "invalid_grant",
+    "invalid refresh token",
+)
+
+
+def is_auth_error(*texts: Optional[str]) -> bool:
+    combined = "\n".join(t for t in texts if t).lower()
+    if not combined:
+        return False
+    return any(pat in combined for pat in AUTH_ERROR_PATTERNS)
+
+
 def compute_cost(
     model: Optional[str],
     input_tokens: int,
@@ -185,7 +205,11 @@ class ClaudeStreamDriver:
                 session_id = evt.get("session_id") or session_id
                 response = evt.get("result", "")
                 is_error = evt.get("is_error", False) or (evt.get("subtype", "success") != "success")
-                error_msg = evt.get("error") if is_error else None
+                error_msg = (
+                    evt.get("error")
+                    or (str(response).strip() if response else None)
+                    or "Claude stream-json turn error"
+                ) if is_error else None
 
                 usage = evt.get("usage") or {}
                 in_tok = usage.get("input_tokens", 0) or 0
@@ -243,6 +267,7 @@ class LiveSession:
         idle_timeout: int,
         turn_timeout: int,
         api_key_name: Optional[str],
+        max_lifetime: int = 86400,
     ):
         self.id = session_id
         self.agent = agent
@@ -253,11 +278,13 @@ class LiveSession:
         self.driver = driver
         self.idle_timeout = idle_timeout
         self.turn_timeout = turn_timeout
+        self.max_lifetime = max_lifetime
         self.api_key_name = api_key_name
 
         self.lock = asyncio.Lock()
         self.queued_waiters = 0
         now = time.time()
+        self.created_at = now
         self.last_active_at = now
         self.status = "idle"
         self.turn_count = 0
@@ -271,13 +298,19 @@ class LiveSession:
         self.cumulative_cost: Optional[float] = None
         self.upstream_conversation_id: Optional[str] = None
         self.closed_reason: Optional[str] = None
+        self.auth_abort_reason: Optional[str] = None
 
         self.stderr_buffer = collections.deque(maxlen=200)
         self.drain_task: Optional[asyncio.Task] = None
 
 
-async def _drain_stderr(proc: asyncio.subprocess.Process, buffer: collections.deque):
-    """Continuously drains stderr to prevent child CLI deadlock when buffer >64 KiB."""
+async def _drain_stderr(
+    proc: asyncio.subprocess.Process,
+    buffer: collections.deque,
+    live: Optional[LiveSession] = None,
+):
+    """Continuously drains stderr to prevent child CLI deadlock when buffer >64 KiB,
+    and aborts immediately if interactive CLI login/OAuth prompt appears on stderr."""
     try:
         while proc.returncode is None:
             chunk = await proc.stderr.read(4096)
@@ -285,6 +318,19 @@ async def _drain_stderr(proc: asyncio.subprocess.Process, buffer: collections.de
                 break
             text = chunk.decode("utf-8", errors="replace")
             buffer.append(text)
+            if live is not None and live.auth_abort_reason is None:
+                lower = text.lower()
+                if "authentication required" in lower or "waiting for authentication" in lower:
+                    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "Authentication required")
+                    live.auth_abort_reason = first_line
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    break
     except asyncio.CancelledError:
         pass
     except Exception as exc:
@@ -368,16 +414,14 @@ class SessionManager:
                 to_expire = []
                 async with self.lock:
                     for sid, s in self._sessions.items():
-                        if (
-                            not s.lock.locked()
-                            and s.queued_waiters == 0
-                            and s.status == "idle"
-                            and (now - s.last_active_at) >= s.idle_timeout
-                        ):
-                            to_expire.append(sid)
+                        if not s.lock.locked() and s.queued_waiters == 0 and s.status == "idle":
+                            if (now - s.last_active_at) >= s.idle_timeout:
+                                to_expire.append((sid, f"idle >= {s.idle_timeout}s"))
+                            elif (now - s.created_at) >= s.max_lifetime:
+                                to_expire.append((sid, f"max_lifetime >= {s.max_lifetime}s"))
 
-                for sid in to_expire:
-                    logger.info(f"Session '{sid}' expired after {self._sessions[sid].idle_timeout}s idle; reaping")
+                for sid, why in to_expire:
+                    logger.info(f"Session '{sid}' expired ({why}); reaping")
                     await self.close_session(sid, reason="expired")
 
             except asyncio.CancelledError:
@@ -393,6 +437,7 @@ class SessionManager:
         effort: Optional[str] = None,
         idle_timeout: Optional[int] = None,
         turn_timeout: Optional[int] = None,
+        max_lifetime: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
         client_ip: Optional[str] = None,
         auth_mode: Optional[str] = None,
@@ -419,6 +464,9 @@ class SessionManager:
             eff_idle = idle_timeout if idle_timeout is not None else settings.session_idle_timeout
             eff_idle = max(5, min(eff_idle, settings.session_idle_max))
             eff_turn = turn_timeout if turn_timeout is not None else settings.session_turn_timeout
+            max_cap = max(5, settings.session_max_lifetime)
+            eff_max_life = max_lifetime if max_lifetime is not None else max_cap
+            eff_max_life = max(5, min(eff_max_life, max_cap))
 
             # Driver selection
             if agent.startswith("mock_claude") or agent == "claude":
@@ -484,8 +532,11 @@ class SessionManager:
                 idle_timeout=eff_idle,
                 turn_timeout=eff_turn,
                 api_key_name=api_key_name,
+                max_lifetime=eff_max_life,
             )
-            live_session.drain_task = asyncio.create_task(_drain_stderr(proc, live_session.stderr_buffer))
+            live_session.drain_task = asyncio.create_task(
+                _drain_stderr(proc, live_session.stderr_buffer, live_session)
+            )
 
             # Create DB row
             create_session_row(
@@ -494,6 +545,7 @@ class SessionManager:
                 effort=effort,
                 idle_timeout=eff_idle,
                 turn_timeout=eff_turn,
+                max_lifetime=eff_max_life,
                 metadata=metadata,
                 session_id=session_id,
                 client_ip=client_ip,
@@ -673,9 +725,33 @@ class SessionManager:
                     await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
                     raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=err_msg)
                 except EOFError as eof_err:
-                    err_msg = f"Session process exited unexpectedly mid-turn: {eof_err}"
+                    await asyncio.sleep(0.05)
+                    recent_stderr = "".join(live.stderr_buffer)
+                    if live.auth_abort_reason or is_auth_error(recent_stderr):
+                        reason_detail = live.auth_abort_reason or recent_stderr.strip() or str(eof_err)
+                        err_msg = f"Agent authentication expired or missing ({live.agent}): {reason_detail}"
+                        logger.error(f"Session {session_id} auth failure: {err_msg}")
+                        finish_session_turn(
+                            turn_id=turn_row["id"],
+                            status="failed",
+                            stderr=recent_stderr,
+                            error=err_msg,
+                            db_path=db_path,
+                        )
+                        live.status = "failed"
+                        await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
+                        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=err_msg)
+
+                    stderr_tail = f" | stderr: {recent_stderr.strip()[:300]}" if recent_stderr.strip() else ""
+                    err_msg = f"Session process exited unexpectedly mid-turn: {eof_err}{stderr_tail}"
                     logger.error(f"Session {session_id} EOF: {err_msg}")
-                    finish_session_turn(turn_id=turn_row["id"], status="failed", error=err_msg, db_path=db_path)
+                    finish_session_turn(
+                        turn_id=turn_row["id"],
+                        status="failed",
+                        stderr=recent_stderr,
+                        error=err_msg,
+                        db_path=db_path,
+                    )
                     live.status = "failed"
                     await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
                     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
@@ -755,6 +831,23 @@ class SessionManager:
                 )
 
                 if not is_success:
+                    if is_auth_error(err_text, recent_stderr):
+                        auth_detail = f"Agent authentication expired or missing ({live.agent}): {err_text or recent_stderr.strip()}"
+                        live.status = "failed"
+                        await self.close_session(session_id, reason="failed", error=auth_detail, db_path=db_path)
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=auth_detail,
+                        )
+                    await asyncio.sleep(0.02)
+                    if live.proc.returncode is not None:
+                        live.status = "failed"
+                        await self.close_session(
+                            session_id,
+                            reason="failed",
+                            error=err_text or "Session process exited on turn error",
+                            db_path=db_path,
+                        )
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail=err_text or "Session turn failed",

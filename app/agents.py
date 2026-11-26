@@ -256,9 +256,9 @@ def build_claude_session_argv(
     effort: Optional[str] = None,
     workspace_path: Optional[str] = None,
 ) -> List[str]:
-    # Note: claude requires -p (--print) when using --input-format/--output-format stream-json.
+    # Note: claude 2.1+ requires both -p (--print) and --verbose when using --output-format stream-json.
     spec = AGENTS["claude"]["spec"]
-    cmd = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json"]
+    cmd = ["claude", "-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json"]
 
     settings = get_settings()
     raw_model = model or settings.claude_default_model or spec.default_model

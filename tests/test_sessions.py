@@ -42,8 +42,10 @@ def test_session_settings_dual_default_parity(monkeypatch):
         "SESSION_IDLE_TIMEOUT",
         "SESSION_IDLE_MAX",
         "SESSION_TURN_TIMEOUT",
+        "SESSION_MAX_LIFETIME",
         "MAX_ACTIVE_SESSIONS",
         "MAX_QUEUED_TURNS_PER_SESSION",
+        "DEFAULT_EFFORT",
     ]:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("API_KEY", "dev")
@@ -63,30 +65,40 @@ def test_session_settings_dual_default_parity(monkeypatch):
     assert raw_settings.session_turn_timeout == 120
     assert resolved_settings.session_turn_timeout == 120
 
+    assert raw_settings.session_max_lifetime == 86400
+    assert resolved_settings.session_max_lifetime == 86400
+
     assert raw_settings.max_active_sessions == 10
     assert resolved_settings.max_active_sessions == 10
 
     assert raw_settings.max_queued_turns_per_session == 3
     assert resolved_settings.max_queued_turns_per_session == 3
 
+    assert raw_settings.default_effort is None
+    assert resolved_settings.default_effort is None
+
 
 def test_session_settings_env_overrides(monkeypatch):
-    """Verify all 6 session settings honour environment variable overrides."""
+    """Verify session settings honour environment variable overrides."""
     monkeypatch.setenv("API_KEY", "dev")
     monkeypatch.setenv("SESSION_WORK_ROOT", "/custom/sessions")
     monkeypatch.setenv("SESSION_IDLE_TIMEOUT", "450")
     monkeypatch.setenv("SESSION_IDLE_MAX", "1800")
     monkeypatch.setenv("SESSION_TURN_TIMEOUT", "60")
+    monkeypatch.setenv("SESSION_MAX_LIFETIME", "7200")
     monkeypatch.setenv("MAX_ACTIVE_SESSIONS", "25")
     monkeypatch.setenv("MAX_QUEUED_TURNS_PER_SESSION", "7")
+    monkeypatch.setenv("DEFAULT_EFFORT", "med")
 
     s = get_settings()
     assert s.session_work_root == "/custom/sessions"
     assert s.session_idle_timeout == 450
     assert s.session_idle_max == 1800
     assert s.session_turn_timeout == 60
+    assert s.session_max_lifetime == 7200
     assert s.max_active_sessions == 25
     assert s.max_queued_turns_per_session == 7
+    assert s.default_effort == "med"
 
 
 # ==============================================================================
@@ -153,9 +165,9 @@ def test_build_claude_session_argv(monkeypatch):
     """Test claude session argv builder rules."""
     monkeypatch.setenv("API_KEY", "dev")
 
-    # Basic call: claude -p --input-format stream-json --output-format stream-json
+    # Basic call: claude -p --verbose --input-format stream-json --output-format stream-json
     argv = build_claude_session_argv()
-    assert argv[:6] == ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json"]
+    assert argv[:7] == ["claude", "-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json"]
     # Model and effort omitted when unspecified
     assert "--model" not in argv
     assert "--effort" not in argv
@@ -453,10 +465,12 @@ from app.sessions import (
     sweep_orphaned_session_workspaces,
 )
 from app.runner import sweep_orphaned_workspaces, wrap_cmd_with_bwrap
+from app.security import rate_limiter
 
 
 @pytest.fixture
 def http_client(tmp_path, monkeypatch):
+    rate_limiter.history.clear()
     test_db = str(tmp_path / "test_sessions_api.db")
     sess_work_root = str(tmp_path / "sessions_work")
     jobs_work_root = str(tmp_path / "jobs_work")
@@ -1221,6 +1235,60 @@ def test_helper_utils_session_cli_and_dev_server_guard(tmp_path):
         )
         assert res_guard.returncode == 2
         assert "refusing port 8090" in res_guard.stderr
+
+
+def test_expired_auth_fast_503_for_agy_and_claude(http_client):
+    """Verify expired login on both agy (60s interactive OAuth stderr) and claude (is_error result) fails fast (<3s) with HTTP 503 and closes dead session."""
+    # 1. agy: emits 'Authentication required' on stderr and sleeps 60s -> _drain_stderr kills immediately & returns 503
+    t0 = time.time()
+    r_agy = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "AUTH_EXPIRED"},
+    )
+    elapsed_agy = time.time() - t0
+    assert r_agy.status_code == 503, r_agy.text
+    assert "authentication expired or missing" in r_agy.json()["detail"].lower()
+    assert elapsed_agy < 5.0, f"agy auth abort took too long: {elapsed_agy:.2f}s"
+
+    # 2. claude: emits is_error=True with 'Not logged in · Please run /login' in result -> returns 503 with message preserved
+    r_claude = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_claude_session", "prompt": "AUTH_EXPIRED"},
+    )
+    assert r_claude.status_code == 503, r_claude.text
+    assert "please run /login" in r_claude.json()["detail"].lower()
+    assert session_manager.active_session_count() == 0
+
+
+def test_session_max_lifetime_and_default_effort(http_client, monkeypatch):
+    """Verify SESSION_MAX_LIFETIME / max_lifetime expires sessions even when recently active, and DEFAULT_EFFORT applies."""
+    monkeypatch.setenv("DEFAULT_EFFORT", "med")
+
+    r1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "idle_timeout": 900, "max_lifetime": 5},
+    )
+    assert r1.status_code == 201, r1.text
+    d1 = r1.json()
+    sid = d1["id"]
+    assert d1["effort"] == "medium"
+    assert d1["max_lifetime"] == 5
+    assert d1.get("max_expires_at") is not None
+
+    # Keep last_active_at fresh, but advance wall-clock age past max_lifetime
+    live = session_manager._sessions[sid]
+    live.last_active_at = time.time()
+    live.created_at = time.time() - 7.0
+    time.sleep(1.3)
+
+    assert not session_manager.is_session_active(sid)
+    r_get = http_client.get(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"})
+    assert r_get.status_code == 200
+    assert r_get.json()["status"] == "expired"
+
 
 
 

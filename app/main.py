@@ -368,8 +368,9 @@ async def create_job_endpoint(
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err))
 
+    raw_effort = effort or settings.default_effort
     resolved_model = resolve_model(target_agent, model) if model else None
-    resolved_effort = resolve_effort(effort) if effort else None
+    resolved_effort = resolve_effort(raw_effort) if raw_effort else None
 
     if model and model != resolved_model:
         logger.info(
@@ -648,6 +649,19 @@ from app.sessions import session_manager
 from app.db import get_session, list_sessions, list_session_turns, update_session_state
 
 
+def _enrich_session_expiry(sess: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not sess:
+        return sess
+    if sess.get("status") in ("starting", "idle", "busy"):
+        sess["expires_at"] = sess["last_active_at"] + sess["idle_timeout"]
+        if sess.get("max_lifetime") is not None and sess.get("created_at") is not None:
+            sess["max_expires_at"] = sess["created_at"] + sess["max_lifetime"]
+    else:
+        sess["expires_at"] = None
+        sess["max_expires_at"] = None
+    return sess
+
+
 @app.post("/v1/sessions")
 async def create_session_endpoint(
     request: Request,
@@ -663,6 +677,7 @@ async def create_session_endpoint(
     attachments_input: List[AttachmentSpec] = []
     idle_timeout: Optional[int] = None
     turn_timeout: Optional[int] = None
+    max_lifetime: Optional[int] = None
     wait_time: int = settings.wait_default
     metadata: Optional[Dict[str, Any]] = None
 
@@ -680,6 +695,11 @@ async def create_session_endpoint(
         if form.get("turn_timeout") is not None:
             try:
                 turn_timeout = int(form.get("turn_timeout"))
+            except ValueError:
+                pass
+        if form.get("max_lifetime") is not None:
+            try:
+                max_lifetime = int(form.get("max_lifetime"))
             except ValueError:
                 pass
         if form.get("wait") is not None:
@@ -724,6 +744,7 @@ async def create_session_endpoint(
         attachments_input = req_obj.attachments or []
         idle_timeout = req_obj.idle_timeout
         turn_timeout = req_obj.turn_timeout
+        max_lifetime = req_obj.max_lifetime
         wait_time = req_obj.wait
         metadata = req_obj.metadata
 
@@ -734,12 +755,15 @@ async def create_session_endpoint(
         logger.error(f"Agent validation failed: {err}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
 
+    raw_effort = effort or settings.default_effort
     resolved_model = resolve_model(agent, model) if model else None
-    resolved_effort = resolve_effort(effort) if effort else None
+    resolved_effort = resolve_effort(raw_effort) if raw_effort else None
 
     eff_idle = idle_timeout if idle_timeout is not None else settings.session_idle_timeout
     eff_idle = max(5, min(eff_idle, settings.session_idle_max))
     eff_turn = turn_timeout if turn_timeout is not None else settings.session_turn_timeout
+    max_cap = max(5, settings.session_max_lifetime)
+    eff_max_life = max(5, min(max_lifetime if max_lifetime is not None else max_cap, max_cap))
     eff_wait = max(0, min(wait_time, settings.wait_max))
 
     api_key_name = auth.name
@@ -751,6 +775,7 @@ async def create_session_endpoint(
         effort=resolved_effort,
         idle_timeout=eff_idle,
         turn_timeout=eff_turn,
+        max_lifetime=eff_max_life,
         metadata=metadata,
         client_ip=client_ip,
         auth_mode="bypass" if auth.name == "bypass" else "api_key",
@@ -796,9 +821,7 @@ async def create_session_endpoint(
                     detail=f"Attachment error: {att_err}",
                 )
 
-        sess_dict = get_session(live_session.id, db_path=settings.db_path)
-        if sess_dict:
-            sess_dict["expires_at"] = sess_dict["last_active_at"] + sess_dict["idle_timeout"]
+        sess_dict = _enrich_session_expiry(get_session(live_session.id, db_path=settings.db_path))
         return Response(
             content=json.dumps(sess_dict),
             status_code=status.HTTP_201_CREATED,
@@ -806,6 +829,7 @@ async def create_session_endpoint(
         )
 
     if eff_wait == 0:
+        sess_dict = _enrich_session_expiry(get_session(live_session.id, db_path=settings.db_path))
         asyncio.create_task(
             session_manager.execute_turn(
                 session_id=live_session.id,
@@ -837,11 +861,9 @@ async def create_session_endpoint(
 
     try:
         turn_res = await asyncio.wait_for(asyncio.shield(turn_task), timeout=float(eff_wait))
-        return turn_res
+        return _enrich_session_expiry(turn_res)
     except asyncio.TimeoutError:
-        fresh_sess = get_session(live_session.id, db_path=settings.db_path)
-        if fresh_sess:
-            fresh_sess["expires_at"] = fresh_sess["last_active_at"] + fresh_sess["idle_timeout"]
+        fresh_sess = _enrich_session_expiry(get_session(live_session.id, db_path=settings.db_path))
         return Response(
             content=json.dumps(fresh_sess),
             status_code=status.HTTP_202_ACCEPTED,
@@ -970,11 +992,9 @@ async def session_message_endpoint(
 
     try:
         turn_res = await asyncio.wait_for(asyncio.shield(turn_task), timeout=float(eff_wait))
-        return turn_res
+        return _enrich_session_expiry(turn_res)
     except asyncio.TimeoutError:
-        fresh_sess = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
-        if fresh_sess:
-            fresh_sess["expires_at"] = fresh_sess["last_active_at"] + fresh_sess["idle_timeout"]
+        fresh_sess = _enrich_session_expiry(get_session(session_id, db_path=settings.db_path, api_key_name=tenant))
         return Response(
             content=json.dumps(fresh_sess),
             status_code=status.HTTP_202_ACCEPTED,
@@ -997,10 +1017,7 @@ async def get_session_endpoint(
             detail=f"Session '{session_id}' not found",
         )
 
-    if sess.get("status") in ("starting", "idle", "busy"):
-        sess["expires_at"] = sess["last_active_at"] + sess["idle_timeout"]
-    else:
-        sess["expires_at"] = None
+    _enrich_session_expiry(sess)
 
     if include_turns:
         turns = list_session_turns(session_id, db_path=settings.db_path, api_key_name=tenant)
@@ -1024,10 +1041,7 @@ async def list_sessions_endpoint(
         api_key_name=tenant,
     )
     for s in sessions:
-        if s.get("status") in ("starting", "idle", "busy"):
-            s["expires_at"] = s["last_active_at"] + s["idle_timeout"]
-        else:
-            s["expires_at"] = None
+        _enrich_session_expiry(s)
     return sessions
 
 

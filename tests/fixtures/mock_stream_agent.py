@@ -35,6 +35,28 @@ def main():
             sys.exit(1)
         if "TIMEOUT" in prompt:
             time.sleep(30)
+        if "AUTH_EXPIRED" in prompt:
+            if args.mode == "agy":
+                sys.stderr.write(
+                    "Authentication required. Please visit the URL to log in:\n"
+                    "Waiting for authentication (timeout 60s)...\n"
+                )
+                sys.stderr.flush()
+                time.sleep(60)
+                sys.exit(1)
+            else:
+                err_evt = {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "session_id": conv_id,
+                    "result": "Not logged in · Please run /login",
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0},
+                    "total_cost_usd": 0,
+                }
+                sys.stdout.write(json.dumps(err_evt) + "\n")
+                sys.stdout.flush()
+                sys.exit(1)
         if "CHATTY_STDERR" in prompt:
             sys.stderr.write("E" * (130 * 1024) + "\n")
             sys.stderr.flush()

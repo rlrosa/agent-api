@@ -203,13 +203,15 @@ The server is configured via environment variables.
 | `BWRAP_ENABLED` | `1` | Enable Bubblewrap OS sandboxing for `agy` and `claude` (1=true, 0=false). |
 | `JOB_TIMEOUT` | `120` | Max job execution timeout in seconds. |
 | `MAX_CONCURRENT_JOBS` | `3` | Maximum worker concurrency for background jobs. |
-| `PURGE_AFTER_HOURS` | `24` | Automated background purge window for old job records. |
+| `JOB_RETENTION` | `30d` | Retention window in days for automated purging of old terminal job and session records. |
+| `DEFAULT_EFFORT` | *(Optional)* | Default reasoning effort (`low`, `med`, `high`) when requests omit `effort`. |
 | `AGY_USAGE_CMD` | `agy -p /usage` | Shell command executed to retrieve raw agy usage TSV. |
 | `AGY_QUOTA_TTL_S` | `1800` | In-memory cache TTL for agy quota query in seconds (30m). |
 | `SESSION_WORK_ROOT` | `/var/tmp/agent-api/sessions` | Directory tree for isolated warm session workspaces. |
 | `SESSION_IDLE_TIMEOUT` | `900` | Inactivity threshold in seconds (15m) before warm session auto-close and workspace reaping. |
 | `SESSION_IDLE_MAX` | `3600` | Maximum client-configurable idle timeout in seconds (60m). |
 | `SESSION_TURN_TIMEOUT` | `120` | Max execution timeout per individual session turn in seconds. |
+| `SESSION_MAX_LIFETIME` | `86400` | Hard wall-clock lifetime cap in seconds (24h) before an idle session expires regardless of activity. |
 | `MAX_ACTIVE_SESSIONS` | `10` | Hard cap on total concurrently warm agent subprocesses. |
 | `MAX_QUEUED_TURNS_PER_SESSION` | `3` | Maximum pending messages queued on a single session's FIFO lock. |
 

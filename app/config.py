@@ -63,8 +63,10 @@ class Settings(BaseModel):
     session_idle_timeout: int = Field(default=900)
     session_idle_max: int = Field(default=3600)
     session_turn_timeout: int = Field(default=120)
+    session_max_lifetime: int = Field(default=86400)
     max_active_sessions: int = Field(default=10)
     max_queued_turns_per_session: int = Field(default=3)
+    default_effort: Optional[str] = Field(default=None)
 
 
 def get_settings() -> Settings:
@@ -145,8 +147,10 @@ def get_settings() -> Settings:
         session_idle_timeout=int(os.environ.get("SESSION_IDLE_TIMEOUT", "900")),
         session_idle_max=int(os.environ.get("SESSION_IDLE_MAX", "3600")),
         session_turn_timeout=int(os.environ.get("SESSION_TURN_TIMEOUT", "120")),
+        session_max_lifetime=int(os.environ.get("SESSION_MAX_LIFETIME", "86400")),
         max_active_sessions=int(os.environ.get("MAX_ACTIVE_SESSIONS", "10")),
         max_queued_turns_per_session=int(os.environ.get("MAX_QUEUED_TURNS_PER_SESSION", "3")),
+        default_effort=os.environ.get("DEFAULT_EFFORT") or None,
     )
 
 
