@@ -5,13 +5,21 @@
 
 ## Security Controls
 
-### 1. Fail-Closed Sandbox Confinement
-- Jobs run confined inside Linux namespaces via `bubblewrap` (`bwrap`).
-- Mount points are restricted to essential read-only system paths (`/usr`, `/bin`, `/lib`, `/etc/resolv.conf`, `/etc/ssl`).
-- The user home directory and API keys are isolated via clean `--tmpfs` mounts.
-- **Fail-Closed Policy**: If `bwrap` is missing or unexecutable, `agent-api` **refuses to run unconfined** by default (`ALLOW_UNCONFINED=0`), failing the job with an error log.
+### 1. Fail-Closed Pluggable Sandbox Confinement (`bwrap` & NVIDIA `openshell`)
+- Jobs and warm sessions run confined via a pluggable sandbox abstraction (`app/sandbox.py`), selectable via `SANDBOX_BACKEND=bwrap|openshell` (default `bwrap`).
+- **`bwrap` Backend (`BwrapBackend`)**:
+  - Confines processes inside Linux namespaces (`--die-with-parent`, `--new-session`).
+  - Mount points are restricted to essential read-only system paths (`/usr`, `/bin`, `/lib`, `/etc/resolv.conf`, `/etc/ssl`).
+  - The user home directory, `~/.gemini`, and `~/.claude` are isolated via clean `--tmpfs` mounts.
+  - **Allowlist-Only OAuth Credential Mounts (F5 Mitigation)**: Only the exact files required for subscription OAuth authentication (`antigravity-oauth-token`, `settings.json`, `installation_id`, `builtin`, `config` for `agy`; `.credentials.json`, `settings.json`, `.claude.json` for `claude`) are bind-mounted read-only. Operator prompt history (`history.jsonl`) and conversation summary databases (`conversation_summaries.db*`) are never mounted into the sandbox.
+  - **Egress Control (F6 Mitigation)**: Setting `EGRESS_RESTRICT=1` switches `bwrap` from `--share-net` to `--unshare-net`.
+- **NVIDIA OpenShell Backend (`OpenShellBackend`)**:
+  - Spawns each job or session inside an isolated container (`OPENSHELL_IMAGE=agent-api-sandbox:latest`) governed by `policies/openshell-policy.yaml`.
+  - Enforces kernel-level **Landlock** filesystem policies, **Seccomp** syscall filters, and an **Outer Network Fence + Supervisor Proxy** that permits outbound TLS (`443`) traffic **only** to allowlisted Google/Gemini and Anthropic OAuth and inference endpoints (`*.googleapis.com`, `api.anthropic.com`, `claude.ai`).
+  - Automatically destroys the sandbox (`openshell sandbox delete agent-api-<id>`) upon job completion, timeout, or session teardown.
+- **Fail-Closed Policy**: If the active backend binary (`bwrap` or `openshell`) is missing or unexecutable, `agent-api` **refuses to run unconfined** by default (`ALLOW_UNCONFINED=0`), failing the job with a confinement error.
 - **Escape Hatch**: Setting `ALLOW_UNCONFINED=1` permits unconfined execution but logs a loud `WARNING` on every job.
-- **Preflight Check**: `/healthz` reports `"confinement": {"enabled": true, "available": true, "mode": "enforced"}`.
+- **Preflight Check**: `/healthz` reports `"confinement": {"enabled": true, "available": true, "backend": "bwrap", "mode": "enforced"}`.
 
 ### 2. SSRF Protection & Per-Hop Redirect Validation
 - Attachment URLs (`http://`, `https://`) are strictly validated against restricted IP ranges (loopback `127.0.0.0/8`, private `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, link-local `169.254.0.0/16`).

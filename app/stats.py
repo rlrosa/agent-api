@@ -427,7 +427,12 @@ def get_error_stats(from_ts: Optional[float] = None, to_ts: Optional[float] = No
                 taxonomy["timeout"] += 1
             elif "rate limit" in err_str.lower() or "429" in err_str or "quota" in err_str.lower():
                 taxonomy["rate_limited"] += 1
-            elif "sandbox" in err_str.lower() or "bwrap" in err_str.lower():
+            elif (
+                "sandbox" in err_str.lower()
+                or "bwrap" in err_str.lower()
+                or "openshell" in err_str.lower()
+                or "confinement error" in err_str.lower()
+            ):
                 taxonomy["sandbox_error"] += 1
             elif code is not None and code != 0:
                 taxonomy["nonzero_exit"] += 1

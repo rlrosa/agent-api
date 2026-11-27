@@ -20,22 +20,26 @@ untrusted.**
 | `app/security.py` | API-key parsing and constant-time comparison; the per-caller limiter |
 | `app/config.py` | All settings. `get_settings()` reads env; see the shadowing trap below |
 | `app/agents.py` | Per-agent argv construction and the model/effort resolvers |
-| `app/runner.py` | Subprocess spawn, the `bwrap` sandbox, env scrubbing, timeout/kill, workspace lifecycle and the orphan reaper |
+| `app/sandbox.py` | Pluggable sandbox confinement backends (`bwrap`, `openshell`), allowlist-only OAuth file mounts, and egress policy enforcement |
+| `app/runner.py` | Subprocess spawn, sandbox delegation, env scrubbing, timeout/kill, workspace lifecycle and the orphan reaper |
 | `app/ratelimit.py` | The 5-layer rate-limit classifier and AIMD concurrency manager |
 | `app/dispatcher.py` | The claim/run loop; drives AIMD backoff/recovery |
 | `app/attachments.py` | URL fetching, the SSRF guard, filename sanitisation |
 | `app/sessions.py` | Warm multi-turn session runtime, stream-json drivers, FIFO lock, idle reaper |
 | `app/db.py` | SQLite access. Every job query must be scoped — see Invariants |
 | `app/static/dashboard.html` | Unauthenticated monitoring page |
+| `policies/openshell-policy.yaml` | Declarative NVIDIA OpenShell Landlock filesystem & TLS egress allowlist policy |
+| `Dockerfile.sandbox` | Self-contained OpenShell sandbox container image (`agy` + `claude` via official installers) |
+| `scripts/setup-openshell.sh` | Provisions the OpenShell CLI/gateway and builds `agent-api-sandbox:latest` |
 | `scripts/session-cli` | Stateful Python stdlib CLI & interactive REPL for `/v1/sessions` |
 | `scripts/dev-server.sh` | Isolated side-by-side loopback dev server manager (default `:8091`, refuses `:8090`) |
 | `doc/sessions.md` | Comprehensive guide and protocol diagrams for warm /v1/sessions |
 | `doc/security-review-2026-08-10.md` | Full security review: findings, evidence, what's fixed |
 
-## Running it
+## Running it & Isolated `.worktrees/` Development
 
 ```bash
-API_KEY=dev .venv/bin/pytest -q            # 37 tests. API_KEY is REQUIRED: without it collection fails
+API_KEY=dev .venv/bin/pytest -q            # Run test suite. API_KEY is REQUIRED: without it collection fails
 API_KEY=dev ./run.sh                       # local uvicorn
 systemctl --user restart agent-api.service # the deployed unit (reads ~/.config/agent-api/env)
 ```
@@ -43,6 +47,11 @@ systemctl --user restart agent-api.service # the deployed unit (reads ~/.config/
 The deployed service reads its config from `~/.config/agent-api/env`, **not** from anything in
 this repo. An explicitly set env var always beats the code default, so changing a default here
 does not change the running service until that file is edited and the unit restarted.
+
+**Isolated Worktrees (`.worktrees/`):** Other tools actively rely on the live `agent-api.service`
+on `:8090`. When developing or testing new features/integrations:
+- Create an isolated git worktree inside `.worktrees/<name>` (e.g., `git worktree add .worktrees/my-feature -b feat/my-feature`). `.worktrees/` is gitignored so it never dirties `git status`.
+- Run tests or an isolated dev server on an alternate port/DB from inside the worktree — **never take down `:8090`** during development.
 
 ## Rate-limit classification (`app/ratelimit.py`)
 
