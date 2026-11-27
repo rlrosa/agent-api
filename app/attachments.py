@@ -144,8 +144,13 @@ def _open_unique_staging_file(attachments_dir: str, clean_filename: str = "part"
     return tempfile.mkstemp(prefix=f"{safe_prefix}.", suffix=".upload", dir=staging_dir)
 
 
-def _publish_staged_file(temp_path: str, attachments_dir: str, clean_filename: str) -> str:
-    """Atomically link temp_path into attachments_dir without overwriting any existing or agent-created file."""
+def _publish_staged_file_with_status(
+    temp_path: str,
+    attachments_dir: str,
+    clean_filename: str,
+) -> Tuple[str, Optional[str]]:
+    """Atomically link temp_path into attachments_dir without overwriting existing files.
+    Returns (published_basename, retained_staging_abspath_if_unlink_failed)."""
     abs_attachments = os.path.abspath(attachments_dir)
     base_name, ext = os.path.splitext(clean_filename)
     counter = 0
@@ -157,13 +162,22 @@ def _publish_staged_file(temp_path: str, attachments_dir: str, clean_filename: s
             raise ValueError("Path traversal attempt detected")
         try:
             os.link(temp_path, target_path)
+            retained_staging: Optional[str] = None
             try:
                 os.unlink(temp_path)
+            except FileNotFoundError:
+                retained_staging = None
             except OSError:
-                pass
-            return os.path.basename(target_path)
+                retained_staging = os.path.abspath(temp_path)
+            return os.path.basename(target_path), retained_staging
         except FileExistsError:
             counter += 1
+
+
+def _publish_staged_file(temp_path: str, attachments_dir: str, clean_filename: str) -> str:
+    """Atomically link temp_path into attachments_dir without overwriting any existing or agent-created file."""
+    pub_name, _ = _publish_staged_file_with_status(temp_path, attachments_dir, clean_filename)
+    return pub_name
 
 
 def _commit_staged_file(temp_path: str, attachments_dir: str, clean_filename: str) -> str:
@@ -185,37 +199,38 @@ async def fetch_url_attachment(
 ) -> Tuple[str, int]:
     current_url = url
     max_hops = 5
+    staged_temp_path: Optional[str] = None
+    staged_clean_filename: Optional[str] = None
+    bytes_written_this_file = 0
 
-    async with httpx.AsyncClient(follow_redirects=False, timeout=10.0) as client:
-        for hop in range(max_hops + 1):
-            validate_url_ssrf(current_url, allowlist=allowlist)
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=10.0) as client:
+            for hop in range(max_hops + 1):
+                validate_url_ssrf(current_url, allowlist=allowlist)
 
-            req = client.build_request("GET", current_url)
-            response = await client.send(req, stream=True)
+                req = client.build_request("GET", current_url)
+                response = await client.send(req, stream=True)
 
-            if response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get("location")
-                await response.aclose()
-                if not location:
-                    raise ValueError(f"HTTP redirect {response.status_code} missing Location header")
-                if hop >= max_hops:
-                    raise ValueError(f"Too many redirects (exceeded max {max_hops} hops)")
-                current_url = urllib.parse.urljoin(current_url, location)
-                continue
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location")
+                    await response.aclose()
+                    if not location:
+                        raise ValueError(f"HTTP redirect {response.status_code} missing Location header")
+                    if hop >= max_hops:
+                        raise ValueError(f"Too many redirects (exceeded max {max_hops} hops)")
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    continue
 
-            if response.status_code != 200:
-                await response.aclose()
-                raise ValueError(f"Failed to fetch attachment URL {current_url}: HTTP {response.status_code}")
-
-            try:
-                content_type = response.headers.get("content-type")
-                raw_filename = get_filename_from_response(response, current_url)
-                clean_filename = sanitize_filename(raw_filename, content_type=content_type)
-
-                bytes_written_this_file = 0
-                sfd, temp_path = _open_unique_staging_file(attachments_dir, clean_filename)
+                if response.status_code != 200:
+                    await response.aclose()
+                    raise ValueError(f"Failed to fetch attachment URL {current_url}: HTTP {response.status_code}")
 
                 try:
+                    content_type = response.headers.get("content-type")
+                    raw_filename = get_filename_from_response(response, current_url)
+                    staged_clean_filename = sanitize_filename(raw_filename, content_type=content_type)
+                    sfd, staged_temp_path = _open_unique_staging_file(attachments_dir, staged_clean_filename)
+
                     with open(sfd, "wb") as f:
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             chunk_len = len(chunk)
@@ -229,16 +244,20 @@ async def fetch_url_attachment(
                                 )
                             f.write(chunk)
                             bytes_written_this_file += chunk_len
+                    break
+                finally:
+                    await response.aclose()
+            else:
+                raise ValueError(f"Failed to fetch attachment URL {url}: max redirects exceeded")
 
-                    final_name = _commit_staged_file(temp_path, attachments_dir, clean_filename)
-                    return final_name, bytes_written_this_file
-                except BaseException as exc:
-                    _cleanup_failed_target(temp_path, exc)
-                    raise
-            finally:
-                await response.aclose()
+        assert staged_temp_path is not None and staged_clean_filename is not None
+        final_name = _commit_staged_file(staged_temp_path, attachments_dir, staged_clean_filename)
+    except BaseException as exc:
+        if staged_temp_path is not None:
+            _cleanup_failed_target(staged_temp_path, exc)
+        raise
 
-    raise ValueError(f"Failed to fetch attachment URL {url}: max redirects exceeded")
+    return final_name, bytes_written_this_file
 
 
 

@@ -14,7 +14,7 @@ import httpx
 
 from app.agents import AGENTS, resolve_effective_session_model, strip_model_tier
 from app.attachments import (
-    _publish_staged_file,
+    _publish_staged_file_with_status,
     compose_prompt,
     deferred_attachment_commits,
     get_upload_staging_dir,
@@ -365,39 +365,43 @@ class LiveSession:
 
 def _rollback_turn_uploads(
     live: "LiveSession",
-    saved_this_turn: List[Union[Tuple[str, int], Tuple[str, int, Optional[int], Optional[int]]]],
+    saved_this_turn: List[Any],
 ) -> None:
-    """Remove newly saved files from a failed turn; protect any agent replacement with a different inode."""
+    """Roll back newly staged files from a failed turn without EVER unlinking exposed workspace paths.
+    Only unexposed files inside get_upload_staging_dir(live.workspace_path) may be unlinked; any file already
+    exposed in workspace_path (or retaining a staging hard link) keeps its byte charge in total_attachment_bytes."""
+    abs_staging = os.path.abspath(get_upload_staging_dir(live.workspace_path))
     for entry in saved_this_turn:
-        if len(entry) == 4:
-            fp, bc, exp_dev, exp_ino = entry
-        else:
-            fp, bc = entry
-            exp_dev, exp_ino = None, None
+        fp = entry[0]
+        bc = entry[1]
+        retained_staging = entry[4] if len(entry) >= 5 else None
+        abs_fp = os.path.abspath(fp)
 
         try:
-            st = os.lstat(fp)
+            is_unexposed_staged = os.path.commonpath([abs_fp, abs_staging]) == abs_staging
+        except ValueError:
+            is_unexposed_staged = False
+
+        if not is_unexposed_staged:
+            # Never unlink an exposed path inside workspace_path (zero TOCTOU risk if agent replaced it).
+            # Try cleaning up any leftover extra staging hard link, while keeping bc charged because abs_fp was exposed.
+            if retained_staging is not None:
+                try:
+                    os.remove(retained_staging)
+                except OSError:
+                    pass
+            continue
+
+        try:
+            os.remove(abs_fp)
+            removed = True
         except FileNotFoundError:
             removed = True
         except OSError:
             removed = False
-        else:
-            if exp_dev is not None and exp_ino is not None and (st.st_dev, st.st_ino) != (exp_dev, exp_ino):
-                # Path was replaced by a different inode (e.g. agent replaced published file); never delete replacement!
-                removed = True
-            else:
-                try:
-                    os.remove(fp)
-                    removed = True
-                except FileNotFoundError:
-                    removed = True
-                except OSError:
-                    removed = False
 
         if removed:
             live.total_attachment_bytes = max(0, live.total_attachment_bytes - bc)
-        else:
-            live.managed_attachments.add(fp)
 
 
 async def _drain_stderr(
@@ -490,12 +494,16 @@ def _account_unremoved_upload_files(live: "LiveSession", exc: BaseException) -> 
     """Account for exact files created by a failed upload that could not be unlinked.
     Returns True if any leftover file's byte count could not be determined."""
     uncertain = False
+    charged_set: Set[str] = getattr(live, "_charged_unremoved_files", None)
+    if charged_set is None:
+        charged_set = set()
+        setattr(live, "_charged_unremoved_files", charged_set)
     for fp, rem_bytes in getattr(exc, "_unremoved_attachment_files", ()):
         if rem_bytes is None:
             uncertain = True
-        elif fp not in live.managed_attachments:
+        elif fp not in charged_set and fp not in live.managed_attachments:
             live.total_attachment_bytes += rem_bytes
-            live.managed_attachments.add(fp)
+            charged_set.add(fp)
     return uncertain
 
 
@@ -960,7 +968,7 @@ class SessionManager:
                 live.queued_waiters = max(0, live.queued_waiters - 1)
                 decremented_waiter = True
                 live.active_turn_task = asyncio.current_task()
-                saved_this_turn: List[Tuple[str, int, Optional[int], Optional[int]]] = []
+                saved_this_turn: List[Any] = []
 
                 try:
                     now_start = time.time()
@@ -1063,18 +1071,18 @@ class SessionManager:
                                     if len(deferred_staged) <= before_def_len:
                                         attachment_filenames.append(clean_fn)
 
-                                # All attachments succeeded: atomically publish deferred staged files into attachments/
+                                # All attachments succeeded: atomically publish deferred staged files into attachments/.
+                                # Keep the device & inode recorded from the staging file (never re-lstat exposed pub_full),
+                                # and record any retained staging hard link if staging unlink failed.
                                 deferred_map = {os.path.abspath(sp): cfn for sp, cfn in deferred_staged}
-                                for idx, (fp, bc, s_dev, s_ino) in enumerate(list(saved_this_turn)):
+                                for idx, entry in enumerate(list(saved_this_turn)):
+                                    fp, bc, s_dev, s_ino = entry[0], entry[1], entry[2], entry[3]
                                     if fp in deferred_map:
-                                        pub_name = _publish_staged_file(fp, att_dir_abs, deferred_map[fp])
+                                        pub_name, retained_staging = _publish_staged_file_with_status(
+                                            fp, att_dir_abs, deferred_map[fp]
+                                        )
                                         pub_full = os.path.abspath(os.path.join(att_dir_abs, pub_name))
-                                        try:
-                                            st_p = os.lstat(pub_full)
-                                            p_dev, p_ino = st_p.st_dev, st_p.st_ino
-                                        except OSError:
-                                            p_dev, p_ino = s_dev, s_ino
-                                        saved_this_turn[idx] = (pub_full, bc, p_dev, p_ino)
+                                        saved_this_turn[idx] = (pub_full, bc, s_dev, s_ino, retained_staging)
                                         attachment_filenames.append(os.path.basename(pub_name))
                         except (ValueError, httpx.RequestError) as att_err:
                             _rollback_turn_uploads(live, saved_this_turn)
@@ -1082,55 +1090,66 @@ class SessionManager:
                             uncertain = _account_unremoved_upload_files(live, att_err)
                             bounded_att_err = _truncate_diag(f"Attachment error: {att_err}", MAX_AUTH_DIAG_CHARS)
                             if live.closing or live.status in ("closed", "expired", "failed") or not self.is_session_active(session_id):
-                                update_session_state(
-                                    session_id,
-                                    total_attachment_bytes=live.total_attachment_bytes,
-                                    db_path=db_path,
-                                )
-                                finish_session_turn(
-                                    turn_id=turn_id,
-                                    status="failed",
-                                    error="Session closed while materializing attachments",
-                                    db_path=db_path,
-                                )
+                                try:
+                                    complete_turn_and_update_session(
+                                        turn_id=turn_id,
+                                        turn_status="failed",
+                                        session_id=session_id,
+                                        turn_error="Session closed while materializing attachments",
+                                        total_attachment_bytes=live.total_attachment_bytes,
+                                        db_path=db_path,
+                                    )
+                                except Exception as db_err:
+                                    raise await self._retire_on_db_failure(
+                                        live, turn_id, db_err, db_path=db_path, prefix="Failed persisting closed-turn attachment state"
+                                    )
                                 raise HTTPException(
                                     status_code=status.HTTP_409_CONFLICT,
                                     detail=f"Session '{session_id}' is {live.closed_reason or 'closed'} and cannot accept new messages",
                                 )
                             if uncertain:
-                                finish_session_turn(
-                                    turn_id=turn_id,
-                                    status="failed",
-                                    error=bounded_att_err,
-                                    db_path=db_path,
-                                )
                                 live.status = "failed"
-                                await self.close_session(
-                                    session_id,
-                                    reason="failed",
-                                    error=bounded_att_err,
-                                    db_path=db_path,
-                                )
+                                try:
+                                    finish_session_turn(
+                                        turn_id=turn_id,
+                                        status="failed",
+                                        error=bounded_att_err,
+                                        db_path=db_path,
+                                    )
+                                    closed_unc = await self.close_session(
+                                        session_id,
+                                        reason="failed",
+                                        error=bounded_att_err,
+                                        db_path=db_path,
+                                    )
+                                    if closed_unc is None:
+                                        raise RuntimeError("Session close row write deferred")
+                                except Exception as db_err:
+                                    raise await self._retire_on_db_failure(
+                                        live, turn_id, db_err, db_path=db_path, prefix="Failed retiring session after uncertain upload cleanup"
+                                    )
                                 raise HTTPException(
                                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                     detail=bounded_att_err,
                                 )
-                            finish_session_turn(
-                                turn_id=turn_id,
-                                status="failed",
-                                error=bounded_att_err,
-                                db_path=db_path,
-                            )
-                            live.status = "idle"
                             now_idle = time.time()
+                            try:
+                                complete_turn_and_update_session(
+                                    turn_id=turn_id,
+                                    turn_status="failed",
+                                    session_id=session_id,
+                                    turn_error=bounded_att_err,
+                                    session_status="idle",
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    last_active_at=now_idle,
+                                    db_path=db_path,
+                                )
+                            except Exception as db_err:
+                                raise await self._retire_on_db_failure(
+                                    live, turn_id, db_err, db_path=db_path, prefix="Failed persisting attachment validation failure"
+                                )
+                            live.status = "idle"
                             live.last_active_at = now_idle
-                            update_session_state(
-                                session_id,
-                                status="idle",
-                                total_attachment_bytes=live.total_attachment_bytes,
-                                last_active_at=now_idle,
-                                db_path=db_path,
-                            )
                             http_status = (
                                 status.HTTP_400_BAD_REQUEST
                                 if isinstance(att_err, ValueError)
@@ -1145,50 +1164,67 @@ class SessionManager:
                             saved_this_turn.clear()
                             uncertain = _account_unremoved_upload_files(live, storage_err)
                             if live.closing or live.status in ("closed", "expired", "failed") or not self.is_session_active(session_id):
-                                update_session_state(
-                                    session_id,
-                                    total_attachment_bytes=live.total_attachment_bytes,
-                                    db_path=db_path,
-                                )
-                                finish_session_turn(
-                                    turn_id=turn_id,
-                                    status="failed",
-                                    error="Session closed while materializing attachments",
-                                    db_path=db_path,
-                                )
+                                try:
+                                    complete_turn_and_update_session(
+                                        turn_id=turn_id,
+                                        turn_status="failed",
+                                        session_id=session_id,
+                                        turn_error="Session closed while materializing attachments",
+                                        total_attachment_bytes=live.total_attachment_bytes,
+                                        db_path=db_path,
+                                    )
+                                except Exception as db_err:
+                                    raise await self._retire_on_db_failure(
+                                        live, turn_id, db_err, db_path=db_path, prefix="Failed persisting closed-turn storage failure"
+                                    )
                                 raise HTTPException(
                                     status_code=status.HTTP_409_CONFLICT,
                                     detail=f"Session '{session_id}' is {live.closed_reason or 'closed'} and cannot accept new messages",
                                 )
                             bounded_io_err = _truncate_diag(f"Attachment storage error: {storage_err}", MAX_AUTH_DIAG_CHARS)
-                            finish_session_turn(
-                                turn_id=turn_id,
-                                status="failed",
-                                error=bounded_io_err,
-                                db_path=db_path,
-                            )
                             if uncertain:
                                 live.status = "failed"
-                                await self.close_session(
-                                    session_id,
-                                    reason="failed",
-                                    error=bounded_io_err,
-                                    db_path=db_path,
-                                )
+                                try:
+                                    finish_session_turn(
+                                        turn_id=turn_id,
+                                        status="failed",
+                                        error=bounded_io_err,
+                                        db_path=db_path,
+                                    )
+                                    closed_unc = await self.close_session(
+                                        session_id,
+                                        reason="failed",
+                                        error=bounded_io_err,
+                                        db_path=db_path,
+                                    )
+                                    if closed_unc is None:
+                                        raise RuntimeError("Session close row write deferred")
+                                except Exception as db_err:
+                                    raise await self._retire_on_db_failure(
+                                        live, turn_id, db_err, db_path=db_path, prefix="Failed retiring session after uncertain storage cleanup"
+                                    )
                                 raise HTTPException(
                                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                     detail=bounded_io_err,
                                 )
-                            live.status = "idle"
                             now_idle = time.time()
+                            try:
+                                complete_turn_and_update_session(
+                                    turn_id=turn_id,
+                                    turn_status="failed",
+                                    session_id=session_id,
+                                    turn_error=bounded_io_err,
+                                    session_status="idle",
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    last_active_at=now_idle,
+                                    db_path=db_path,
+                                )
+                            except Exception as db_err:
+                                raise await self._retire_on_db_failure(
+                                    live, turn_id, db_err, db_path=db_path, prefix="Failed persisting attachment storage failure"
+                                )
+                            live.status = "idle"
                             live.last_active_at = now_idle
-                            update_session_state(
-                                session_id,
-                                status="idle",
-                                total_attachment_bytes=live.total_attachment_bytes,
-                                last_active_at=now_idle,
-                                db_path=db_path,
-                            )
                             raise HTTPException(
                                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 detail=bounded_io_err,

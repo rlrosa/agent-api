@@ -2093,10 +2093,11 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
         flock_bin_dir.mkdir(mode=0o700)
         real_flock = _sh.which("flock")
         assert real_flock is not None
+        import shlex
         flock_reached = tmp_path / "flock.reached"
         flock_wrapper = flock_bin_dir / "flock"
         flock_wrapper.write_text(
-            f"#!/usr/bin/env bash\n: > {str(flock_reached)!r}\nexec {real_flock!r} \"$@\"\n",
+            f"#!/usr/bin/env bash\n: > {shlex.quote(str(flock_reached))}\nexec {shlex.quote(real_flock)} \"$@\"\n",
             encoding="utf-8",
         )
         flock_wrapper.chmod(0o700)
@@ -2605,22 +2606,104 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     assert os.path.exists(concurrent_agent_file) and real_open(concurrent_agent_file, "rb").read() == b"agent-concurrent-data"
     assert os.path.exists(concurrent_report_file) and real_open(concurrent_report_file, "rb").read() == b"agent-report-v1"
 
-    # Also verify inode-verified _rollback_turn_uploads directly when an already-published path was replaced by a new inode
+    # 4715616293, 4715991491, 4715991503:
+    # Interleaving A: File #1 links into attachments/ (with a retained staging hard link) and the agent immediately
+    # replaces attachments/pub_first.txt BEFORE File #2 fails publication -> replacement is NOT deleted and File #1's 32B stay charged!
+    real_pub_fn = _sess_mod._publish_staged_file_with_status
+    pub_calls = {"n": 0}
+    remove_targets = []
+    orig_sess_remove = _sess_mod.os.remove
+
+    def _spy_remove(path, *a, **kw):
+        remove_targets.append(os.path.abspath(str(path)))
+        return orig_sess_remove(path, *a, **kw)
+
+    def _pub_interleave(temp_path, attachments_dir_arg, clean_fn):
+        pub_calls["n"] += 1
+        if pub_calls["n"] == 1:
+            # Create an extra hard link to simulate staging unlink failure (retained staging link)
+            extra_stage = temp_path + ".retained"
+            os.link(temp_path, extra_stage)
+            pub_name, _ = real_pub_fn(temp_path, attachments_dir_arg, clean_fn)
+            # Agent immediately replaces the published path before caller records or publishes File #2!
+            pub_target = os.path.join(attachments_dir_arg, pub_name)
+            repl_tmp_p = os.path.join(attachments_dir_arg, "agent_repl.tmp")
+            with real_open(repl_tmp_p, "wb") as rf:
+                rf.write(b"agent-replaced-during-publish")
+            os.replace(repl_tmp_p, pub_target)
+            return pub_name, extra_stage
+        raise OSError(errno.ENOSPC, "Simulated publication failure on second file")
+
+    monkeypatch.setattr(_sess_mod.os, "remove", _spy_remove)
+    monkeypatch.setattr(_sess_mod, "_publish_staged_file_with_status", _pub_interleave)
+    r_pub_race = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Publish interleaving race",
+            "attachments": [
+                {"filename": "pub_first.txt", "content_b64": payload_32},
+                {"filename": "pub_second.txt", "content_b64": payload_32},
+            ],
+        },
+    )
+    assert r_pub_race.status_code == 500
+    monkeypatch.setattr(_sess_mod, "_publish_staged_file_with_status", real_pub_fn)
+    # Exposed path in attachments/ was NEVER passed to os.remove, and agent replacement is intact!
+    assert all(not p.startswith(os.path.abspath(att_dir) + os.sep) for p in remove_targets)
+    assert real_open(os.path.join(att_dir, "pub_first.txt"), "rb").read() == b"agent-replaced-during-publish"
+    # File #1 (32B) stayed charged (43 + 32 = 75), while File #2 (unexposed staged) was rolled back!
+    s_after_pub_race = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_after_pub_race["total_attachment_bytes"] == 43 + 32
+
+    # Interleaving B: Direct _rollback_turn_uploads with an exposed workspace path never calls os.remove on it
+    remove_targets.clear()
     orig_pub = os.path.join(att_dir, "inode_guard.txt")
     with real_open(orig_pub, "wb") as gf:
-        gf.write(b"orig-10-by")
-    orig_st = os.lstat(orig_pub)
-    repl_tmp = os.path.join(att_dir, "inode_guard_repl.tmp")
-    with real_open(repl_tmp, "wb") as rf:
-        rf.write(b"agent-replacement-protected")
-    os.replace(repl_tmp, orig_pub)
-    assert os.lstat(orig_pub).st_ino != orig_st.st_ino
+        gf.write(b"agent-replacement-protected")
     live_att_obj = session_manager._sessions[sid_att]
     before_bytes = live_att_obj.total_attachment_bytes
-    live_att_obj.total_attachment_bytes += 10
-    _sess_mod._rollback_turn_uploads(live_att_obj, [(orig_pub, 10, orig_st.st_dev, orig_st.st_ino)])
+    _sess_mod._rollback_turn_uploads(live_att_obj, [(orig_pub, 10, 1, 1)])
+    monkeypatch.setattr(_sess_mod.os, "remove", orig_sess_remove)
+    assert remove_targets == []
     assert os.path.exists(orig_pub) and real_open(orig_pub, "rb").read() == b"agent-replacement-protected"
     assert live_att_obj.total_attachment_bytes == before_bytes
+
+    # Reset baseline back to 43 so existing downstream arithmetic assertions stay exact
+    live_att_obj.total_attachment_bytes = 43
+    from app.db import update_session_state as _upd_sess_bytes
+    _upd_sess_bytes(sid_att, total_attachment_bytes=43)
+
+    # 4715991496: HTTP response.aclose() raising after streaming chunks cleans up staged file (zero leaked/uncharged staging files)
+    class _FailingCloseStream(_httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"Z" * 8192
+
+        async def aclose(self) -> None:
+            raise _httpx.ReadError("Simulated aclose failure after full chunk write")
+
+    monkeypatch.setattr(
+        _att_mod.httpx,
+        "AsyncClient",
+        lambda **kw: real_async_client(
+            transport=_httpx.MockTransport(
+                lambda req: _httpx.Response(200, headers={"content-type": "text/plain"}, stream=_FailingCloseStream())
+                if req.url.params.get("case") == "aclose_fail"
+                else _mock_handler(req)
+            ),
+            **{k: v for k, v in kw.items() if k != "transport"},
+        ),
+    )
+    r_aclose = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "URL aclose fails",
+            "attachments": [{"url": "https://files.example.test/aclose.txt?case=aclose_fail"}],
+        },
+    )
+    assert r_aclose.status_code == 502
+    assert http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()["total_attachment_bytes"] == 43
 
     # (3) Repeated oversize URL downloads for the SAME filename ('report.bin') when staging unlink fails:
     # first retains 8192B (43 + 8192 = 8235), second retains 16384B in a DISTINCT staging file (8235 + 16384 = 24619, zero undercount!)
@@ -2808,6 +2891,8 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     from app.agents import build_agy_argv, build_claude_argv
     from app.db import close_session_row as _db_close_row, complete_turn_and_update_session as _db_complete, create_session_turn as _db_create_turn
 
+    monkeypatch.delenv("AGENT_FLAGS_AGY", raising=False)
+    monkeypatch.delenv("AGENT_FLAGS_CLAUDE", raising=False)
     monkeypatch.setenv("DEFAULT_EFFORT", "low")
     agy_cmd = build_agy_argv("hello", model="gemini-3.8-flash-high", effort=None)
     assert "--effort" not in agy_cmd
@@ -2815,6 +2900,34 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     claude_cmd = build_claude_argv("hello", effort=None)
     assert "--effort" not in claude_cmd
     monkeypatch.delenv("DEFAULT_EFFORT", raising=False)
+
+    # 4715991508: SQLite failure during attachment-validation error finalization enters retirement & reconciles on recovery
+    rate_limiter.history.clear()
+    r_att_db = http_client.post("/v1/sessions", headers={"X-API-Key": "key-alice"}, json={"agent": "mock_agy_session"})
+    sid_att_db = r_att_db.json()["id"]
+    monkeypatch.setattr(_sess_mod, "complete_turn_and_update_session", _db_down)
+    monkeypatch.setattr(_sess_mod, "finish_session_turn", _db_down)
+    monkeypatch.setattr(_sess_mod, "close_session_row", _db_down)
+    r_att_db_fail = http_client.post(
+        f"/v1/sessions/{sid_att_db}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Second attachment fails validation while DB is down",
+            "attachments": [
+                {"filename": "ok1.bin", "content_b64": payload_32},
+                {"filename": "bad2.bin", "content_b64": "!!!invalid-b64!!!"},
+            ],
+        },
+    )
+    assert r_att_db_fail.status_code == 500
+    assert not session_manager.is_session_active(sid_att_db)
+    monkeypatch.setattr(_sess_mod, "complete_turn_and_update_session", real_atomic)
+    monkeypatch.setattr(_sess_mod, "finish_session_turn", real_finish_turn)
+    monkeypatch.setattr(_sess_mod, "close_session_row", real_close_row)
+    session_manager.reconcile_pending_db_writes()
+    att_db_doc = http_client.get(f"/v1/sessions/{sid_att_db}?include_turns=true", headers={"X-API-Key": "key-alice"}).json()
+    assert att_db_doc["status"] == "failed"
+    assert att_db_doc["turns"][0]["status"] == "failed"
 
     with pytest.raises(LookupError):
         _db_complete(turn_id="nonexistent-turn", turn_status="completed", session_id=sid_busy, turn_count=99)
