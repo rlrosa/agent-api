@@ -307,38 +307,41 @@ async def create_job_endpoint(
             max_file_bytes=settings.max_attachment_bytes,
             max_total_bytes=settings.max_total_bytes,
         )
-        agent_name = form.get("agent")
-        prompt = form.get("prompt", "")
-        model = form.get("model")
-        effort = form.get("effort")
-        wait_val = form.get("wait")
+        try:
+            agent_name = form.get("agent")
+            prompt = form.get("prompt", "")
+            model = form.get("model")
+            effort = form.get("effort")
+            wait_val = form.get("wait")
 
-        if wait_val is not None:
-            try:
-                wait_time = int(wait_val)
-            except ValueError:
-                pass
-        timeout_val = form.get("timeout")
-        if timeout_val is not None:
-            try:
-                job_timeout = int(timeout_val)
-            except ValueError:
-                pass
-        meta_val = form.get("metadata")
-        if meta_val:
-            try:
-                metadata = json.loads(meta_val)
-            except json.JSONDecodeError:
-                pass
+            if wait_val is not None:
+                try:
+                    wait_time = int(wait_val)
+                except ValueError:
+                    pass
+            timeout_val = form.get("timeout")
+            if timeout_val is not None:
+                try:
+                    job_timeout = int(timeout_val)
+                except ValueError:
+                    pass
+            meta_val = form.get("metadata")
+            if meta_val:
+                try:
+                    metadata = json.loads(meta_val)
+                except json.JSONDecodeError:
+                    pass
 
-        # Handle uploaded files in form data
-        for field_name, field_value in form.multi_items():
-            if hasattr(field_value, "filename") and getattr(field_value, "filename", None):
-                file_bytes = await field_value.read()
-                attachments_input.append({
-                    "filename": field_value.filename or "uploaded_file.bin",
-                    "bytes": file_bytes,
-                })
+            # Handle uploaded files in form data
+            for field_name, field_value in form.multi_items():
+                if hasattr(field_value, "filename") and getattr(field_value, "filename", None):
+                    file_bytes = await field_value.read()
+                    attachments_input.append({
+                        "filename": field_value.filename or "uploaded_file.bin",
+                        "bytes": file_bytes,
+                    })
+        finally:
+            await _close_form_files(form)
 
 
     else:
@@ -382,9 +385,8 @@ async def create_job_endpoint(
             detail=f"Agent '{target_agent}' does not support one-shot jobs",
         )
 
-    raw_effort = effort or settings.default_effort
     resolved_model = resolve_model(target_agent, model) if model else None
-    resolved_effort = resolve_effort(raw_effort) if raw_effort else None
+    resolved_effort = resolve_effort(effort) if effort else None
 
     if model and model != resolved_model:
         logger.info(
@@ -802,6 +804,24 @@ async def _read_bounded_form_uploads(
                     pass
 
 
+async def _close_form_files(form: Any) -> None:
+    for _, field_value in form.multi_items():
+        if hasattr(field_value, "close"):
+            try:
+                await field_value.close()
+            except Exception:
+                pass
+
+
+def _session_tenant(auth: AuthContext) -> Optional[str]:
+    """Return None (unscoped) strictly when caller has 'admin' scope; never map a non-admin key named 'bypass' to unscoped."""
+    if "admin" in auth.scopes:
+        return None
+    if auth.name == "bypass":
+        return "__nonadmin_key_bypass__"
+    return auth.name
+
+
 def _suppress_bg_task_exc(task: asyncio.Task) -> None:
     if not task.cancelled():
         task.exception()
@@ -832,46 +852,49 @@ async def create_session_endpoint(
             max_file_bytes=settings.max_attachment_bytes,
             max_total_bytes=settings.max_total_bytes,
         )
-        agent_name = _extract_scalar_form_str(form, "agent")
-        prompt = _extract_scalar_form_str(form, "prompt")
-        model = _extract_scalar_form_str(form, "model")
-        effort = _extract_scalar_form_str(form, "effort")
-        idle_raw = _extract_scalar_form_str(form, "idle_timeout")
-        if idle_raw is not None:
-            try:
-                idle_timeout = int(idle_raw)
-            except ValueError:
-                pass
-        turn_raw = _extract_scalar_form_str(form, "turn_timeout")
-        if turn_raw is not None:
-            try:
-                turn_timeout = int(turn_raw)
-            except ValueError:
-                pass
-        max_life_raw = _extract_scalar_form_str(form, "max_lifetime")
-        if max_life_raw is not None:
-            try:
-                max_lifetime = int(max_life_raw)
-            except ValueError:
-                pass
-        wait_raw = _extract_scalar_form_str(form, "wait")
-        if wait_raw is not None:
-            try:
-                wait_time = int(wait_raw)
-            except ValueError:
-                pass
-        meta_raw = _extract_scalar_form_str(form, "metadata")
-        if meta_raw:
-            try:
-                metadata = json.loads(meta_raw)
-            except Exception:
-                pass
+        try:
+            agent_name = _extract_scalar_form_str(form, "agent")
+            prompt = _extract_scalar_form_str(form, "prompt")
+            model = _extract_scalar_form_str(form, "model")
+            effort = _extract_scalar_form_str(form, "effort")
+            idle_raw = _extract_scalar_form_str(form, "idle_timeout")
+            if idle_raw is not None:
+                try:
+                    idle_timeout = int(idle_raw)
+                except ValueError:
+                    pass
+            turn_raw = _extract_scalar_form_str(form, "turn_timeout")
+            if turn_raw is not None:
+                try:
+                    turn_timeout = int(turn_raw)
+                except ValueError:
+                    pass
+            max_life_raw = _extract_scalar_form_str(form, "max_lifetime")
+            if max_life_raw is not None:
+                try:
+                    max_lifetime = int(max_life_raw)
+                except ValueError:
+                    pass
+            wait_raw = _extract_scalar_form_str(form, "wait")
+            if wait_raw is not None:
+                try:
+                    wait_time = int(wait_raw)
+                except ValueError:
+                    pass
+            meta_raw = _extract_scalar_form_str(form, "metadata")
+            if meta_raw:
+                try:
+                    metadata = json.loads(meta_raw)
+                except Exception:
+                    pass
 
-        attachments_input = await _read_bounded_form_uploads(
-            form,
-            max_file_bytes=settings.max_attachment_bytes,
-            max_total_bytes=settings.max_total_bytes,
-        )
+            attachments_input = await _read_bounded_form_uploads(
+                form,
+                max_file_bytes=settings.max_attachment_bytes,
+                max_total_bytes=settings.max_total_bytes,
+            )
+        finally:
+            await _close_form_files(form)
     else:
         try:
             body = await request.json() if await request.body() else {}
@@ -994,6 +1017,24 @@ async def create_session_endpoint(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Attachment error: {att_err}",
                     )
+                except HTTPException:
+                    raise
+                except Exception as init_err:
+                    if live_session.closing or not session_manager.is_session_active(live_session.id):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Session '{live_session.id}' was closed or expired while initializing attachments",
+                        )
+                    await session_manager.close_session(
+                        live_session.id,
+                        reason="failed",
+                        error=str(init_err),
+                        db_path=settings.db_path,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Attachment initialization failed: {init_err}",
+                    )
 
         if not session_manager.is_session_active(live_session.id):
             raise HTTPException(
@@ -1067,7 +1108,7 @@ async def session_message_endpoint(
     auth: AuthContext = Depends(require_scope("jobs")),
 ):
     settings = get_settings()
-    tenant = "bypass" if "admin" in auth.scopes else auth.name
+    tenant = _session_tenant(auth)
     sess_row = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
     if not sess_row:
         raise HTTPException(
@@ -1096,26 +1137,29 @@ async def session_message_endpoint(
             max_total_bytes=settings.max_total_bytes,
             initial_total=initial_bytes,
         )
-        prompt = _extract_scalar_form_str(form, "prompt", default="") or ""
-        turn_raw = _extract_scalar_form_str(form, "turn_timeout")
-        if turn_raw is not None:
-            try:
-                turn_timeout = int(turn_raw)
-            except ValueError:
-                pass
-        wait_raw = _extract_scalar_form_str(form, "wait")
-        if wait_raw is not None:
-            try:
-                wait_time = int(wait_raw)
-            except ValueError:
-                pass
+        try:
+            prompt = _extract_scalar_form_str(form, "prompt", default="") or ""
+            turn_raw = _extract_scalar_form_str(form, "turn_timeout")
+            if turn_raw is not None:
+                try:
+                    turn_timeout = int(turn_raw)
+                except ValueError:
+                    pass
+            wait_raw = _extract_scalar_form_str(form, "wait")
+            if wait_raw is not None:
+                try:
+                    wait_time = int(wait_raw)
+                except ValueError:
+                    pass
 
-        attachments_input = await _read_bounded_form_uploads(
-            form,
-            max_file_bytes=settings.max_attachment_bytes,
-            max_total_bytes=settings.max_total_bytes,
-            initial_total=initial_bytes,
-        )
+            attachments_input = await _read_bounded_form_uploads(
+                form,
+                max_file_bytes=settings.max_attachment_bytes,
+                max_total_bytes=settings.max_total_bytes,
+                initial_total=initial_bytes,
+            )
+        finally:
+            await _close_form_files(form)
     else:
         try:
             body = await request.json() if await request.body() else {}
@@ -1198,12 +1242,12 @@ async def session_message_endpoint(
 async def get_session_endpoint(
     session_id: str,
     include_turns: bool = Query(default=False),
-    after_turn: Optional[int] = Query(default=None, ge=0),
+    after_turn: Optional[int] = Query(default=None, ge=0, le=(2**63 - 1)),
     turns_limit: int = Query(default=100, ge=1, le=500),
     auth: AuthContext = Depends(require_scope("jobs")),
 ):
     settings = get_settings()
-    tenant = "bypass" if "admin" in auth.scopes else auth.name
+    tenant = _session_tenant(auth)
     sess = get_session(session_id, db_path=settings.db_path, api_key_name=tenant)
     if not sess:
         raise HTTPException(
@@ -1214,7 +1258,8 @@ async def get_session_endpoint(
     _enrich_session_expiry(sess)
 
     if include_turns:
-        fetched = list_session_turns(
+        fetched = await asyncio.to_thread(
+            list_session_turns,
             session_id,
             db_path=settings.db_path,
             api_key_name=tenant,
@@ -1237,7 +1282,7 @@ async def list_sessions_endpoint(
     auth: AuthContext = Depends(require_scope("jobs")),
 ):
     settings = get_settings()
-    tenant = "bypass" if "admin" in auth.scopes else auth.name
+    tenant = _session_tenant(auth)
     sessions = list_sessions(
         status=status_filter,
         limit=limit,
@@ -1255,7 +1300,12 @@ async def delete_session_endpoint(
     auth: AuthContext = Depends(verify_api_key),
 ):
     settings = get_settings()
-    tenant_filter = check_job_modify_auth(auth)
+    if "admin" not in auth.scopes and "jobs" not in auth.scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Missing required scope ('jobs' or 'admin')",
+        )
+    tenant_filter = _session_tenant(auth)
     sess = get_session(session_id, db_path=settings.db_path, api_key_name=tenant_filter)
     if not sess:
         raise HTTPException(

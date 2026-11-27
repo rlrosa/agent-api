@@ -493,6 +493,19 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
     return result
 
 
+def validate_distinct_work_roots(work_root: str, session_work_root: str) -> None:
+    """Reject equal or nested WORK_ROOT and SESSION_WORK_ROOT so neither sweeper touches the other's tree."""
+    real_jobs = os.path.realpath(os.path.abspath(work_root))
+    real_sess = os.path.realpath(os.path.abspath(session_work_root))
+    if real_jobs == real_sess:
+        raise ValueError(f"WORK_ROOT and SESSION_WORK_ROOT must be distinct (both resolve to '{real_jobs}')")
+    common = os.path.commonpath([real_jobs, real_sess])
+    if common in (real_jobs, real_sess):
+        raise ValueError(
+            f"WORK_ROOT ('{real_jobs}') and SESSION_WORK_ROOT ('{real_sess}') must not be nested inside each other"
+        )
+
+
 def sweep_orphaned_workspaces(
     work_root: Optional[str] = None,
     db_path: Optional[str] = None,
@@ -500,6 +513,7 @@ def sweep_orphaned_workspaces(
 ) -> int:
     settings = get_settings()
     root = work_root or settings.work_root
+    validate_distinct_work_roots(root, settings.session_work_root)
     if not os.path.exists(root):
         return 0
 

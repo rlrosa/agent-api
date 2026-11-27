@@ -49,12 +49,14 @@ def _parse_entry(entry: str) -> Optional[Tuple[str, str, Set[str]]]:
     parts = entry.split(":")
     if len(parts) == 2:
         name, secret = parts[0].strip(), parts[1].strip()
-        if not name or not secret:
+        if not name or not secret or name == "bypass":
             return None
         return name, secret, set(DEFAULT_SCOPES)
 
     # len(parts) >= 3
     name = parts[0].strip()
+    if not name or name == "bypass":
+        return None
     last_segment = parts[-1].strip()
 
     if re.match(r"^[a-z+]+$", last_segment):

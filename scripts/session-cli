@@ -148,7 +148,10 @@ def encode_attachments(file_paths: List[str]) -> List[Dict[str, str]]:
 def format_turn_footer(sess: Dict[str, Any], elapsed_s: float) -> str:
     sid = (sess.get("id") or "")[:8]
     turn = sess.get("latest_turn") or {}
-    t_idx = sess.get("turn_count", "?")
+    raw_turn_idx = turn.get("turn_index")
+    t_label = str(int(raw_turn_idx) + 1) if raw_turn_idx is not None else str(sess.get("turn_count", "?"))
+    total_turns = sess.get("turn_count")
+    turn_field = f"turn={t_label}/{total_turns}" if (raw_turn_idx is not None and total_turns is not None and int(raw_turn_idx) + 1 != int(total_turns)) else f"turn={t_label}"
     in_t = turn.get("input_tokens")
     cache_t = turn.get("cached_tokens")
     out_t = turn.get("output_tokens")
@@ -159,7 +162,7 @@ def format_turn_footer(sess: Dict[str, Any], elapsed_s: float) -> str:
     parts = [
         f"session={sid}",
         f"model={sess.get('model') or sess.get('agent')}",
-        f"turn={t_idx}",
+        turn_field,
         f"{elapsed_s:.2f}s",
         f"in={in_t} cached={cache_t} out={out_t}",
     ]
@@ -362,13 +365,10 @@ def cmd_history(state: Dict[str, Any]) -> int:
     if not sid:
         warn("No cached session_id.")
         return 0
-    code, sess = api_request(
-        state["url"], state["api_key"], "GET", f"/v1/sessions/{sid}?include_turns=true", timeout=15.0
-    )
+    code, sess, turns = _fetch_all_session_turns(state, sid)
     if code != 200:
         err_print(f"[error HTTP {code}] {sess.get('detail') or sess}")
         return 1
-    turns = sess.get("turns") or []
     print(_c("1;34", f"=== Session {sid} ({sess.get('status')}, {len(turns)} turns) ===", IS_TTY_OUT))
     for t in turns:
         idx = t.get("turn_index", 0) + 1
@@ -379,6 +379,17 @@ def cmd_history(state: Dict[str, Any]) -> int:
             print((t.get("response") or "").rstrip("\n"))
         else:
             print(f"[FAILED: {t.get('error')}]")
+    return 0
+
+
+def cmd_forget(state: Dict[str, Any], state_path: str) -> int:
+    sid = state.get("session_id")
+    if not sid:
+        info("No cached session_id to forget.")
+        return 0
+    state["session_id"] = None
+    save_state(state_path, state)
+    info(f"[forgot] Cleared local cached session {sid[:8]} without contacting server.")
     return 0
 
 
@@ -393,7 +404,10 @@ def cmd_close(state: Dict[str, Any], state_path: str) -> int:
         save_state(state_path, state)
         info(f"[closed] Session {sid[:8]} closed and workspace reaped.")
         return 0
-    err_print(f"[error HTTP {code}] Failed to close session {sid[:8]} (keeping cached session_id): {data.get('detail') or data}")
+    err_print(
+        f"[error HTTP {code}] Failed to close session {sid[:8]} (keeping cached session_id; use --forget or /forget to clear locally): "
+        f"{data.get('detail') or data}"
+    )
     return 1
 
 
@@ -414,7 +428,8 @@ def ensure_warm_idle_session(state: Dict[str, Any], state_path: str) -> Optional
             save_state(state_path, state)
         else:
             err_print(
-                f"[error HTTP {code}] Cannot verify cached session {sid[:8]} (keeping cached session_id): {sdata.get('detail') or sdata}"
+                f"[error HTTP {code}] Cannot verify cached session {sid[:8]} (keeping cached session_id; use --forget or /forget to clear locally): "
+                f"{sdata.get('detail') or sdata}"
             )
             return None
 
@@ -477,6 +492,7 @@ def run_repl(state: Dict[str, Any], state_path: str) -> int:
                 "  /attach <path> <prompt>         Upload a local file with your prompt\n"
                 "  /new [agent] [model] [effort]   Close current session and spawn a fresh one\n"
                 "  /close                          Close the remote session and reap its workspace\n"
+                "  /forget                         Clear only the local cached session_id without calling server\n"
                 "  /quit                           Exit REPL while leaving the session warm"
             )
             continue
@@ -487,6 +503,10 @@ def run_repl(state: Dict[str, Any], state_path: str) -> int:
 
         if line == "/history":
             cmd_history(state)
+            continue
+
+        if line == "/forget":
+            cmd_forget(state, state_path)
             continue
 
         if line == "/close":
@@ -544,6 +564,7 @@ def main() -> int:
     parser.add_argument("--status", action="store_true", help="Show server & cached session status")
     parser.add_argument("--history", action="store_true", help="Print full turn history of cached session")
     parser.add_argument("--close", action="store_true", help="Close cached session on server and clear session_id")
+    parser.add_argument("--forget", action="store_true", help="Clear only local cached session_id without calling server")
     parser.add_argument("--save-config", action="store_true", help="Persist --url/--key/--agent/--model/--effort into state file")
 
     args = parser.parse_args()
@@ -566,11 +587,13 @@ def main() -> int:
 
     if args.save_config:
         save_state(state_path, state)
-        if not (args.prompt or args.status or args.history or args.close or args.new):
+        if not (args.prompt or args.status or args.history or args.close or args.forget or args.new):
             info(f"[saved] Configuration persisted to {state_path}")
             return 0
 
     try:
+        if args.forget:
+            return cmd_forget(state, state_path)
         if args.close:
             return cmd_close(state, state_path)
         if args.status:

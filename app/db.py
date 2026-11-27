@@ -1007,3 +1007,120 @@ def purge_old_sessions(before_ts: float, db_path: Optional[str] = None) -> int:
 
 
 
+
+from typing import Tuple as _Tuple
+
+
+def complete_turn_and_update_session(
+    turn_id: str,
+    turn_status: str,
+    session_id: str,
+    *,
+    response: Optional[str] = None,
+    stderr: Optional[str] = None,
+    turn_error: Optional[str] = None,
+    turn_input_tokens: Optional[int] = None,
+    turn_output_tokens: Optional[int] = None,
+    turn_cached_tokens: Optional[int] = None,
+    turn_total_tokens: Optional[int] = None,
+    turn_cost_usd: Optional[float] = None,
+    session_status: Optional[str] = None,
+    upstream_conversation_id: Optional[str] = None,
+    turn_count: Optional[int] = None,
+    total_attachment_bytes: Optional[int] = None,
+    cum_input_tokens: Optional[int] = None,
+    cum_output_tokens: Optional[int] = None,
+    cum_cached_tokens: Optional[int] = None,
+    cum_total_tokens: Optional[int] = None,
+    cum_cost_usd: Optional[float] = None,
+    session_error: Any = _UNSET,
+    last_active_at: Optional[float] = None,
+    db_path: Optional[str] = None,
+) -> _Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Atomically persist both the completed/failed turn row and updated session totals in one SQLite transaction."""
+    path = _get_db_path(db_path)
+    end_time = time.time()
+
+    sess_updates: List[str] = []
+    sess_params: List[Any] = []
+    if session_status is not None:
+        sess_updates.append("status = ?")
+        sess_params.append(session_status)
+    if upstream_conversation_id is not None:
+        sess_updates.append("upstream_conversation_id = ?")
+        sess_params.append(upstream_conversation_id)
+    if turn_count is not None:
+        sess_updates.append("turn_count = ?")
+        sess_params.append(turn_count)
+    if total_attachment_bytes is not None:
+        sess_updates.append("total_attachment_bytes = ?")
+        sess_params.append(total_attachment_bytes)
+    if cum_input_tokens is not None:
+        sess_updates.append("input_tokens = ?")
+        sess_params.append(cum_input_tokens)
+    if cum_output_tokens is not None:
+        sess_updates.append("output_tokens = ?")
+        sess_params.append(cum_output_tokens)
+    if cum_cached_tokens is not None:
+        sess_updates.append("cached_tokens = ?")
+        sess_params.append(cum_cached_tokens)
+    if cum_total_tokens is not None:
+        sess_updates.append("total_tokens = ?")
+        sess_params.append(cum_total_tokens)
+    if cum_cost_usd is not None:
+        sess_updates.append("cost_usd = ?")
+        sess_params.append(cum_cost_usd)
+    if session_error is not _UNSET:
+        sess_updates.append("error = ?")
+        sess_params.append(session_error)
+    if last_active_at is not None:
+        sess_updates.append("last_active_at = ?")
+        sess_params.append(last_active_at)
+
+    with _db_lock:
+        with _connect(path) as conn:
+            t_cur = conn.execute(
+                """
+                UPDATE session_turns
+                SET status = ?,
+                    response = ?,
+                    stderr = ?,
+                    error = ?,
+                    finished_at = ?,
+                    input_tokens = ?,
+                    output_tokens = ?,
+                    cached_tokens = ?,
+                    total_tokens = ?,
+                    cost_usd = ?
+                WHERE id = ?
+                RETURNING *;
+                """,
+                (
+                    turn_status,
+                    response,
+                    stderr,
+                    turn_error,
+                    end_time,
+                    turn_input_tokens,
+                    turn_output_tokens,
+                    turn_cached_tokens,
+                    turn_total_tokens,
+                    turn_cost_usd,
+                    turn_id,
+                ),
+            )
+            turn_row = t_cur.fetchone()
+
+            if sess_updates:
+                sess_params.append(session_id)
+                s_cur = conn.execute(
+                    f"UPDATE sessions SET {', '.join(sess_updates)} WHERE id = ? RETURNING *;",
+                    tuple(sess_params),
+                )
+                sess_row = s_cur.fetchone()
+            else:
+                s_cur = conn.execute("SELECT * FROM sessions WHERE id = ?;", (session_id,))
+                sess_row = s_cur.fetchone()
+
+            conn.commit()
+            return _row_to_dict(turn_row), _row_to_dict(sess_row)

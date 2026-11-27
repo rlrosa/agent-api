@@ -398,6 +398,16 @@ async function waitForTurnResult(sessionId, data) {
   throw new Error("Timed out polling for session turn completion");
 }
 
+async function extractSessionReply(sessionId, res) {
+  if (res.status === 201) {
+    return "Attachment saved to session — send a prompt to analyze it.";
+  }
+  if (res.status === 202) {
+    return await waitForTurnResult(sessionId, res.data);
+  }
+  return res.data.latest_turn.response;
+}
+
 async function handleUserMessage(chatId, text, mediaAttachment) {
   let sessionId = await cache.get(`session:${chatId}`);
 
@@ -412,9 +422,7 @@ async function handleUserMessage(chatId, text, mediaAttachment) {
     });
     sessionId = res.data.id;
     await cache.set(`session:${chatId}`, sessionId, 15 * 60); // 15m TTL
-    return res.status === 202
-      ? await waitForTurnResult(sessionId, res.data)
-      : res.data.latest_turn.response;
+    return await extractSessionReply(sessionId, res);
   }
 
   // 2. Subsequent turn: send message to existing session
@@ -424,9 +432,7 @@ async function handleUserMessage(chatId, text, mediaAttachment) {
       attachments: mediaAttachment ? [mediaAttachment] : []
     });
     await cache.expire(`session:${chatId}`, 15 * 60); // refresh TTL
-    return res.status === 202
-      ? await waitForTurnResult(sessionId, res.data)
-      : res.data.latest_turn.response;
+    return await extractSessionReply(sessionId, res);
   } catch (err) {
     if (err.response && err.response.status === 409) {
       // 3. Session expired or closed: seamlessly start a fresh session
@@ -438,9 +444,7 @@ async function handleUserMessage(chatId, text, mediaAttachment) {
         attachments: mediaAttachment ? [mediaAttachment] : []
       });
       await cache.set(`session:${chatId}`, freshRes.data.id, 15 * 60);
-      return freshRes.status === 202
-        ? await waitForTurnResult(freshRes.data.id, freshRes.data)
-        : freshRes.data.latest_turn.response;
+      return await extractSessionReply(freshRes.data.id, freshRes);
     }
     throw err;
   }

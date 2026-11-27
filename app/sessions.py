@@ -15,7 +15,9 @@ from app.agents import AGENTS, resolve_effective_session_model, strip_model_tier
 from app.attachments import compose_prompt, materialize_attachment
 from app.config import Settings, get_settings
 from app.db import (
+    _UNSET,
     close_session_row,
+    complete_turn_and_update_session,
     create_session_row,
     create_session_turn,
     finish_session_turn,
@@ -28,6 +30,7 @@ from app.ratelimit import is_rate_limit_error, rate_limit_manager
 from app.runner import (
     UNREADABLE_ATTACHMENT_PATTERNS,
     build_scrubbed_env,
+    validate_distinct_work_roots,
     wrap_cmd_with_bwrap,
 )
 
@@ -138,36 +141,57 @@ class AgyStreamDriver:
                 usage = res_dict.get("usage")
                 if usage is not None and not isinstance(usage, dict):
                     raise ValueError(f"Expected dict in agy usage, got {type(usage).__name__}")
-                usage = usage or {}
-                cum_input = usage.get("input_tokens", 0) or 0
-                cum_output = usage.get("output_tokens", 0) or 0
-                cum_cached = (
-                    usage.get("cache_read_tokens")
-                    or usage.get("cache_read_input_tokens")
-                    or usage.get("cached_tokens", 0)
-                ) or 0
-                cum_total = usage.get("total_tokens") or (cum_input + cum_output) or 0
+                if usage is None:
+                    new_cum_usage = {
+                        "input_tokens": prev_cum_usage.get("input_tokens", 0),
+                        "output_tokens": prev_cum_usage.get("output_tokens", 0),
+                        "cached_tokens": prev_cum_usage.get("cached_tokens", 0),
+                        "total_tokens": prev_cum_usage.get("total_tokens", 0),
+                    }
+                    turn_usage = {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cached_tokens": 0,
+                        "total_tokens": 0,
+                    }
+                    turn_cost = None
+                    cum_cost = compute_cost(
+                        model,
+                        new_cum_usage["input_tokens"],
+                        new_cum_usage["output_tokens"],
+                        new_cum_usage["total_tokens"],
+                        settings.model_prices,
+                    )
+                else:
+                    cum_input = usage.get("input_tokens", 0) or 0
+                    cum_output = usage.get("output_tokens", 0) or 0
+                    cum_cached = (
+                        usage.get("cache_read_tokens")
+                        or usage.get("cache_read_input_tokens")
+                        or usage.get("cached_tokens", 0)
+                    ) or 0
+                    cum_total = usage.get("total_tokens") or (cum_input + cum_output) or 0
 
-                turn_input = max(0, cum_input - prev_cum_usage.get("input_tokens", 0))
-                turn_output = max(0, cum_output - prev_cum_usage.get("output_tokens", 0))
-                turn_cached = max(0, cum_cached - prev_cum_usage.get("cached_tokens", 0))
-                turn_total = max(0, cum_total - prev_cum_usage.get("total_tokens", 0))
+                    turn_input = max(0, cum_input - prev_cum_usage.get("input_tokens", 0))
+                    turn_output = max(0, cum_output - prev_cum_usage.get("output_tokens", 0))
+                    turn_cached = max(0, cum_cached - prev_cum_usage.get("cached_tokens", 0))
+                    turn_total = max(0, cum_total - prev_cum_usage.get("total_tokens", 0))
 
-                new_cum_usage = {
-                    "input_tokens": cum_input,
-                    "output_tokens": cum_output,
-                    "cached_tokens": cum_cached,
-                    "total_tokens": cum_total,
-                }
-                turn_usage = {
-                    "input_tokens": turn_input,
-                    "output_tokens": turn_output,
-                    "cached_tokens": turn_cached,
-                    "total_tokens": turn_total,
-                }
+                    new_cum_usage = {
+                        "input_tokens": cum_input,
+                        "output_tokens": cum_output,
+                        "cached_tokens": cum_cached,
+                        "total_tokens": cum_total,
+                    }
+                    turn_usage = {
+                        "input_tokens": turn_input,
+                        "output_tokens": turn_output,
+                        "cached_tokens": turn_cached,
+                        "total_tokens": turn_total,
+                    }
 
-                turn_cost = compute_cost(model, turn_input, turn_output, turn_total, settings.model_prices)
-                cum_cost = compute_cost(model, cum_input, cum_output, cum_total, settings.model_prices)
+                    turn_cost = compute_cost(model, turn_input, turn_output, turn_total, settings.model_prices)
+                    cum_cost = compute_cost(model, cum_input, cum_output, cum_total, settings.model_prices)
 
                 return {
                     "conversation_id": conv_id,
@@ -394,6 +418,23 @@ async def _drain_stderr(
         logger.debug(f"stderr drain finished: {exc}")
 
 
+def _close_proc_pipes(proc: asyncio.subprocess.Process) -> None:
+    try:
+        if proc.stdin is not None and not proc.stdin.is_closing():
+            proc.stdin.close()
+    except Exception:
+        pass
+    proc_transport = getattr(proc, "_transport", None)
+    if proc_transport is not None:
+        for fd_num in (0, 1, 2):
+            try:
+                pipe_tr = proc_transport.get_pipe_transport(fd_num)
+                if pipe_tr is not None:
+                    pipe_tr.close()
+            except Exception:
+                pass
+
+
 async def _terminate_and_reap_proc(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is not None:
         return
@@ -402,14 +443,20 @@ async def _terminate_and_reap_proc(proc: asyncio.subprocess.Process) -> None:
         os.killpg(pgid, signal.SIGTERM)
         await asyncio.sleep(0.2)
         if proc.returncode is None:
+            _close_proc_pipes(proc)
             os.killpg(pgid, signal.SIGKILL)
-        await proc.wait()
+        await asyncio.wait_for(proc.wait(), timeout=2.0)
     except ProcessLookupError:
-        pass
+        _close_proc_pipes(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=0.5)
+        except Exception:
+            pass
     except Exception:
+        _close_proc_pipes(proc)
         try:
             proc.kill()
-            await proc.wait()
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
         except Exception:
             pass
 
@@ -453,6 +500,7 @@ class SessionManager:
     async def start(self):
         current_loop = asyncio.get_running_loop()
         settings = get_settings()
+        validate_distinct_work_roots(settings.work_root, settings.session_work_root)
         reset_count = reset_orphan_sessions(settings.db_path)
         if reset_count > 0:
             logger.info(f"Startup session sweep: reset {reset_count} orphaned sessions to closed")
@@ -526,6 +574,20 @@ class SessionManager:
                     if closed is not None:
                         logger.info(f"Session '{sid}' expired ({why}); reaped")
 
+                # Retry cleanup of any child that survived an earlier close attempt
+                async with self.lock:
+                    surviving = [
+                        (sid, proc)
+                        for sid, proc in list(self._unreaped_procs.items())
+                        if sid not in self._sessions and sid not in self._closing
+                    ]
+                for sid, proc in surviving:
+                    if proc.returncode is None:
+                        await _terminate_and_reap_proc(proc)
+                    if proc.returncode is not None:
+                        async with self.lock:
+                            self._unreaped_procs.pop(sid, None)
+
             except asyncio.CancelledError:
                 logger.debug("Idle reaper loop cancelled")
                 break
@@ -548,6 +610,7 @@ class SessionManager:
         db_path: Optional[str] = None,
     ) -> LiveSession:
         settings = get_settings()
+        validate_distinct_work_roots(settings.work_root, settings.session_work_root)
 
         async with self.lock:
             if self.active_session_count() >= settings.max_active_sessions:
@@ -748,10 +811,7 @@ class SessionManager:
                         detail=f"Session turn queue full (max {settings.max_queued_turns_per_session})",
                         headers={"Retry-After": "5"},
                     )
-                live.queued_waiters += 1
-                live.last_active_at = now
                 reserved_idx = live.next_turn_index
-                live.next_turn_index += 1
                 turn_row = create_session_turn(
                     session_id=session_id,
                     turn_index=reserved_idx,
@@ -759,6 +819,9 @@ class SessionManager:
                     status="running",
                     db_path=db_path,
                 )
+                live.queued_waiters += 1
+                live.last_active_at = now
+                live.next_turn_index = reserved_idx + 1
                 return live, turn_row
 
         if expired_live is not None:
@@ -931,6 +994,37 @@ class SessionManager:
                                 status_code=status.HTTP_400_BAD_REQUEST,
                                 detail=f"Attachment error: {att_err}",
                             )
+                        except OSError as storage_err:
+                            _rollback_turn_uploads(live, saved_this_turn)
+                            saved_this_turn.clear()
+                            bounded_io_err = _truncate_diag(f"Attachment storage error: {storage_err}", MAX_AUTH_DIAG_CHARS)
+                            finish_session_turn(
+                                turn_id=turn_id,
+                                status="failed",
+                                error=bounded_io_err,
+                                db_path=db_path,
+                            )
+                            if not live.closing and live.status not in ("closed", "expired", "failed"):
+                                live.status = "idle"
+                                now_idle = time.time()
+                                live.last_active_at = now_idle
+                                update_session_state(
+                                    session_id,
+                                    status="idle",
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    last_active_at=now_idle,
+                                    db_path=db_path,
+                                )
+                            else:
+                                update_session_state(
+                                    session_id,
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    db_path=db_path,
+                                )
+                            raise HTTPException(
+                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=bounded_io_err,
+                            )
 
                         for fp, _ in saved_this_turn:
                             live.managed_attachments.add(fp)
@@ -960,6 +1054,19 @@ class SessionManager:
                             live.status = "failed"
                             await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
                             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
+
+                    if (time.time() - live.created_at) >= live.max_lifetime:
+                        finish_session_turn(
+                            turn_id=turn_id,
+                            status="failed",
+                            error="Session max_lifetime reached before prompt send",
+                            db_path=db_path,
+                        )
+                        await self.close_session(session_id, reason="expired", db_path=db_path)
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Session '{session_id}' is expired and cannot accept new messages",
+                        )
 
                     composed_prompt = compose_prompt(prompt, attachment_filenames, workspace_path=live.workspace_path)
                     input_bytes = live.driver.format_prompt(composed_prompt)
@@ -1135,51 +1242,53 @@ class SessionManager:
                         live.upstream_conversation_id = result_data["conversation_id"]
 
                     turn_status = "completed" if is_success else "failed"
-                    finished_turn = finish_session_turn(
-                        turn_id=turn_id,
-                        status=turn_status,
-                        response=response_text if is_success else None,
-                        stderr=bounded_stderr,
-                        error=err_text,
-                        input_tokens=turn_usage.get("input_tokens"),
-                        output_tokens=turn_usage.get("output_tokens"),
-                        cached_tokens=turn_usage.get("cached_tokens"),
-                        total_tokens=turn_usage.get("total_tokens"),
-                        cost_usd=turn_cost,
-                        db_path=db_path,
-                    )
-
                     now_finish = time.time()
                     live.last_active_at = now_finish
-                    if not live.closing and live.status not in ("closed", "expired", "failed"):
+                    session_open = not live.closing and live.status not in ("closed", "expired", "failed")
+                    if session_open:
                         live.status = "idle"
-                        updated_session = update_session_state(
+
+                    try:
+                        finished_turn, updated_session = complete_turn_and_update_session(
+                            turn_id=turn_id,
+                            turn_status=turn_status,
                             session_id=session_id,
-                            status="idle",
+                            response=response_text if is_success else None,
+                            stderr=bounded_stderr,
+                            turn_error=err_text,
+                            turn_input_tokens=turn_usage.get("input_tokens"),
+                            turn_output_tokens=turn_usage.get("output_tokens"),
+                            turn_cached_tokens=turn_usage.get("cached_tokens"),
+                            turn_total_tokens=turn_usage.get("total_tokens"),
+                            turn_cost_usd=turn_cost,
+                            session_status="idle" if session_open else None,
                             upstream_conversation_id=live.upstream_conversation_id,
                             turn_count=live.turn_count,
                             total_attachment_bytes=live.total_attachment_bytes,
-                            input_tokens=cum_usage.get("input_tokens"),
-                            output_tokens=cum_usage.get("output_tokens"),
-                            cached_tokens=cum_usage.get("cached_tokens"),
-                            total_tokens=cum_usage.get("total_tokens"),
-                            cost_usd=cum_cost,
-                            error=err_text if not is_success else None,
-                            last_active_at=now_finish,
+                            cum_input_tokens=cum_usage.get("input_tokens"),
+                            cum_output_tokens=cum_usage.get("output_tokens"),
+                            cum_cached_tokens=cum_usage.get("cached_tokens"),
+                            cum_total_tokens=cum_usage.get("total_tokens"),
+                            cum_cost_usd=cum_cost,
+                            session_error=(err_text if not is_success else None) if session_open else _UNSET,
+                            last_active_at=now_finish if session_open else None,
                             db_path=db_path,
                         )
-                    else:
-                        updated_session = update_session_state(
-                            session_id=session_id,
-                            upstream_conversation_id=live.upstream_conversation_id,
-                            turn_count=live.turn_count,
-                            total_attachment_bytes=live.total_attachment_bytes,
-                            input_tokens=cum_usage.get("input_tokens"),
-                            output_tokens=cum_usage.get("output_tokens"),
-                            cached_tokens=cum_usage.get("cached_tokens"),
-                            total_tokens=cum_usage.get("total_tokens"),
-                            cost_usd=cum_cost,
-                            db_path=db_path,
+                    except Exception as persist_err:
+                        persist_msg = _truncate_diag(f"Failed persisting turn result: {persist_err}", MAX_AUTH_DIAG_CHARS)
+                        logger.error(f"Session {session_id} persistence failure: {persist_msg}", exc_info=True)
+                        live.status = "failed"
+                        try:
+                            finish_session_turn(turn_id=turn_id, status="failed", error=persist_msg, db_path=db_path)
+                        except Exception:
+                            pass
+                        try:
+                            await self.close_session(session_id, reason="failed", error=persist_msg, db_path=db_path)
+                        except Exception:
+                            pass
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=persist_msg,
                         )
 
                     if not is_success:
@@ -1382,6 +1491,7 @@ def sweep_orphaned_session_workspaces(
 ) -> int:
     settings = get_settings()
     root = work_root or settings.session_work_root
+    validate_distinct_work_roots(settings.work_root, root)
     if not os.path.exists(root):
         return 0
 

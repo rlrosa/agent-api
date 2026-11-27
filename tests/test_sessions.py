@@ -730,8 +730,8 @@ def test_workspace_isolation_between_jobs_and_sessions(tmp_path, http_client):
     http_client.delete(f"/v1/sessions/{active_id}", headers={"X-API-Key": "key-alice"})
 
 
-def test_fifo_turn_serialization_and_queue_depth_cap(http_client, monkeypatch):
-    """Test controlled FIFO sequential execution overlap and real queue depth rejection (429)."""
+def test_fifo_turn_serialization_and_queue_depth_cap(http_client, monkeypatch, tmp_path):
+    """Test controlled FIFO sequential execution overlap via test gate and real queue depth rejection (429)."""
     monkeypatch.setenv("MAX_QUEUED_TURNS_PER_SESSION", "2")
     r1 = http_client.post(
         "/v1/sessions",
@@ -740,6 +740,7 @@ def test_fifo_turn_serialization_and_queue_depth_cap(http_client, monkeypatch):
     )
     session_id = r1.json()["id"]
     live = session_manager._sessions[session_id]
+    gate_file = str(tmp_path / "release_turn_zero.gate")
 
     def send_turn(turn_text):
         return http_client.post(
@@ -749,32 +750,36 @@ def test_fifo_turn_serialization_and_queue_depth_cap(http_client, monkeypatch):
         )
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        # Hold Turn 0 active on live.lock
-        f0 = executor.submit(send_turn, "SLOW_TURN:0.55:TurnZero")
-        deadline = time.time() + 2.0
-        while time.time() < deadline and not live.lock.locked():
-            time.sleep(0.01)
-        assert live.lock.locked()
+        # Hold Turn 0 open on a deterministic file gate until after overflow check finishes
+        f0 = executor.submit(send_turn, f"WAIT_GATE:{gate_file}:TurnZero")
+        try:
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not live.lock.locked():
+                time.sleep(0.01)
+            assert live.lock.locked()
 
-        # Submit Turn 1 in known order and wait until queued_waiters == 1
-        f1 = executor.submit(send_turn, "QueuedFirst")
-        deadline = time.time() + 2.0
-        while time.time() < deadline and live.queued_waiters < 1:
-            time.sleep(0.01)
-        assert live.queued_waiters == 1
+            # Submit Turn 1 in known order and wait until queued_waiters == 1
+            f1 = executor.submit(send_turn, "QueuedFirst")
+            deadline = time.time() + 2.0
+            while time.time() < deadline and live.queued_waiters < 1:
+                time.sleep(0.01)
+            assert live.queued_waiters == 1
 
-        # Submit Turn 2 in known order and wait until queued_waiters == 2 (fills MAX_QUEUED_TURNS_PER_SESSION=2)
-        f2 = executor.submit(send_turn, "QueuedSecond")
-        deadline = time.time() + 2.0
-        while time.time() < deadline and live.queued_waiters < 2:
-            time.sleep(0.01)
-        assert live.queued_waiters == 2
+            # Submit Turn 2 in known order and wait until queued_waiters == 2 (fills MAX_QUEUED_TURNS_PER_SESSION=2)
+            f2 = executor.submit(send_turn, "QueuedSecond")
+            deadline = time.time() + 2.0
+            while time.time() < deadline and live.queued_waiters < 2:
+                time.sleep(0.01)
+            assert live.queued_waiters == 2
 
-        # Additional turn while 2 real turns are waiting in queue -> HTTP 429 overflow
-        r_over = send_turn("RejectedOverflow")
-        assert r_over.status_code == 429, r_over.text
-        assert "Session turn queue full" in r_over.json()["detail"]
-        assert r_over.headers.get("Retry-After") == "5"
+            # Additional turn while Turn 0 is gated and 2 real turns wait in queue -> HTTP 429 overflow
+            r_over = send_turn("RejectedOverflow")
+            assert r_over.status_code == 429, r_over.text
+            assert "Session turn queue full" in r_over.json()["detail"]
+            assert r_over.headers.get("Retry-After") == "5"
+        finally:
+            with open(gate_file, "w", encoding="utf-8") as gf:
+                gf.write("go\n")
 
         res0 = f0.result()
         res1 = f1.result()
@@ -783,7 +788,7 @@ def test_fifo_turn_serialization_and_queue_depth_cap(http_client, monkeypatch):
     assert res0.status_code == 200
     assert res1.status_code == 200
     assert res2.status_code == 200
-    assert "Echo [turn 1]: SLOW_TURN:0.55:TurnZero" in res0.json()["latest_turn"]["response"]
+    assert f"Echo [turn 1]: WAIT_GATE:{gate_file}:TurnZero" in res0.json()["latest_turn"]["response"]
     assert "Echo [turn 2]: QueuedFirst" in res1.json()["latest_turn"]["response"]
     assert "Echo [turn 3]: QueuedSecond" in res2.json()["latest_turn"]["response"]
 
@@ -1852,18 +1857,20 @@ async def test_raw_asgi_incremental_multipart_early_rejection(tmp_path, monkeypa
         api_key_name="alice",
         db_path=test_db,
     )
-    live.total_attachment_bytes = 14
-    from app.db import update_session_state
-    update_session_state(live.id, total_attachment_bytes=14, db_path=test_db)
+    try:
+        live.total_attachment_bytes = 14
+        from app.db import update_session_state
+        update_session_state(live.id, total_attachment_bytes=14, db_path=test_db)
 
-    st2, body2, consumed2 = await run_raw_asgi_multipart(
-        f"/v1/sessions/{live.id}/messages",
-        [b"012345", b"6789ab", b"SENTINEL_NEVER_READ" * 100],
-    )
-    assert st2 == 400, body2
-    assert "MAX_TOTAL_BYTES" in body2
-    assert consumed2 is False
-    await session_manager.close_session(live.id, reason="closed", db_path=test_db)
+        st2, body2, consumed2 = await run_raw_asgi_multipart(
+            f"/v1/sessions/{live.id}/messages",
+            [b"012345", b"6789ab", b"SENTINEL_NEVER_READ" * 100],
+        )
+        assert st2 == 400, body2
+        assert "MAX_TOTAL_BYTES" in body2
+        assert consumed2 is False
+    finally:
+        await session_manager.close_session(live.id, reason="closed", db_path=test_db)
 
 
 @pytest.mark.asyncio
@@ -1990,11 +1997,24 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
     assert len(la_doc["turns"][0]["error"] or "") <= 240
 
     # 2. dev-server.sh rejects unsafe group/world-writable STATE_DIR BEFORE reading PID in both start and stop
-    test_port = 18943
-    unsafe_dir = f"/tmp/agent-api-dev-{test_port}"
-    shutil.rmtree(unsafe_dir, ignore_errors=True) if "shutil" in dir() else None
+    # Pick a guaranteed-free port whose /tmp state dir does not already exist so we never disturb an active dev server
     import shutil as _sh
-    _sh.rmtree(unsafe_dir, ignore_errors=True)
+    test_port = None
+    for cand_port in range(28911, 28990):
+        cand_dir = os.path.join("/tmp", f"agent-api-dev-{cand_port}")  # noqa: S108
+        if os.path.exists(cand_dir):
+            continue
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", cand_port))
+            test_port = cand_port
+            break
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    assert test_port is not None
+    unsafe_dir = os.path.join("/tmp", f"agent-api-dev-{test_port}")  # noqa: S108
     os.mkdir(unsafe_dir, 0o777)
     os.chmod(unsafe_dir, 0o777)
     # Put current test process PID in uvicorn.pid — stop MUST refuse unsafe dir and NOT signal us!
@@ -2005,8 +2025,17 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
             res = subprocess.run(["bash", dev_srv, action, str(test_port)], capture_output=True, text=True, check=False)
             assert res.returncode != 0
             assert "refusing" in res.stderr
-        # Also test competing bind on occupied port rejected cleanly
+        # Also test stale/mismatched starttime in PID file is ignored without signaling, and occupied port is rejected
         _sh.rmtree(unsafe_dir, ignore_errors=True)
+        os.mkdir(unsafe_dir, 0o700)
+        pid_f = os.path.join(unsafe_dir, "uvicorn.pid")
+        with open(pid_f, "w") as f:
+            f.write(f"{os.getpid()}:0\n")  # mismatched /proc/<pid>/stat starttime -> must NOT signal os.getpid()!
+        os.chmod(pid_f, 0o600)
+        res_stale = subprocess.run(["bash", dev_srv, "stop", str(test_port)], capture_output=True, text=True, check=False)
+        assert res_stale.returncode == 0
+        assert "No running verified dev-server PID" in res_stale.stdout
+
         occ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         occ.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         occ.bind(("127.0.0.1", test_port))
@@ -2079,6 +2108,43 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
     polled = cli_mod._poll_until_turn_done(state, "sid-1", time.time(), submitted_turn_id="turn-A")
     assert polled is not None
     assert polled["latest_turn"]["response"] == "Exact Turn A"
+    # Footer uses matched turn_index + 1 (1/2) rather than session turn_count (2)
+    footer = cli_mod.format_turn_footer(polled, 1.0)
+    assert "turn=1/2" in footer
+
+    # --forget clears local cached session_id without calling server
+    assert cli_mod.cmd_forget(state, st_path) == 0
+    assert state["session_id"] is None
+    assert json.load(open(st_path))["session_id"] is None
+
+    # 4. Work-root overlap guard, bypass key-name rejection, and DEFAULT_EFFORT non-persistence on jobs
+    from app.runner import validate_distinct_work_roots
+    from app.security import parse_api_keys
+    with pytest.raises(ValueError):
+        validate_distinct_work_roots(str(tmp_path / "same"), str(tmp_path / "same"))
+    with pytest.raises(ValueError):
+        validate_distinct_work_roots(str(tmp_path / "outer"), str(tmp_path / "outer" / "inner"))
+
+    monkeypatch.setenv("API_KEYS", "bypass:evil-secret:jobs,alice:key-alice:jobs")
+    parsed_keys = parse_api_keys()
+    assert "bypass" not in parsed_keys
+
+    monkeypatch.setenv("DEFAULT_EFFORT", "high")
+    r_j_def = http_client.post(
+        "/v1/jobs",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_429", "prompt": "Check job effort row", "wait": 0},
+    )
+    assert r_j_def.status_code in (200, 202)
+    assert r_j_def.json().get("effort") is None
+    monkeypatch.delenv("DEFAULT_EFFORT", raising=False)
+
+    # Oversized after_turn cursor (> SQLite INT64 max) rejected with 422 instead of 500 OverflowError
+    r_ov_cur = http_client.get(
+        f"/v1/sessions/{la_sid}?include_turns=true&after_turn={2**63}",
+        headers={"X-API-Key": "key-alice"},
+    )
+    assert r_ov_cur.status_code == 422
 
 
 

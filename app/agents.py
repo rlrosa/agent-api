@@ -179,9 +179,10 @@ def build_agy_argv(
     cmd = ["agy", "-p", prompt]
 
     resolved_model = resolve_model("agy", model)
-    if effort:
+    eff = effort or get_settings().default_effort
+    if eff:
         base = strip_model_tier(resolved_model)
-        resolved_eff = resolve_effort(effort)
+        resolved_eff = resolve_effort(eff)
         cmd.extend(["--model", base, "--effort", resolved_eff])
     else:
         cmd.extend(["--model", resolved_model])
@@ -211,8 +212,9 @@ def build_claude_argv(
         resolved_model = resolve_model("claude", raw_model)
         cmd.extend(["--model", resolved_model])
 
-    if effort:
-        resolved_eff = resolve_effort(effort)
+    eff = effort or settings.default_effort
+    if eff:
+        resolved_eff = resolve_effort(eff)
         cmd.extend(["--effort", resolved_eff])
 
     cmd.extend(get_agent_flags("claude"))

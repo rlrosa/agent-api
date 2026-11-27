@@ -9,8 +9,8 @@
 #
 # Starts uvicorn via an inherited pre-bound loopback socket (127.0.0.1:<port>) with
 # isolated SQLite DBs and workspaces under /tmp/agent-api-dev-<port> (mode 0700),
-# SSH_CONNECTION=1, and BWRAP_ENABLED=1, and configures ~/.cache/agent-api/session-cli.json
-# (mode 0600) so ./scripts/session-cli talks to it out of the box.
+# flock-serialized startup/stop, pidfd + /proc/<pid>/stat start-time identity checks,
+# SSH_CONNECTION=1, and BWRAP_ENABLED=1.
 
 set -euo pipefail
 
@@ -55,20 +55,22 @@ esac
 validate_port "$PORT"
 
 STATE_DIR="/tmp/agent-api-dev-${PORT}"
+LOCK_FILE="${STATE_DIR}/.lock"
 PID_FILE="${STATE_DIR}/uvicorn.pid"
 LOG_FILE="${STATE_DIR}/uvicorn.log"
 TARGET_URL="http://127.0.0.1:${PORT}"
 
-# Validate any pre-existing STATE_DIR / PID_FILE / LOG_FILE BEFORE reading PIDs or logs in ANY action.
+# Validate STATE_DIR / PID_FILE / LOG_FILE / LOCK_FILE WITHOUT truncating live PID or log files.
 validate_state_dir() {
   local create_mode="${1:-0}"
-  python3 - "$STATE_DIR" "$LOG_FILE" "$PID_FILE" "$create_mode" <<'PY'
+  python3 - "$STATE_DIR" "$LOG_FILE" "$PID_FILE" "$LOCK_FILE" "$create_mode" <<'PY'
 import errno, os, stat, sys
 
-state_dir, log_file, pid_file, create_mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+state_dir, log_file, pid_file, lock_file, create_mode = sys.argv[1:6]
+create_b = create_mode == "1"
 uid = os.getuid()
 
-if create_mode:
+if create_b:
     try:
         os.mkdir(state_dir, 0o700)
     except OSError as e:
@@ -87,7 +89,7 @@ if st.st_uid != uid:
 if (st.st_mode & 0o077) != 0:
     sys.exit(f"error: refusing state directory {state_dir} with group/world permissions ({oct(st.st_mode & 0o777)})")
 
-for existing in (pid_file, log_file):
+for existing in (pid_file, log_file, lock_file):
     try:
         fst = os.lstat(existing)
     except FileNotFoundError:
@@ -96,10 +98,10 @@ for existing in (pid_file, log_file):
         sys.exit(f"error: refusing unsafe file {existing} (symlink or non-regular)")
     if fst.st_uid != uid:
         sys.exit(f"error: refusing file {existing} owned by uid {fst.st_uid} (expected {uid})")
-    if not create_mode and (fst.st_mode & 0o077) != 0:
+    if not create_b and (fst.st_mode & 0o077) != 0:
         sys.exit(f"error: refusing file {existing} with group/world permissions ({oct(fst.st_mode & 0o777)})")
 
-if create_mode:
+if create_b:
     os.chmod(state_dir, 0o700)
     for sub in ("jobs", "sessions"):
         p = os.path.join(state_dir, sub)
@@ -113,22 +115,24 @@ if create_mode:
             sys.exit(f"error: refusing unsafe subdirectory {p}")
         os.chmod(p, 0o700)
 
-    for fpath in (log_file, pid_file):
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(fpath, flags, 0o600)
-        try:
-            fst = os.fstat(fd)
-            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid:
-                sys.exit(f"error: refusing unsafe file {fpath}")
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
+    lfd = os.open(lock_file, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.fchmod(lfd, 0o600)
+    finally:
+        os.close(lfd)
 PY
 }
 
-read_safe_pid() {
+# Read verified PID (matches stored /proc/<pid>/stat starttime if recorded) and confirm process is alive.
+read_verified_live_pid() {
   python3 - "$PID_FILE" <<'PY'
 import os, stat, sys
+
+def proc_starttime(pid: int) -> str:
+    data = open(f"/proc/{pid}/stat", "r", encoding="utf-8").read()
+    after_comm = data.rsplit(")", 1)[1].split()
+    return after_comm[19]
+
 p = sys.argv[1]
 try:
     fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -138,40 +142,112 @@ try:
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or (st.st_mode & 0o077) != 0:
         sys.exit(1)
-    raw = os.read(fd, 64).decode("utf-8", errors="replace").strip()
-    if not raw.isdigit():
-        sys.exit(1)
-    print(raw)
+    raw = os.read(fd, 128).decode("utf-8", errors="replace").strip()
 finally:
     os.close(fd)
+
+if not raw:
+    sys.exit(1)
+parts = raw.split(":", 1)
+if not parts[0].isdigit():
+    sys.exit(1)
+pid = int(parts[0])
+expected_start = parts[1].strip() if len(parts) > 1 else None
+
+try:
+    os.kill(pid, 0)
+    actual_start = proc_starttime(pid)
+except OSError:
+    sys.exit(1)
+
+if expected_start and actual_start != expected_start:
+    sys.exit(1)
+
+print(pid)
 PY
 }
 
 is_running() {
-  local pid
-  pid="$(read_safe_pid 2>/dev/null)" || return 1
-  kill -0 "$pid" 2>/dev/null
+  read_verified_live_pid >/dev/null 2>&1
 }
 
-terminate_pid() {
-  local pid="$1"
-  kill -TERM "$pid" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      return 0
-    fi
-    sleep 0.15
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
-    for _ in $(seq 1 10); do
-      if ! kill -0 "$pid" 2>/dev/null; then
-        return 0
-      fi
-      sleep 0.1
-    done
-  fi
-  ! kill -0 "$pid" 2>/dev/null
+# Identity-safe termination using os.pidfd_open + /proc/<pid>/stat starttime verification.
+terminate_verified_pid_record() {
+  python3 - "$PID_FILE" <<'PY'
+import os, signal, stat, sys, time
+
+def proc_starttime(pid: int) -> str:
+    data = open(f"/proc/{pid}/stat", "r", encoding="utf-8").read()
+    return data.rsplit(")", 1)[1].split()[19]
+
+p = sys.argv[1]
+try:
+    fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    sys.exit(1)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or (st.st_mode & 0o077) != 0:
+        sys.exit(1)
+    raw = os.read(fd, 128).decode("utf-8", errors="replace").strip()
+finally:
+    os.close(fd)
+
+parts = raw.split(":", 1)
+if not parts or not parts[0].isdigit():
+    sys.exit(1)
+pid = int(parts[0])
+expected_start = parts[1].strip() if len(parts) > 1 else None
+
+pidfd = None
+try:
+    if hasattr(os, "pidfd_open"):
+        pidfd = os.pidfd_open(pid, 0)
+    actual_start = proc_starttime(pid)
+except OSError:
+    if pidfd is not None:
+        os.close(pidfd)
+    sys.exit(1)
+
+if expected_start and actual_start != expected_start:
+    if pidfd is not None:
+        os.close(pidfd)
+    sys.exit(1)
+
+def send_sig(sig: int) -> None:
+    if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(pidfd, sig)
+    else:
+        os.kill(pid, sig)
+
+def still_alive() -> bool:
+    try:
+        send_sig(0)
+        return os.path.exists(f"/proc/{pid}/stat") and (not expected_start or proc_starttime(pid) == expected_start)
+    except OSError:
+        return False
+
+try:
+    send_sig(signal.SIGTERM)
+    for _ in range(20):
+        if not still_alive():
+            print(pid)
+            sys.exit(0)
+        time.sleep(0.15)
+    if still_alive():
+        send_sig(signal.SIGKILL)
+        for _ in range(10):
+            if not still_alive():
+                print(pid)
+                sys.exit(0)
+            time.sleep(0.1)
+    if still_alive():
+        sys.exit(2)
+    print(pid)
+finally:
+    if pidfd is not None:
+        os.close(pidfd)
+PY
 }
 
 case "$ACTION" in
@@ -181,25 +257,29 @@ case "$ACTION" in
       exit 1
     fi
 
-    # Validate any pre-existing state directory BEFORE touching PID_FILE
-    validate_state_dir 0
+    validate_state_dir 1
+
+    # Acquire exclusive flock on STATE_DIR/.lock for the entire start sequence
+    exec 9<>"$LOCK_FILE"
+    flock -x 9
+
     if is_running; then
-      echo "dev-server already running on ${TARGET_URL} (PID $(read_safe_pid))"
+      echo "dev-server already running on ${TARGET_URL} (PID $(read_verified_live_pid))"
       exit 0
     fi
-
-    # Create/lock down STATE_DIR, bind 127.0.0.1:<PORT>, and pass the bound socket fd directly to uvicorn (--fd)
-    validate_state_dir 1
 
     DEV_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
 
     NEW_PID="$(
       DEV_KEY="$DEV_KEY" python3 - "$UVICORN_BIN" "$PORT" "$STATE_DIR" "$LOG_FILE" "$PID_FILE" "$REPO_ROOT" <<'PY'
-import os, socket, stat, subprocess, sys
+import os, socket, subprocess, sys
+
+def proc_starttime(pid: int) -> str:
+    data = open(f"/proc/{pid}/stat", "r", encoding="utf-8").read()
+    return data.rsplit(")", 1)[1].split()[19]
 
 uvicorn_bin, port_s, state_dir, log_file, pid_file, repo_root = sys.argv[1:7]
 port = int(port_s)
-uid = os.getuid()
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -211,10 +291,15 @@ except OSError as e:
     sys.exit(f"error: port 127.0.0.1:{port} is already in use ({e})")
 
 sock.set_inheritable(True)
-log_fd = os.open(log_file, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
+log_fd = os.open(
+    log_file,
+    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
 os.fchmod(log_fd, 0o600)
 
 child_env = os.environ.copy()
+child_env.pop("API_KEYS", None)
 child_env.update({
     "SSH_CONNECTION": "1",
     "API_KEY": os.environ["DEV_KEY"],
@@ -243,10 +328,15 @@ finally:
     os.close(log_fd)
     sock.close()
 
-pid_fd = os.open(pid_file, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0))
+start_ticks = proc_starttime(proc.pid)
+pid_fd = os.open(
+    pid_file,
+    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
 try:
     os.fchmod(pid_fd, 0o600)
-    os.write(pid_fd, f"{proc.pid}\n".encode("ascii"))
+    os.write(pid_fd, f"{proc.pid}:{start_ticks}\n".encode("ascii"))
 finally:
     os.close(pid_fd)
 
@@ -255,13 +345,13 @@ PY
     )"
 
     ready=0
-    for _ in $(seq 1 35); do
-      if ! kill -0 "$NEW_PID" 2>/dev/null; then
+    deadline=$((SECONDS + 10))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if ! is_running; then
         break
       fi
-      # Authenticate against /v1/me with the newly generated DEV_KEY so readiness can only come from THIS instance
-      if curl -sf -H "X-API-Key: ${DEV_KEY}" "${TARGET_URL}/v1/me" >/dev/null 2>&1; then
-        if kill -0 "$NEW_PID" 2>/dev/null; then
+      if curl -sf --max-time 1 -H "X-API-Key: ${DEV_KEY}" "${TARGET_URL}/v1/me" >/dev/null 2>&1; then
+        if is_running; then
           ready=1
           break
         fi
@@ -272,7 +362,7 @@ PY
     if [ "$ready" -ne 1 ]; then
       echo "error: dev-server failed to start on ${TARGET_URL}. Recent logs:" >&2
       tail -n 30 "$LOG_FILE" >&2 || true
-      if terminate_pid "$NEW_PID"; then
+      if terminate_verified_pid_record >/dev/null 2>&1 || ! is_running; then
         rm -f "$PID_FILE"
       else
         echo "warning: uvicorn PID ${NEW_PID} still alive; keeping ${PID_FILE}" >&2
@@ -302,8 +392,8 @@ if os.path.exists(p):
   status)
     validate_state_dir 0
     if is_running; then
-      echo "RUNNING on ${TARGET_URL} (PID $(read_safe_pid), dir ${STATE_DIR})"
-      curl -s "${TARGET_URL}/healthz" && echo
+      echo "RUNNING on ${TARGET_URL} (PID $(read_verified_live_pid), dir ${STATE_DIR})"
+      curl -s --max-time 2 "${TARGET_URL}/healthz" && echo
     else
       echo "STOPPED (no active dev-server for port ${PORT})"
       exit 1
@@ -325,6 +415,12 @@ if os.path.exists(p):
 
   stop)
     validate_state_dir 0
+    if [ -d "$STATE_DIR" ]; then
+      validate_state_dir 1
+      exec 9<>"$LOCK_FILE"
+      flock -x 9
+    fi
+
     if [ -x "$SESSION_CLI" ] && [ -f "$HOME/.cache/agent-api/session-cli.json" ]; then
       current_url="$(python3 -c 'import json, os; p=os.path.expanduser("~/.cache/agent-api/session-cli.json"); print(json.load(open(p)).get("url",""))' 2>/dev/null || true)"
       if [ "$current_url" = "$TARGET_URL" ]; then
@@ -333,12 +429,11 @@ if os.path.exists(p):
       fi
     fi
 
-    if is_running; then
-      pid="$(read_safe_pid)"
-      terminate_pid "$pid" || true
-      echo "Stopped dev-server PID ${pid} on ${TARGET_URL}"
+    stopped_pid=""
+    if stopped_pid="$(terminate_verified_pid_record 2>/dev/null)"; then
+      echo "Stopped dev-server PID ${stopped_pid} on ${TARGET_URL}"
     else
-      echo "No running dev-server PID for port ${PORT}"
+      echo "No running verified dev-server PID for port ${PORT}"
     fi
 
     if [ ! -L "$STATE_DIR" ] && [ -d "$STATE_DIR" ] && [ -O "$STATE_DIR" ]; then
