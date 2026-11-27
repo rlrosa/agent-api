@@ -4,6 +4,7 @@ import mimetypes
 import os
 import re
 import socket
+import tempfile
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
@@ -110,6 +111,42 @@ def get_filename_from_response(response: httpx.Response, url: str) -> str:
     return "downloaded_file"
 
 
+def get_upload_staging_dir(workspace_path: str) -> str:
+    """Return an upload-owned staging directory outside workspace_path (invisible inside bwrap)."""
+    abs_ws = os.path.abspath(workspace_path.rstrip(os.sep))
+    return os.path.join(os.path.dirname(abs_ws), ".staging", os.path.basename(abs_ws))
+
+
+def _open_unique_staging_file(attachments_dir: str) -> Tuple[int, str]:
+    abs_att = os.path.abspath(attachments_dir.rstrip(os.sep))
+    ws_path = os.path.dirname(abs_att)
+    staging_dir = get_upload_staging_dir(ws_path)
+    os.makedirs(staging_dir, mode=0o700, exist_ok=True)
+    return tempfile.mkstemp(prefix=".part-", suffix=".upload", dir=staging_dir)
+
+
+def _commit_staged_file(temp_path: str, attachments_dir: str, clean_filename: str) -> str:
+    """Atomically publish temp_path into attachments_dir without overwriting any existing or agent-created file."""
+    abs_attachments = os.path.abspath(attachments_dir)
+    base_name, ext = os.path.splitext(clean_filename)
+    counter = 0
+    while True:
+        cand_name = clean_filename if counter == 0 else f"{base_name}_{counter}{ext}"
+        target_path = os.path.join(attachments_dir, cand_name)
+        abs_target = os.path.abspath(target_path)
+        if not abs_target.startswith(abs_attachments + os.sep) and abs_target != abs_attachments:
+            raise ValueError("Path traversal attempt detected")
+        try:
+            os.link(temp_path, target_path)
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            return os.path.basename(target_path)
+        except FileExistsError:
+            counter += 1
+
+
 async def fetch_url_attachment(
     url: str,
     attachments_dir: str,
@@ -146,13 +183,12 @@ async def fetch_url_attachment(
                 content_type = response.headers.get("content-type")
                 raw_filename = get_filename_from_response(response, current_url)
                 clean_filename = sanitize_filename(raw_filename, content_type=content_type)
-                target_path = get_unique_filepath(attachments_dir, clean_filename)
 
                 bytes_written_this_file = 0
-                temp_path = target_path + ".tmp"
+                sfd, temp_path = _open_unique_staging_file(attachments_dir)
 
                 try:
-                    with open(temp_path, "wb") as f:
+                    with open(sfd, "wb") as f:
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             chunk_len = len(chunk)
                             if bytes_written_this_file + chunk_len > max_attachment_bytes:
@@ -166,8 +202,8 @@ async def fetch_url_attachment(
                             f.write(chunk)
                             bytes_written_this_file += chunk_len
 
-                    os.rename(temp_path, target_path)
-                    return os.path.basename(target_path), bytes_written_this_file
+                    final_name = _commit_staged_file(temp_path, attachments_dir, clean_filename)
+                    return final_name, bytes_written_this_file
                 except BaseException as exc:
                     _cleanup_failed_target(temp_path, exc)
                     raise
@@ -207,7 +243,6 @@ def materialize_base64_attachment(
     max_total_bytes: int,
 ) -> Tuple[str, int]:
     clean_filename = sanitize_filename(filename)
-    target_path = get_unique_filepath(attachments_dir, clean_filename)
 
     try:
         data = base64.b64decode(content_b64)
@@ -220,14 +255,16 @@ def materialize_base64_attachment(
     if total_bytes_written + data_len > max_total_bytes:
         raise ValueError(f"Job total attachments size exceeds limit ({max_total_bytes} bytes)")
 
+    sfd, temp_path = _open_unique_staging_file(attachments_dir)
     try:
-        with open(target_path, "wb") as f:
+        with open(sfd, "wb") as f:
             f.write(data)
+        final_name = _commit_staged_file(temp_path, attachments_dir, clean_filename)
     except BaseException as exc:
-        _cleanup_failed_target(target_path, exc)
+        _cleanup_failed_target(temp_path, exc)
         raise
 
-    return os.path.basename(target_path), data_len
+    return final_name, data_len
 
 
 def materialize_bytes_attachment(
@@ -239,7 +276,6 @@ def materialize_bytes_attachment(
     max_total_bytes: int,
 ) -> Tuple[str, int]:
     clean_filename = sanitize_filename(filename)
-    target_path = get_unique_filepath(attachments_dir, clean_filename)
 
     data_len = len(content_bytes)
     if data_len > max_attachment_bytes:
@@ -247,14 +283,16 @@ def materialize_bytes_attachment(
     if total_bytes_written + data_len > max_total_bytes:
         raise ValueError(f"Job total attachments size exceeds limit ({max_total_bytes} bytes)")
 
+    sfd, temp_path = _open_unique_staging_file(attachments_dir)
     try:
-        with open(target_path, "wb") as f:
+        with open(sfd, "wb") as f:
             f.write(content_bytes)
+        final_name = _commit_staged_file(temp_path, attachments_dir, clean_filename)
     except BaseException as exc:
-        _cleanup_failed_target(target_path, exc)
+        _cleanup_failed_target(temp_path, exc)
         raise
 
-    return os.path.basename(target_path), data_len
+    return final_name, data_len
 
 
 async def materialize_attachment(

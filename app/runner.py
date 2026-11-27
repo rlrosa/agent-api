@@ -474,6 +474,8 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         if not should_keep:
             if os.path.exists(workspace_path):
                 shutil.rmtree(workspace_path, ignore_errors=True)
+            from app.attachments import get_upload_staging_dir
+            shutil.rmtree(get_upload_staging_dir(workspace_path), ignore_errors=True)
 
     result = finish_job(
         job_id=job_id,
@@ -521,6 +523,22 @@ def sweep_orphaned_workspaces(
     reaped = 0
 
     for item in os.listdir(root):
+        if item == ".staging":
+            staging_root = os.path.join(root, ".staging")
+            if os.path.isdir(staging_root):
+                for sub_item in os.listdir(staging_root):
+                    sub_dir = os.path.join(staging_root, sub_item)
+                    if not os.path.isdir(sub_dir):
+                        continue
+                    try:
+                        if (now - os.path.getmtime(sub_dir)) < min_age_seconds:
+                            continue
+                    except OSError:
+                        continue
+                    sub_job = get_job(sub_item, db_path=db_path)
+                    if sub_job is None or sub_job.get("status") in ("completed", "failed", "canceled"):
+                        shutil.rmtree(sub_dir, ignore_errors=True)
+            continue
         job_dir = os.path.join(root, item)
         if not os.path.isdir(job_dir):
             continue

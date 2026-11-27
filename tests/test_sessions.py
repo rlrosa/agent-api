@@ -2449,14 +2449,14 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
 
     def _patched_open(file, mode="r", *args, **kwargs):
         fh = real_open(file, mode, *args, **kwargs)
-        if "w" in mode and "b" in mode and str(file).startswith(att_dir):
+        if "w" in mode and "b" in mode and (isinstance(file, int) or str(file).startswith(att_dir) or ".staging" in str(file)):
             return _PartialFailWriter(fh)
         return fh
 
     monkeypatch.setattr(_att_mod, "open", _patched_open, raising=False)
     payload_32 = base64.b64encode(b"A" * 32).decode("ascii")
 
-    # Case A: unlink succeeds -> partial file removed and total_attachment_bytes stays 0
+    # Case A: unlink succeeds -> partial staging file removed and total_attachment_bytes stays 0
     r_part_clean = http_client.post(
         f"/v1/sessions/{sid_att}/messages",
         headers={"X-API-Key": "key-alice"},
@@ -2471,11 +2471,11 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     assert s_after_a["status"] == "idle"
     assert s_after_a["total_attachment_bytes"] == 0
 
-    # Case B: unlink ALSO fails -> unremovable 11-byte partial file is counted in total_attachment_bytes
+    # Case B: unlink ALSO fails -> unremovable 11-byte partial staging file is counted in total_attachment_bytes
     real_unlink = os.unlink
 
     def _deny_unlink_unremovable(path, *args, **kwargs):
-        if os.path.basename(str(path)).startswith("unremovable"):
+        if ".staging" in str(path) or os.path.basename(str(path)).startswith("unremovable"):
             raise PermissionError("Simulated unremovable partial file")
         return real_unlink(path, *args, **kwargs)
 
@@ -2496,25 +2496,151 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     assert s_after_b["status"] == "idle"
     assert s_after_b["total_attachment_bytes"] == 11
 
-    # 4715616293: Agent-written file in attachments/ is NOT unlinked when a concurrent/subsequent upload fails
-    agent_file = os.path.join(att_dir, "agent_created_note.txt")
-    with real_open(agent_file, "wb") as af:
-        af.write(b"agent-owned")
-    monkeypatch.setattr(_att_mod, "open", _patched_open, raising=False)
-    r_preserve_agent = http_client.post(
+    # 4715131526: Earlier file in same turn becomes inaccessible (remove raises PermissionError where os.path.exists would be False)
+    # followed by a 2nd attachment failing before creating any file -> rollback MUST retain the 32 bytes (no undercount)
+    real_remove = os.remove
+
+    def _deny_inaccessible_rollback(path, *args, **kwargs):
+        if os.path.basename(str(path)).startswith("inaccessible_saved"):
+            raise PermissionError(errno.EACCES, "Permission denied unlinking saved attachment")
+        return real_remove(path, *args, **kwargs)
+
+    real_path_exists = os.path.exists
+    monkeypatch.setattr(_sess_mod.os, "remove", _deny_inaccessible_rollback)
+    monkeypatch.setattr(_sess_mod.os.path, "exists", lambda p: False if "inaccessible_saved" in str(p) else real_path_exists(p))
+    r_inacc_rb = http_client.post(
         f"/v1/sessions/{sid_att}/messages",
         headers={"X-API-Key": "key-alice"},
         json={
-            "prompt": "Upload fails while agent file exists",
-            "attachments": [{"filename": "transient_fail.bin", "content_b64": payload_32}],
+            "prompt": "First saves 32B then becomes inaccessible; second fails base64 decode",
+            "attachments": [
+                {"filename": "inaccessible_saved.bin", "content_b64": payload_32},
+                {"filename": "bad_second.bin", "content_b64": "!!!not-base64!!!"},
+            ],
         },
     )
-    assert r_preserve_agent.status_code == 500
-    monkeypatch.delattr(_att_mod, "open", raising=False)
-    assert os.path.exists(agent_file)
+    assert r_inacc_rb.status_code == 400
+    monkeypatch.setattr(_sess_mod.os, "remove", real_remove)
+    monkeypatch.setattr(_sess_mod.os.path, "exists", real_path_exists)
+    s_after_inacc = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_after_inacc["status"] == "idle"
+    assert s_after_inacc["total_attachment_bytes"] == 43  # 11 + 32 retained (no undercount!)
+
+    # 4715616293 & 4715616289: End-to-end real fetch_url_attachment streaming tests:
+    # (1) Pre-existing agent 'report.txt.tmp' is NOT truncated or unlinked on failing URL upload for 'report.txt'
+    # (2) Concurrent agent files created mid-download (between >=8192B URL stream chunks) remain untouched when upload fails
+    # (3) Repeated oversize URL downloads for the SAME filename with failed cleanup use distinct staging paths (no undercount)
+    import httpx as _httpx
+
+    agent_tmp = os.path.join(att_dir, "report.txt.tmp")
+    with real_open(agent_tmp, "wb") as tf:
+        tf.write(b"agent-tmp-payload")
+
+    concurrent_agent_file = os.path.join(att_dir, "concurrent_during_stream.txt")
+    concurrent_report_file = os.path.join(att_dir, "report.txt")
+
+    class _StreamScenario(_httpx.AsyncByteStream):
+        def __init__(self, mode: str):
+            self.mode = mode
+
+        async def __aiter__(self):
+            if self.mode == "collision_fail":
+                yield b"chunk-1-" * 1024  # 8192 bytes flushed as chunk 1
+                raise _httpx.ReadError("Simulated mid-stream failure on report.txt")
+            elif self.mode == "concurrent_create_fail":
+                yield b"chunk-1-" * 1024  # 8192 bytes flushed as chunk 1
+                # Agent writes files into attachments/ while URL download yielded!
+                with real_open(concurrent_agent_file, "wb") as cf:
+                    cf.write(b"agent-concurrent-data")
+                with real_open(concurrent_report_file, "wb") as rf:
+                    rf.write(b"agent-report-v1")
+                raise _httpx.ReadError("Simulated stream cut after agent created files")
+            elif self.mode == "oversize_1chunk":
+                yield b"A" * 8192
+                yield b"B" * 12000  # 20192 > MAX_ATTACHMENT_BYTES=18000 -> ValueError after 8192B written
+            elif self.mode == "oversize_2chunks":
+                yield b"C" * 8192
+                yield b"D" * 8192
+                yield b"E" * 8192  # 24576 > MAX_ATTACHMENT_BYTES=18000 -> ValueError after 16384B written
+
+    def _mock_handler(request: _httpx.Request) -> _httpx.Response:
+        q = request.url.params.get("case", "")
+        return _httpx.Response(200, headers={"content-type": "text/plain"}, stream=_StreamScenario(q))
+
+    real_async_client = _httpx.AsyncClient
+    monkeypatch.setenv("ATTACHMENT_HOST_ALLOWLIST", "files.example.test")
+    monkeypatch.setattr(
+        _att_mod.httpx,
+        "AsyncClient",
+        lambda **kw: real_async_client(transport=_httpx.MockTransport(_mock_handler), **{k: v for k, v in kw.items() if k != "transport"}),
+    )
+
+    # (1) Temporary-path collision check on report.txt.tmp
+    r_col = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Download report.txt while report.txt.tmp exists",
+            "attachments": [{"url": "https://files.example.test/report.txt?case=collision_fail"}],
+        },
+    )
+    assert r_col.status_code == 502
+    assert os.path.exists(agent_tmp)
+    assert real_open(agent_tmp, "rb").read() == b"agent-tmp-payload"
+
+    # (2) Concurrent agent file creation mid-stream
+    rate_limiter.history.clear()
+    r_conc_url = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Download report.txt while agent creates files mid-stream",
+            "attachments": [{"url": "https://files.example.test/report.txt?case=concurrent_create_fail"}],
+        },
+    )
+    assert r_conc_url.status_code == 502
+    assert os.path.exists(concurrent_agent_file) and real_open(concurrent_agent_file, "rb").read() == b"agent-concurrent-data"
+    assert os.path.exists(concurrent_report_file) and real_open(concurrent_report_file, "rb").read() == b"agent-report-v1"
+
+    # (3) Repeated oversize URL downloads for the SAME filename ('report.bin') when staging unlink fails:
+    # first retains 8192B (43 + 8192 = 8235), second retains 16384B in a DISTINCT staging file (8235 + 16384 = 24619, zero undercount!)
+    monkeypatch.setenv("MAX_ATTACHMENT_BYTES", "10000")
+    monkeypatch.setattr(_att_mod.os, "unlink", _deny_unlink_unremovable)
+
+    r_ov_1 = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Oversize same filename #1",
+            "attachments": [{"url": "https://files.example.test/report.bin?case=oversize_1chunk"}],
+        },
+    )
+    assert r_ov_1.status_code == 400
+    s_ov_1 = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_ov_1["status"] == "idle"
+    assert s_ov_1["total_attachment_bytes"] == 43 + 8192
+
+    monkeypatch.setenv("MAX_ATTACHMENT_BYTES", "20000")
+    r_ov_2 = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Oversize same filename #2",
+            "attachments": [{"url": "https://files.example.test/report.bin?case=oversize_2chunks"}],
+        },
+    )
+    assert r_ov_2.status_code == 400
+    monkeypatch.setattr(_att_mod.os, "unlink", real_unlink)
+    monkeypatch.setattr(_att_mod.httpx, "AsyncClient", real_async_client)
+    monkeypatch.delenv("MAX_ATTACHMENT_BYTES", raising=False)
+    monkeypatch.delenv("ATTACHMENT_HOST_ALLOWLIST", raising=False)
+
+    s_ov_2 = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_ov_2["status"] == "idle"
+    expected_retained = 43 + 8192 + 16384
+    assert s_ov_2["total_attachment_bytes"] == expected_retained
 
     # 4715616286: httpx.ReadTimeout on 2nd attachment rolls back 1st attachment, finalizes turn as failed, restores idle (502)
-    import httpx as _httpx
     real_sess_mat = _sess_mod.materialize_attachment
     url_seq = {"n": 0}
 
@@ -2540,31 +2666,7 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     monkeypatch.setattr(_sess_mod, "materialize_attachment", real_sess_mat)
     s_after_to = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
     assert s_after_to["status"] == "idle"
-    assert s_after_to["total_attachment_bytes"] == 11  # first attachment rolled back cleanly
-
-    # 4715616289: ValueError size-limit rejection with retained unremovable temp file preserves 400 and accounts for retained bytes
-    async def _val_err_with_leftover(spec, workspace_path, **kwargs):
-        retained = os.path.abspath(os.path.join(workspace_path, "attachments", "retained_partial.tmp"))
-        with real_open(retained, "wb") as rf:
-            rf.write(b"X" * 7)
-        ve = ValueError("Attachment exceeds max single file size limit")
-        setattr(ve, "_unremoved_attachment_files", [(retained, 7)])
-        raise ve
-
-    monkeypatch.setattr(_sess_mod, "materialize_attachment", _val_err_with_leftover)
-    r_val_left = http_client.post(
-        f"/v1/sessions/{sid_att}/messages",
-        headers={"X-API-Key": "key-alice"},
-        json={
-            "prompt": "Oversize with retained temp",
-            "attachments": [{"url": "https://example.com/huge.bin"}],
-        },
-    )
-    assert r_val_left.status_code == 400
-    monkeypatch.setattr(_sess_mod, "materialize_attachment", real_sess_mat)
-    s_after_val = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
-    assert s_after_val["status"] == "idle"
-    assert s_after_val["total_attachment_bytes"] == 18  # 11 + 7
+    assert s_after_to["total_attachment_bytes"] == expected_retained  # first attachment rolled back cleanly
 
     # 4715131526: Uncertain leftover byte size (rem_bytes is None because stat also failed) retires session as 'failed' (500)
     async def _uncertain_io_err(spec, workspace_path, **kwargs):

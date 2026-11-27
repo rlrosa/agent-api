@@ -13,7 +13,7 @@ from fastapi import HTTPException, status
 import httpx
 
 from app.agents import AGENTS, resolve_effective_session_model, strip_model_tier
-from app.attachments import compose_prompt, materialize_attachment
+from app.attachments import compose_prompt, get_upload_staging_dir, materialize_attachment
 from app.config import Settings, get_settings
 from app.db import (
     _UNSET,
@@ -360,13 +360,11 @@ class LiveSession:
 def _rollback_turn_uploads(live: "LiveSession", saved_this_turn: List[Tuple[str, int]]) -> None:
     """Remove newly saved files from a failed turn; keep byte accounting & tracking for any file whose unlink failed."""
     for fp, bc in saved_this_turn:
-        removed = False
         try:
-            if not os.path.exists(fp):
-                removed = True
-            else:
-                os.remove(fp)
-                removed = True
+            os.remove(fp)
+            removed = True
+        except FileNotFoundError:
+            removed = True
         except OSError:
             removed = False
 
@@ -1506,6 +1504,7 @@ class SessionManager:
             if not (reason == "failed" and settings.keep_workspace_on_failure):
                 try:
                     shutil.rmtree(live.workspace_path, ignore_errors=True)
+                    shutil.rmtree(get_upload_staging_dir(live.workspace_path), ignore_errors=True)
                 except Exception as exc:
                     logger.warning(f"Failed deleting session workspace {live.workspace_path}: {exc}")
 
@@ -1621,6 +1620,24 @@ def sweep_orphaned_session_workspaces(
     reaped = 0
 
     for item in os.listdir(root):
+        if item == ".staging":
+            staging_root = os.path.join(root, ".staging")
+            if os.path.isdir(staging_root):
+                for sub_item in os.listdir(staging_root):
+                    sub_dir = os.path.join(staging_root, sub_item)
+                    if not os.path.isdir(sub_dir):
+                        continue
+                    try:
+                        if (now - os.path.getmtime(sub_dir)) < min_age_seconds:
+                            continue
+                    except OSError:
+                        continue
+                    if session_manager.is_session_active(sub_item) or sub_item in session_manager._closing:
+                        continue
+                    sub_sess = get_session(sub_item, db_path=db_path)
+                    if sub_sess is None or sub_sess.get("status") in ("closed", "expired", "failed"):
+                        shutil.rmtree(sub_dir, ignore_errors=True)
+            continue
         sess_dir = os.path.join(root, item)
         if not os.path.isdir(sess_dir):
             continue
