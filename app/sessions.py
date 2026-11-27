@@ -10,6 +10,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from fastapi import HTTPException, status
+import httpx
 
 from app.agents import AGENTS, resolve_effective_session_model, strip_model_tier
 from app.attachments import compose_prompt, materialize_attachment
@@ -461,6 +462,19 @@ async def _terminate_and_reap_proc(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
+def _account_unremoved_upload_files(live: "LiveSession", exc: BaseException) -> bool:
+    """Account for exact files created by a failed upload that could not be unlinked.
+    Returns True if any leftover file's byte count could not be determined."""
+    uncertain = False
+    for fp, rem_bytes in getattr(exc, "_unremoved_attachment_files", ()):
+        if rem_bytes is None:
+            uncertain = True
+        elif fp not in live.managed_attachments:
+            live.total_attachment_bytes += rem_bytes
+            live.managed_attachments.add(fp)
+    return uncertain
+
+
 class SessionManager:
     def __init__(self):
         self._sessions: Dict[str, LiveSession] = {}
@@ -559,10 +573,52 @@ class SessionManager:
             try:
                 if turn_id is not None:
                     finish_session_turn(turn_id=turn_id, status="failed", error=err_msg, db_path=target_db)
-                close_session_row(session_id=sid, status=status_reason, error=err_msg, db_path=target_db)
+                if status_reason:
+                    close_session_row(
+                        session_id=sid,
+                        status=status_reason,
+                        error=err_msg,
+                        db_path=target_db,
+                        only_if_non_terminal=True,
+                    )
                 self._pending_db_reconcile.pop(sid, None)
             except Exception as exc:
                 logger.warning(f"Deferred DB reconciliation for session '{sid}' still pending: {exc}")
+
+    async def _retire_on_db_failure(
+        self,
+        live: "LiveSession",
+        turn_id: Optional[str],
+        persist_err: BaseException,
+        db_path: Optional[str],
+        prefix: str = "Failed persisting turn state",
+    ) -> HTTPException:
+        persist_msg = _truncate_diag(f"{prefix}: {persist_err}", MAX_AUTH_DIAG_CHARS)
+        logger.error(f"Session {live.id} persistence failure: {persist_msg}", exc_info=True)
+        live.status = "failed"
+        self._pending_db_reconcile[live.id] = (turn_id, "failed", persist_msg, db_path)
+        turn_ok = turn_id is None
+        if turn_id is not None:
+            try:
+                finish_session_turn(turn_id=turn_id, status="failed", error=persist_msg, db_path=db_path)
+                turn_ok = True
+            except Exception:
+                pass
+        sess_closed_row = None
+        try:
+            sess_closed_row = await self.close_session(
+                live.id, reason="failed", error=persist_msg, db_path=db_path
+            )
+        except Exception:
+            pass
+        if turn_ok and sess_closed_row is not None:
+            self._pending_db_reconcile.pop(live.id, None)
+        elif turn_ok:
+            self._pending_db_reconcile[live.id] = (None, "failed", persist_msg, db_path)
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=persist_msg,
+        )
 
     async def _idle_reaper_loop(self):
         logger.debug("Idle reaper loop started")
@@ -915,7 +971,16 @@ class SessionManager:
                     live.status = "busy"
                     live.last_active_at = now_start
                     live.stderr_buffer.clear()
-                    update_session_state(session_id, status="busy", last_active_at=now_start, db_path=db_path)
+                    try:
+                        update_session_state(session_id, status="busy", last_active_at=now_start, db_path=db_path)
+                    except Exception as busy_err:
+                        raise await self._retire_on_db_failure(
+                            live,
+                            turn_id,
+                            busy_err,
+                            db_path=db_path,
+                            prefix="Failed persisting turn busy state",
+                        )
 
                     if rate_limit_manager.is_in_cooldown():
                         rem = rate_limit_manager.get_cooldown_remaining()
@@ -935,8 +1000,6 @@ class SessionManager:
 
                     attachment_filenames: List[str] = []
                     if attachments:
-                        att_dir = os.path.join(live.workspace_path, "attachments")
-                        pre_turn_files = set(os.listdir(att_dir)) if os.path.isdir(att_dir) else set()
                         try:
                             for att in attachments:
                                 if live.closing or live.status in ("closed", "expired", "failed"):
@@ -960,57 +1023,74 @@ class SessionManager:
                                         f"Cumulative attachment size ({live.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
                                     )
                                 attachment_filenames.append(os.path.basename(saved_name))
-                        except ValueError as att_err:
+                        except (ValueError, httpx.RequestError) as att_err:
                             _rollback_turn_uploads(live, saved_this_turn)
                             saved_this_turn.clear()
+                            uncertain = _account_unremoved_upload_files(live, att_err)
                             bounded_att_err = _truncate_diag(f"Attachment error: {att_err}", MAX_AUTH_DIAG_CHARS)
+                            if live.closing or live.status in ("closed", "expired", "failed") or not self.is_session_active(session_id):
+                                update_session_state(
+                                    session_id,
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    db_path=db_path,
+                                )
+                                finish_session_turn(
+                                    turn_id=turn_id,
+                                    status="failed",
+                                    error="Session closed while materializing attachments",
+                                    db_path=db_path,
+                                )
+                                raise HTTPException(
+                                    status_code=status.HTTP_409_CONFLICT,
+                                    detail=f"Session '{session_id}' is {live.closed_reason or 'closed'} and cannot accept new messages",
+                                )
+                            if uncertain:
+                                finish_session_turn(
+                                    turn_id=turn_id,
+                                    status="failed",
+                                    error=bounded_att_err,
+                                    db_path=db_path,
+                                )
+                                live.status = "failed"
+                                await self.close_session(
+                                    session_id,
+                                    reason="failed",
+                                    error=bounded_att_err,
+                                    db_path=db_path,
+                                )
+                                raise HTTPException(
+                                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                    detail=bounded_att_err,
+                                )
                             finish_session_turn(
                                 turn_id=turn_id,
                                 status="failed",
                                 error=bounded_att_err,
                                 db_path=db_path,
                             )
-                            if not live.closing and live.status not in ("closed", "expired", "failed"):
-                                live.status = "idle"
-                                now_idle = time.time()
-                                live.last_active_at = now_idle
-                                update_session_state(
-                                    session_id,
-                                    status="idle",
-                                    total_attachment_bytes=live.total_attachment_bytes,
-                                    last_active_at=now_idle,
-                                    db_path=db_path,
-                                )
-                            else:
-                                update_session_state(
-                                    session_id,
-                                    total_attachment_bytes=live.total_attachment_bytes,
-                                    db_path=db_path,
-                                )
+                            live.status = "idle"
+                            now_idle = time.time()
+                            live.last_active_at = now_idle
+                            update_session_state(
+                                session_id,
+                                status="idle",
+                                total_attachment_bytes=live.total_attachment_bytes,
+                                last_active_at=now_idle,
+                                db_path=db_path,
+                            )
+                            http_status = (
+                                status.HTTP_400_BAD_REQUEST
+                                if isinstance(att_err, ValueError)
+                                else status.HTTP_502_BAD_GATEWAY
+                            )
                             raise HTTPException(
-                                status_code=status.HTTP_400_BAD_REQUEST,
+                                status_code=http_status,
                                 detail=f"Attachment error: {att_err}",
                             )
                         except OSError as storage_err:
                             _rollback_turn_uploads(live, saved_this_turn)
                             saved_this_turn.clear()
-                            if os.path.isdir(att_dir):
-                                for leftover_name in list(os.listdir(att_dir)):
-                                    if leftover_name in pre_turn_files:
-                                        continue
-                                    leftover_fp = os.path.abspath(os.path.join(att_dir, leftover_name))
-                                    try:
-                                        os.unlink(leftover_fp)
-                                    except FileNotFoundError:
-                                        pass
-                                    except OSError:
-                                        try:
-                                            rem_size = os.stat(leftover_fp, follow_symlinks=False).st_size
-                                            if leftover_fp not in live.managed_attachments:
-                                                live.total_attachment_bytes += rem_size
-                                                live.managed_attachments.add(leftover_fp)
-                                        except OSError:
-                                            pass
+                            uncertain = _account_unremoved_upload_files(live, storage_err)
                             if live.closing or live.status in ("closed", "expired", "failed") or not self.is_session_active(session_id):
                                 update_session_state(
                                     session_id,
@@ -1034,6 +1114,18 @@ class SessionManager:
                                 error=bounded_io_err,
                                 db_path=db_path,
                             )
+                            if uncertain:
+                                live.status = "failed"
+                                await self.close_session(
+                                    session_id,
+                                    reason="failed",
+                                    error=bounded_io_err,
+                                    db_path=db_path,
+                                )
+                                raise HTTPException(
+                                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                    detail=bounded_io_err,
+                                )
                             live.status = "idle"
                             now_idle = time.time()
                             live.last_active_at = now_idle
@@ -1298,30 +1390,12 @@ class SessionManager:
                             db_path=db_path,
                         )
                     except Exception as persist_err:
-                        persist_msg = _truncate_diag(f"Failed persisting turn result: {persist_err}", MAX_AUTH_DIAG_CHARS)
-                        logger.error(f"Session {session_id} persistence failure: {persist_msg}", exc_info=True)
-                        live.status = "failed"
-                        self._pending_db_reconcile[session_id] = (turn_id, "failed", persist_msg, db_path)
-                        turn_ok = False
-                        try:
-                            finish_session_turn(turn_id=turn_id, status="failed", error=persist_msg, db_path=db_path)
-                            turn_ok = True
-                        except Exception:
-                            pass
-                        sess_closed_row = None
-                        try:
-                            sess_closed_row = await self.close_session(
-                                session_id, reason="failed", error=persist_msg, db_path=db_path
-                            )
-                        except Exception:
-                            pass
-                        if turn_ok and sess_closed_row is not None:
-                            self._pending_db_reconcile.pop(session_id, None)
-                        elif turn_ok:
-                            self._pending_db_reconcile[session_id] = (None, "failed", persist_msg, db_path)
-                        raise HTTPException(
-                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail=persist_msg,
+                        raise await self._retire_on_db_failure(
+                            live,
+                            turn_id,
+                            persist_err,
+                            db_path=db_path,
+                            prefix="Failed persisting turn result",
                         )
 
                     if not is_success:
@@ -1444,6 +1518,13 @@ class SessionManager:
                     db_path=db_path,
                     api_key_name=api_key_name,
                 )
+                existing = self._pending_db_reconcile.get(live.id)
+                if existing is not None:
+                    if existing[0] is not None:
+                        # Winning close committed session status; keep only pending turn completion
+                        self._pending_db_reconcile[live.id] = (existing[0], "", existing[2], existing[3])
+                    else:
+                        self._pending_db_reconcile.pop(live.id, None)
                 return closed_row
             except Exception as db_exc:
                 logger.warning(f"Failed writing terminal session row for '{live.id}' (queued for reconciliation): {db_exc}")

@@ -2008,123 +2008,183 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
     dev_home = tmp_path / "dev_home"
     dev_home.mkdir(mode=0o700)
 
-    test_port = None
-    for cand_port in range(28911, 28990):
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            probe.bind(("127.0.0.1", cand_port))
-            test_port = cand_port
-            break
-        except OSError:
-            continue
-        finally:
-            probe.close()
-    assert test_port is not None
-
     dev_env = os.environ.copy()
     dev_env["DEV_SERVER_STATE_ROOT"] = str(dev_state_root)
     dev_env["HOME"] = str(dev_home)
 
-    unsafe_dir = os.path.join(str(dev_state_root), f"agent-api-dev-{test_port}")
-    os.mkdir(unsafe_dir, 0o777)
-    os.chmod(unsafe_dir, 0o777)
-    # Put current test process PID in uvicorn.pid — stop MUST refuse unsafe dir and NOT signal us!
-    with open(os.path.join(unsafe_dir, "uvicorn.pid"), "w") as f:
-        f.write(f"{os.getpid()}\n")
-    for action in ("start", "stop", "status"):
-        res = subprocess.run(["bash", dev_srv, action, str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
-        assert res.returncode != 0
-        assert "refusing" in res.stderr
-
-    # 4715131553(a): PID-only record inside valid 0700 state dir is rejected (exit != 0) without signaling os.getpid()
-    _sh.rmtree(unsafe_dir, ignore_errors=True)
-    os.mkdir(unsafe_dir, 0o700)
-    pid_f = os.path.join(unsafe_dir, "uvicorn.pid")
-    with open(pid_f, "w") as f:
-        f.write(f"{os.getpid()}\n")
-    os.chmod(pid_f, 0o600)
-    res_pid_only = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
-    assert res_pid_only.returncode != 0
-    assert "without valid '<pid>:<starttime>'" in res_pid_only.stderr
-
-    # 4715131553(b): Valid <pid>:<starttime> when pidfd signaling is unavailable fails (exit != 0) without os.kill fallback
-    my_starttime = open(f"/proc/{os.getpid()}/stat", encoding="utf-8").read().rsplit(")", 1)[1].split()[19]
-    with open(pid_f, "w") as f:
-        f.write(f"{os.getpid()}:{my_starttime}\n")
-    os.chmod(pid_f, 0o600)
-    no_pidfd_pkg = tmp_path / "no_pidfd_site"
-    no_pidfd_pkg.mkdir(mode=0o700)
-    (no_pidfd_pkg / "sitecustomize.py").write_text(
-        "import os, signal\n"
-        "if hasattr(os, 'pidfd_open'): delattr(os, 'pidfd_open')\n"
-        "if hasattr(signal, 'pidfd_send_signal'): delattr(signal, 'pidfd_send_signal')\n",
-        encoding="utf-8",
-    )
-    no_pidfd_env = dev_env.copy()
-    no_pidfd_env["PYTHONPATH"] = str(no_pidfd_pkg) + (os.pathsep + dev_env["PYTHONPATH"] if dev_env.get("PYTHONPATH") else "")
-    res_no_pidfd = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=no_pidfd_env, capture_output=True, text=True, check=False)
-    assert res_no_pidfd.returncode != 0
-    assert "pidfd signaling" in res_no_pidfd.stderr
-
-    # Stale/mismatched starttime in PID file is ignored without signaling, and cleans up state dir while preserving lock inode
-    with open(pid_f, "w") as f:
-        f.write(f"{os.getpid()}:0\n")
-    os.chmod(pid_f, 0o600)
-    res_stale = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
-    assert res_stale.returncode == 0
-    assert "No running verified dev-server PID" in res_stale.stdout
-    assert not os.path.exists(unsafe_dir)
-
-    # 4715131544: Stable per-port lock survives stop cleanup AND blocks stop even when STATE_DIR is absent
-    lock_path = os.path.join(str(dev_state_root), f".agent-api-dev-{test_port}.lock")
-    assert os.path.exists(lock_path)
-    lock_ino_before = os.stat(lock_path).st_ino
-    with open(lock_path, "r+b") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        # STATE_DIR does not exist right now; stop MUST still block trying to acquire LOCK_FILE!
-        with pytest.raises(subprocess.TimeoutExpired):
-            subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, timeout=0.35, check=False)
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-    res_after_unlock = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
-    assert res_after_unlock.returncode == 0
-    assert os.stat(lock_path).st_ino == lock_ino_before
-
-    # Occupied port is rejected cleanly
+    # 4715616308: Bind port 0 and keep 'occ' open for the entire set of non-live + occupied-port checks (zero port-reuse race)
     occ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    occ.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    occ.bind(("127.0.0.1", test_port))
+    occ.bind(("127.0.0.1", 0))
     occ.listen(5)
+    test_port = occ.getsockname()[1]
     try:
+        unsafe_dir = os.path.join(str(dev_state_root), f"agent-api-dev-{test_port}")
+        os.mkdir(unsafe_dir, 0o777)
+        os.chmod(unsafe_dir, 0o777)
+        # Put current test process PID in uvicorn.pid — stop MUST refuse unsafe dir and NOT signal us!
+        with open(os.path.join(unsafe_dir, "uvicorn.pid"), "w") as f:
+            f.write(f"{os.getpid()}\n")
+        for action in ("start", "stop", "status"):
+            res = subprocess.run(["bash", dev_srv, action, str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+            assert res.returncode != 0
+            assert "refusing" in res.stderr
+
+        # 4715131553(a): PID-only record inside valid 0700 state dir is rejected (exit != 0) without signaling os.getpid()
+        _sh.rmtree(unsafe_dir, ignore_errors=True)
+        os.mkdir(unsafe_dir, 0o700)
+        pid_f = os.path.join(unsafe_dir, "uvicorn.pid")
+        with open(pid_f, "w") as f:
+            f.write(f"{os.getpid()}\n")
+        os.chmod(pid_f, 0o600)
+        res_pid_only = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+        assert res_pid_only.returncode != 0
+        assert "without valid '<pid>:<starttime>'" in res_pid_only.stderr
+
+        # 4715131553(b): Valid <pid>:<starttime> when pidfd signaling is unavailable fails (exit != 0) without os.kill fallback
+        my_starttime = open(f"/proc/{os.getpid()}/stat", encoding="utf-8").read().rsplit(")", 1)[1].split()[19]
+        with open(pid_f, "w") as f:
+            f.write(f"{os.getpid()}:{my_starttime}\n")
+        os.chmod(pid_f, 0o600)
+        no_pidfd_pkg = tmp_path / "no_pidfd_site"
+        no_pidfd_pkg.mkdir(mode=0o700)
+        (no_pidfd_pkg / "sitecustomize.py").write_text(
+            "import os, signal\n"
+            "if hasattr(os, 'pidfd_open'): delattr(os, 'pidfd_open')\n"
+            "if hasattr(signal, 'pidfd_send_signal'): delattr(signal, 'pidfd_send_signal')\n",
+            encoding="utf-8",
+        )
+        no_pidfd_env = dev_env.copy()
+        no_pidfd_env["PYTHONPATH"] = str(no_pidfd_pkg) + (os.pathsep + dev_env["PYTHONPATH"] if dev_env.get("PYTHONPATH") else "")
+        res_no_pidfd = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=no_pidfd_env, capture_output=True, text=True, check=False)
+        assert res_no_pidfd.returncode != 0
+        assert "pidfd signaling" in res_no_pidfd.stderr
+        assert os.path.exists(pid_f)
+
+        # 4715616296: pidfd_open raising transient OSError (EMFILE) returns non-cleanup error and preserves STATE_DIR & PID_FILE
+        emfile_pkg = tmp_path / "emfile_pidfd_site"
+        emfile_pkg.mkdir(mode=0o700)
+        (emfile_pkg / "sitecustomize.py").write_text(
+            "import errno, os\n"
+            "def _emfile_pidfd(pid, flags=0):\n"
+            "    raise OSError(errno.EMFILE, 'Too many open files')\n"
+            "os.pidfd_open = _emfile_pidfd\n",
+            encoding="utf-8",
+        )
+        emfile_env = dev_env.copy()
+        emfile_env["PYTHONPATH"] = str(emfile_pkg) + (os.pathsep + dev_env["PYTHONPATH"] if dev_env.get("PYTHONPATH") else "")
+        res_emfile = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=emfile_env, capture_output=True, text=True, check=False)
+        assert res_emfile.returncode != 0
+        assert os.path.exists(unsafe_dir) and os.path.exists(pid_f)
+
+        # Stale/mismatched starttime in PID file is ignored without signaling, and cleans up state dir while preserving lock inode
+        with open(pid_f, "w") as f:
+            f.write(f"{os.getpid()}:0\n")
+        os.chmod(pid_f, 0o600)
+        res_stale = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+        assert res_stale.returncode == 0
+        assert "No running verified dev-server PID" in res_stale.stdout
+        assert not os.path.exists(unsafe_dir)
+
+        # 4715131544 & 4715616313: Instrumented flock wrapper proves stop reaches flock and blocks on LOCK_FILE when STATE_DIR is absent
+        lock_path = os.path.join(str(dev_state_root), f".agent-api-dev-{test_port}.lock")
+        assert os.path.exists(lock_path)
+        lock_ino_before = os.stat(lock_path).st_ino
+        flock_bin_dir = tmp_path / "flock_bin"
+        flock_bin_dir.mkdir(mode=0o700)
+        real_flock = _sh.which("flock")
+        assert real_flock is not None
+        flock_reached = tmp_path / "flock.reached"
+        flock_wrapper = flock_bin_dir / "flock"
+        flock_wrapper.write_text(
+            f"#!/usr/bin/env bash\n: > {str(flock_reached)!r}\nexec {real_flock!r} \"$@\"\n",
+            encoding="utf-8",
+        )
+        flock_wrapper.chmod(0o700)
+        flock_env = dev_env.copy()
+        flock_env["PATH"] = str(flock_bin_dir) + os.pathsep + dev_env.get("PATH", "")
+
+        with open(lock_path, "r+b") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            proc_stop = subprocess.Popen(
+                ["bash", dev_srv, "stop", str(test_port)],
+                env=flock_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                reach_deadline = time.time() + 5.0
+                while time.time() < reach_deadline and not flock_reached.exists():
+                    time.sleep(0.02)
+                assert flock_reached.exists(), "stop child did not reach flock checkpoint"
+                time.sleep(0.05)
+                assert proc_stop.poll() is None, "stop child exited before lock was released"
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                out_s, err_s = proc_stop.communicate(timeout=5.0)
+                assert proc_stop.returncode == 0, f"stdout={out_s}\nstderr={err_s}"
+            finally:
+                if proc_stop.poll() is None:
+                    proc_stop.kill()
+                    proc_stop.wait()
+        assert os.stat(lock_path).st_ino == lock_ino_before
+
+        # Occupied port ('occ' still bound!) is rejected cleanly
         res_occ = subprocess.run(["bash", dev_srv, "start", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
         assert res_occ.returncode != 0
         assert "already in use" in res_occ.stderr
     finally:
         occ.close()
 
-    # 4715131548: Start dev-server with inherited API_KEYS=default:... and verify generated key works while inherited key is 401
+    # 4715131548 & 4715616299 & 4715616308: Allocate fresh port for live start (retrying only on bind collision) + test 0400 stale pid_file
+    live_port = None
+    res_start = None
     shadow_env = dev_env.copy()
     shadow_env["API_KEYS"] = "default:inherited-shadow-secret:jobs+admin"
-    res_start = subprocess.run(["bash", dev_srv, "start", str(test_port)], env=shadow_env, capture_output=True, text=True, check=False)
+    for _ in range(5):
+        p_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        p_sock.bind(("127.0.0.1", 0))
+        cand_live = p_sock.getsockname()[1]
+        p_sock.close()
+        if cand_live == 8090:
+            continue
+        # Pre-seed an owned mode-0400 stale uvicorn.pid to verify start replaces it cleanly (4715616299)
+        cand_dir = dev_state_root / f"agent-api-dev-{cand_live}"
+        cand_dir.mkdir(mode=0o700, exist_ok=True)
+        stale_ro_pid = cand_dir / "uvicorn.pid"
+        stale_ro_pid.write_text(f"{os.getpid()}:0\n", encoding="utf-8")
+        stale_ro_pid.chmod(0o400)
+        res_try = subprocess.run(["bash", dev_srv, "start", str(cand_live)], env=shadow_env, capture_output=True, text=True, check=False)
+        if res_try.returncode != 0 and "already in use" in res_try.stderr:
+            stale_ro_pid.chmod(0o600)
+            _sh.rmtree(cand_dir, ignore_errors=True)
+            continue
+        live_port = cand_live
+        res_start = res_try
+        break
+
+    assert live_port is not None and res_start is not None
+    live_lock_path = os.path.join(str(dev_state_root), f".agent-api-dev-{live_port}.lock")
+    live_lock_ino = os.stat(live_lock_path).st_ino
     try:
         assert res_start.returncode == 0, f"stdout={res_start.stdout}\nstderr={res_start.stderr}"
         saved_cli_cfg = json.loads((dev_home / ".cache" / "agent-api" / "session-cli.json").read_text(encoding="utf-8"))
         gen_key = saved_cli_cfg["api_key"]
         assert gen_key and gen_key != "inherited-shadow-secret"
 
-        req_ok = urllib.request.Request(f"http://127.0.0.1:{test_port}/v1/me", headers={"X-API-Key": gen_key})
+        req_ok = urllib.request.Request(f"http://127.0.0.1:{live_port}/v1/me", headers={"X-API-Key": gen_key})
         with urllib.request.urlopen(req_ok, timeout=2.0) as resp_ok:
             assert resp_ok.status == 200
 
         req_bad = urllib.request.Request(
-            f"http://127.0.0.1:{test_port}/v1/me", headers={"X-API-Key": "inherited-shadow-secret"}
+            f"http://127.0.0.1:{live_port}/v1/me", headers={"X-API-Key": "inherited-shadow-secret"}
         )
         with pytest.raises(urllib.error.HTTPError) as http_err:
             urllib.request.urlopen(req_bad, timeout=2.0)
         assert http_err.value.code == 401
     finally:
-        res_stop_live = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=shadow_env, capture_output=True, text=True, check=False)
+        res_stop_live = subprocess.run(["bash", dev_srv, "stop", str(live_port)], env=shadow_env, capture_output=True, text=True, check=False)
         assert res_stop_live.returncode == 0
-        assert os.stat(lock_path).st_ino == lock_ino_before
+        assert os.stat(live_lock_path).st_ino == live_lock_ino
 
     # 3. session-cli module unit tests: preserve session_id on 404/401 across --close, --new, REPL /new, and 202 polling
     loader = importlib.machinery.SourceFileLoader("session_cli_mod", cli_path)
@@ -2435,9 +2495,98 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     s_after_b = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
     assert s_after_b["status"] == "idle"
     assert s_after_b["total_attachment_bytes"] == 11
-    http_client.delete(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"})
 
-    # --- 4715131535: DB unavailable during BOTH atomic commit and fallback writes, reconciled live without restart ---
+    # 4715616293: Agent-written file in attachments/ is NOT unlinked when a concurrent/subsequent upload fails
+    agent_file = os.path.join(att_dir, "agent_created_note.txt")
+    with real_open(agent_file, "wb") as af:
+        af.write(b"agent-owned")
+    monkeypatch.setattr(_att_mod, "open", _patched_open, raising=False)
+    r_preserve_agent = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Upload fails while agent file exists",
+            "attachments": [{"filename": "transient_fail.bin", "content_b64": payload_32}],
+        },
+    )
+    assert r_preserve_agent.status_code == 500
+    monkeypatch.delattr(_att_mod, "open", raising=False)
+    assert os.path.exists(agent_file)
+
+    # 4715616286: httpx.ReadTimeout on 2nd attachment rolls back 1st attachment, finalizes turn as failed, restores idle (502)
+    import httpx as _httpx
+    real_sess_mat = _sess_mod.materialize_attachment
+    url_seq = {"n": 0}
+
+    async def _second_times_out(spec, workspace_path, **kwargs):
+        url_seq["n"] += 1
+        if url_seq["n"] == 1:
+            return await real_sess_mat(spec, workspace_path, **kwargs)
+        raise _httpx.ReadTimeout("Simulated URL stream timeout on second attachment")
+
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", _second_times_out)
+    r_url_to = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Two attachments where second times out",
+            "attachments": [
+                {"filename": "ok_first.bin", "content_b64": payload_32},
+                {"url": "https://example.com/slow.bin"},
+            ],
+        },
+    )
+    assert r_url_to.status_code == 502
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", real_sess_mat)
+    s_after_to = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_after_to["status"] == "idle"
+    assert s_after_to["total_attachment_bytes"] == 11  # first attachment rolled back cleanly
+
+    # 4715616289: ValueError size-limit rejection with retained unremovable temp file preserves 400 and accounts for retained bytes
+    async def _val_err_with_leftover(spec, workspace_path, **kwargs):
+        retained = os.path.abspath(os.path.join(workspace_path, "attachments", "retained_partial.tmp"))
+        with real_open(retained, "wb") as rf:
+            rf.write(b"X" * 7)
+        ve = ValueError("Attachment exceeds max single file size limit")
+        setattr(ve, "_unremoved_attachment_files", [(retained, 7)])
+        raise ve
+
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", _val_err_with_leftover)
+    r_val_left = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Oversize with retained temp",
+            "attachments": [{"url": "https://example.com/huge.bin"}],
+        },
+    )
+    assert r_val_left.status_code == 400
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", real_sess_mat)
+    s_after_val = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_after_val["status"] == "idle"
+    assert s_after_val["total_attachment_bytes"] == 18  # 11 + 7
+
+    # 4715131526: Uncertain leftover byte size (rem_bytes is None because stat also failed) retires session as 'failed' (500)
+    async def _uncertain_io_err(spec, workspace_path, **kwargs):
+        io_e = OSError(errno.EIO, "I/O failure with unreadable leftover")
+        setattr(io_e, "_unremoved_attachment_files", [(os.path.join(workspace_path, "attachments", "mystery.bin"), None)])
+        raise io_e
+
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", _uncertain_io_err)
+    r_uncertain = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Uncertain leftover bytes",
+            "attachments": [{"filename": "mystery.bin", "content_b64": payload_32}],
+        },
+    )
+    assert r_uncertain.status_code == 500
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", real_sess_mat)
+    assert http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()["status"] == "failed"
+
+    # --- 4715131535 & 4715616318: DB unavailable during atomic commit + fallbacks; stdin.write called EXACTLY once ---
+    rate_limiter.history.clear()
     r_db_spawn = http_client.post(
         "/v1/sessions",
         headers={"X-API-Key": "key-alice"},
@@ -2445,6 +2594,15 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     )
     assert r_db_spawn.status_code == 201
     sid_db = r_db_spawn.json()["id"]
+
+    live_db_obj = session_manager._sessions[sid_db]
+    stdin_writes = []
+    orig_stdin_write = live_db_obj.proc.stdin.write
+    monkeypatch.setattr(
+        live_db_obj.proc.stdin,
+        "write",
+        lambda payload: (stdin_writes.append(bytes(payload)), orig_stdin_write(payload))[1],
+    )
 
     real_atomic = _sess_mod.complete_turn_and_update_session
     real_finish_turn = _sess_mod.finish_session_turn
@@ -2464,6 +2622,7 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     )
     assert r_db_turn.status_code == 500
     assert not session_manager.is_session_active(sid_db)
+    assert len(stdin_writes) == 1
 
     # While DB writes are still blocked, rows are not yet reconciled
     pre_rec = http_client.get(f"/v1/sessions/{sid_db}?include_turns=true", headers={"X-API-Key": "key-alice"}).json()
@@ -2486,5 +2645,64 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
         time.sleep(0.1)
 
     assert post_rec is not None, f"Expected live DB reconciliation to failed; got {cand}"
-    assert len(post_rec["turns"]) == 1  # Prompt was never resent
+    assert len(stdin_writes) == 1  # Prompt was sent to subprocess stdin once and never resent during reconciliation
+    assert len(post_rec["turns"]) == 1
     assert post_rec["turn_count"] == 0
+
+    # --- 4715616282: Initial 'busy' write failure enters DB recovery without sending prompt (stdin_writes == 0) ---
+    r_busy_spawn = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    sid_busy = r_busy_spawn.json()["id"]
+    live_busy = session_manager._sessions[sid_busy]
+    busy_writes = []
+    orig_bw = live_busy.proc.stdin.write
+    monkeypatch.setattr(live_busy.proc.stdin, "write", lambda p: (busy_writes.append(p), orig_bw(p))[1])
+
+    real_upd_state = _sess_mod.update_session_state
+    monkeypatch.setattr(_sess_mod, "update_session_state", _db_down)
+    monkeypatch.setattr(_sess_mod, "finish_session_turn", _db_down)
+    monkeypatch.setattr(_sess_mod, "close_session_row", _db_down)
+
+    r_busy_fail = http_client.post(
+        f"/v1/sessions/{sid_busy}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Must never reach stdin"},
+    )
+    assert r_busy_fail.status_code == 500
+    assert len(busy_writes) == 0
+    monkeypatch.setattr(_sess_mod, "update_session_state", real_upd_state)
+    monkeypatch.setattr(_sess_mod, "finish_session_turn", real_finish_turn)
+    monkeypatch.setattr(_sess_mod, "close_session_row", real_close_row)
+    session_manager.reconcile_pending_db_writes()
+    rec_busy = http_client.get(f"/v1/sessions/{sid_busy}?include_turns=true", headers={"X-API-Key": "key-alice"}).json()
+    assert rec_busy["status"] == "failed"
+    assert rec_busy["turns"][0]["status"] == "failed"
+    assert len(busy_writes) == 0
+
+    # --- 4715616280, 4715616277, 4715616271, 4715616305: Winning 'closed' preserved, pair check, job DEFAULT_EFFORT, colon gate ---
+    from app.agents import build_agy_argv, build_claude_argv
+    from app.db import close_session_row as _db_close_row, complete_turn_and_update_session as _db_complete, create_session_turn as _db_create_turn
+
+    monkeypatch.setenv("DEFAULT_EFFORT", "low")
+    agy_cmd = build_agy_argv("hello", model="gemini-3.8-flash-high", effort=None)
+    assert "--effort" not in agy_cmd
+    assert "gemini-3.8-flash-high" in agy_cmd
+    claude_cmd = build_claude_argv("hello", effort=None)
+    assert "--effort" not in claude_cmd
+    monkeypatch.delenv("DEFAULT_EFFORT", raising=False)
+
+    with pytest.raises(LookupError):
+        _db_complete(turn_id="nonexistent-turn", turn_status="completed", session_id=sid_busy, turn_count=99)
+
+    r_win = http_client.post("/v1/sessions", headers={"X-API-Key": "key-alice"}, json={"agent": "mock_agy_session"})
+    sid_win = r_win.json()["id"]
+    t_win = _db_create_turn(session_id=sid_win, turn_index=0, prompt="p")
+    session_manager._pending_db_reconcile[sid_win] = (t_win["id"], "failed", "stale failure intent", None)
+    http_client.delete(f"/v1/sessions/{sid_win}", headers={"X-API-Key": "key-alice"})
+    session_manager.reconcile_pending_db_writes()
+    win_doc = http_client.get(f"/v1/sessions/{sid_win}?include_turns=true", headers={"X-API-Key": "key-alice"}).json()
+    assert win_doc["status"] == "closed"  # Winning 'closed' status was NOT overwritten by 'failed'
+    assert win_doc["turns"][0]["status"] == "failed"  # Pending turn still reached terminal 'failed'

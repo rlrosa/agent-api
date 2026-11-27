@@ -911,32 +911,34 @@ def close_session_row(
     error: Optional[str] = None,
     db_path: Optional[str] = None,
     api_key_name: Optional[str] = None,
+    only_if_non_terminal: bool = False,
 ) -> Optional[Dict[str, Any]]:
     path = _get_db_path(db_path)
     now = time.time()
+    non_term_clause = " AND status NOT IN ('closed', 'expired', 'failed')" if only_if_non_terminal else ""
 
     with _db_lock:
         with _connect(path) as conn:
             if api_key_name is not None and api_key_name != "bypass":
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE sessions
                     SET status = ?,
                         error = COALESCE(?, error),
                         closed_at = ?
-                    WHERE id = ? AND (api_key_name = ? OR (api_key_name IS NULL AND ? = 'default'))
+                    WHERE id = ? AND (api_key_name = ? OR (api_key_name IS NULL AND ? = 'default')){non_term_clause}
                     RETURNING *;
                     """,
                     (status, error, now, session_id, api_key_name, api_key_name),
                 )
             else:
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE sessions
                     SET status = ?,
                         error = COALESCE(?, error),
                         closed_at = ?
-                    WHERE id = ?
+                    WHERE id = ?{non_term_clause}
                     RETURNING *;
                     """,
                     (status, error, now, session_id),
@@ -1092,7 +1094,7 @@ def complete_turn_and_update_session(
                     cached_tokens = ?,
                     total_tokens = ?,
                     cost_usd = ?
-                WHERE id = ?
+                WHERE id = ? AND session_id = ?
                 RETURNING *;
                 """,
                 (
@@ -1107,9 +1109,13 @@ def complete_turn_and_update_session(
                     turn_total_tokens,
                     turn_cost_usd,
                     turn_id,
+                    session_id,
                 ),
             )
             turn_row = t_cur.fetchone()
+            if turn_row is None:
+                conn.rollback()
+                raise LookupError(f"Turn '{turn_id}' not found for session '{session_id}'")
 
             if sess_updates:
                 sess_params.append(session_id)
@@ -1121,6 +1127,10 @@ def complete_turn_and_update_session(
             else:
                 s_cur = conn.execute("SELECT * FROM sessions WHERE id = ?;", (session_id,))
                 sess_row = s_cur.fetchone()
+
+            if sess_row is None:
+                conn.rollback()
+                raise LookupError(f"Session '{session_id}' not found")
 
             conn.commit()
             return _row_to_dict(turn_row), _row_to_dict(sess_row)

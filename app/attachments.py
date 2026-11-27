@@ -168,17 +168,34 @@ async def fetch_url_attachment(
 
                     os.rename(temp_path, target_path)
                     return os.path.basename(target_path), bytes_written_this_file
-                except BaseException:
-                    try:
-                        os.unlink(temp_path)
-                    except OSError:
-                        pass
+                except BaseException as exc:
+                    _cleanup_failed_target(temp_path, exc)
                     raise
             finally:
                 await response.aclose()
 
     raise ValueError(f"Failed to fetch attachment URL {url}: max redirects exceeded")
 
+
+
+def _cleanup_failed_target(path: str, exc: BaseException) -> None:
+    """Remove a file created by a failed upload, or attach its exact path & byte size to exc if unlink fails."""
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        rem_bytes: Optional[int] = None
+        try:
+            rem_bytes = os.stat(path, follow_symlinks=False).st_size
+        except OSError:
+            rem_bytes = None
+        existing = list(getattr(exc, "_unremoved_attachment_files", ()))
+        existing.append((os.path.abspath(path), rem_bytes))
+        try:
+            setattr(exc, "_unremoved_attachment_files", existing)
+        except Exception:
+            pass
 
 
 def materialize_base64_attachment(
@@ -206,11 +223,8 @@ def materialize_base64_attachment(
     try:
         with open(target_path, "wb") as f:
             f.write(data)
-    except BaseException:
-        try:
-            os.unlink(target_path)
-        except OSError:
-            pass
+    except BaseException as exc:
+        _cleanup_failed_target(target_path, exc)
         raise
 
     return os.path.basename(target_path), data_len
@@ -236,11 +250,8 @@ def materialize_bytes_attachment(
     try:
         with open(target_path, "wb") as f:
             f.write(content_bytes)
-    except BaseException:
-        try:
-            os.unlink(target_path)
-        except OSError:
-            pass
+    except BaseException as exc:
+        _cleanup_failed_target(target_path, exc)
         raise
 
     return os.path.basename(target_path), data_len

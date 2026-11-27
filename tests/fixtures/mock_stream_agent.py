@@ -36,8 +36,9 @@ def main():
         if "TIMEOUT" in prompt:
             time.sleep(30)
         if "WAIT_GATE:" in prompt:
-            # Format: WAIT_GATE:<gate_filepath>:<label>
-            gate_path = prompt.split("WAIT_GATE:", 1)[1].split(":", 1)[0].strip()
+            # Format: WAIT_GATE:<gate_filepath>:<label> (preserve colons in gate_filepath via rsplit)
+            first_line = prompt.splitlines()[0]
+            gate_path = first_line.split("WAIT_GATE:", 1)[1].rsplit(":", 1)[0].strip()
             deadline = time.time() + 10.0
             while time.time() < deadline and not os.path.exists(gate_path):
                 time.sleep(0.02)

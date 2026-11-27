@@ -249,10 +249,15 @@ pidfd = None
 try:
     pidfd = os.pidfd_open(pid, 0)
     actual_start = proc_starttime(pid)
-except OSError:
+except (ProcessLookupError, FileNotFoundError):
     if pidfd is not None:
         os.close(pidfd)
     sys.exit(1)
+except OSError as e:
+    if pidfd is not None:
+        os.close(pidfd)
+    sys.stderr.write(f"error: failed opening pidfd or reading /proc/{pid}/stat: {e}\n")
+    sys.exit(3)
 
 if actual_start != expected_start:
     os.close(pidfd)
@@ -366,17 +371,33 @@ finally:
     os.close(log_fd)
     sock.close()
 
-start_ticks = proc_starttime(proc.pid)
-pid_fd = os.open(
-    pid_file,
-    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
-    0o600,
-)
 try:
-    os.fchmod(pid_fd, 0o600)
-    os.write(pid_fd, f"{proc.pid}:{start_ticks}\n".encode("ascii"))
-finally:
-    os.close(pid_fd)
+    start_ticks = proc_starttime(proc.pid)
+    try:
+        os.unlink(pid_file)
+    except FileNotFoundError:
+        pass
+    pid_fd = os.open(
+        pid_file,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        os.fchmod(pid_fd, 0o600)
+        os.write(pid_fd, f"{proc.pid}:{start_ticks}\n".encode("ascii"))
+    finally:
+        os.close(pid_fd)
+except BaseException as pub_err:
+    try:
+        proc.terminate()
+        proc.wait(timeout=3.0)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+    sys.exit(f"error: failed publishing PID file {pid_file}: {pub_err}")
 
 print(proc.pid)
 PY
