@@ -60,7 +60,28 @@ LOG_FILE="${STATE_DIR}/uvicorn.log"
 TARGET_URL="http://127.0.0.1:${PORT}"
 
 is_running() {
-  [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+  [ ! -L "$PID_FILE" ] && [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+terminate_pid() {
+  local pid="$1"
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.15
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+      fi
+      sleep 0.1
+    done
+  fi
+  ! kill -0 "$pid" 2>/dev/null
 }
 
 case "$ACTION" in
@@ -74,11 +95,66 @@ case "$ACTION" in
       exit 0
     fi
 
-    umask 077
-    mkdir -p "${STATE_DIR}/jobs" "${STATE_DIR}/sessions"
+    # Reject if another process already owns 127.0.0.1:<PORT>
+    if ! python3 - "$PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", port))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+    then
+      echo "error: port 127.0.0.1:${PORT} is already in use by another process" >&2
+      exit 1
+    fi
+
+    # Securely create/validate STATE_DIR (reject symlinks, foreign ownership, or unsafe permissions)
+    python3 - "$STATE_DIR" "$LOG_FILE" "$PID_FILE" <<'PY'
+import errno, os, stat, sys
+
+state_dir, log_file, pid_file = sys.argv[1], sys.argv[2], sys.argv[3]
+uid = os.getuid()
+
+try:
+    os.mkdir(state_dir, 0o700)
+except OSError as e:
+    if e.errno != errno.EEXIST:
+        raise
+
+st = os.lstat(state_dir)
+if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+    sys.exit(f"error: refusing unsafe state path {state_dir} (symlink or non-directory)")
+if st.st_uid != uid:
+    sys.exit(f"error: refusing state directory {state_dir} owned by uid {st.st_uid} (expected {uid})")
+if (st.st_mode & 0o077) != 0:
+    sys.exit(f"error: refusing state directory {state_dir} with group/world permissions ({oct(st.st_mode & 0o777)})")
+
+os.chmod(state_dir, 0o700)
+for sub in ("jobs", "sessions"):
+    p = os.path.join(state_dir, sub)
+    try:
+        os.mkdir(p, 0o700)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+    sub_st = os.lstat(p)
+    if stat.S_ISLNK(sub_st.st_mode) or not stat.S_ISDIR(sub_st.st_mode) or sub_st.st_uid != uid:
+        sys.exit(f"error: refusing unsafe subdirectory {p}")
+
+for fpath in (log_file, pid_file):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(fpath, flags, 0o600)
+    os.close(fd)
+PY
 
     DEV_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
 
+    umask 077
     env \
       SSH_CONNECTION=1 \
       API_KEY="$DEV_KEY" \
@@ -91,17 +167,21 @@ case "$ACTION" in
       BWRAP_ENABLED=1 \
       ALLOW_UNCONFINED=0 \
       setsid "$UVICORN_BIN" app.main:app --host 127.0.0.1 --port "$PORT" \
-      </dev/null >"$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
+      </dev/null >>"$LOG_FILE" 2>&1 &
+    NEW_PID=$!
+    echo "$NEW_PID" > "$PID_FILE"
 
     ready=0
     for _ in $(seq 1 35); do
-      if curl -sf "${TARGET_URL}/healthz" >/dev/null 2>&1; then
-        ready=1
+      if ! kill -0 "$NEW_PID" 2>/dev/null; then
         break
       fi
-      if ! is_running; then
-        break
+      if curl -sf "${TARGET_URL}/healthz" >/dev/null 2>&1; then
+        sleep 0.05
+        if kill -0 "$NEW_PID" 2>/dev/null; then
+          ready=1
+          break
+        fi
       fi
       sleep 0.2
     done
@@ -109,13 +189,16 @@ case "$ACTION" in
     if [ "$ready" -ne 1 ]; then
       echo "error: dev-server failed to start on ${TARGET_URL}. Recent logs:" >&2
       tail -n 30 "$LOG_FILE" >&2 || true
-      rm -f "$PID_FILE"
+      if terminate_pid "$NEW_PID"; then
+        rm -f "$PID_FILE"
+      else
+        echo "warning: uvicorn PID ${NEW_PID} still alive; keeping ${PID_FILE}" >&2
+      fi
       exit 1
     fi
 
     if [ -x "$SESSION_CLI" ]; then
       "$SESSION_CLI" --url "$TARGET_URL" --key "$DEV_KEY" --save-config >/dev/null 2>&1 || true
-      # Clear any stale session_id from a previous run
       python3 -c '
 import json, os
 p = os.path.expanduser("~/.cache/agent-api/session-cli.json")
@@ -129,7 +212,7 @@ if os.path.exists(p):
 '
     fi
 
-    echo "Started isolated dev-server on ${TARGET_URL} (PID $(cat "$PID_FILE"), dir ${STATE_DIR})"
+    echo "Started isolated dev-server on ${TARGET_URL} (PID ${NEW_PID}, dir ${STATE_DIR})"
     echo "Ready: run ./scripts/session-cli to chat, or ./scripts/dev-server.sh stop ${PORT} when done."
     ;;
 
@@ -144,8 +227,8 @@ if os.path.exists(p):
     ;;
 
   logs)
-    if [ ! -f "$LOG_FILE" ]; then
-      echo "No log file at ${LOG_FILE}" >&2
+    if [ ! -f "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
+      echo "No valid log file at ${LOG_FILE}" >&2
       exit 1
     fi
     if [ "$EXTRA_ARG" = "-f" ] || [ "$EXTRA_ARG" = "--follow" ]; then
@@ -156,7 +239,6 @@ if os.path.exists(p):
     ;;
 
   stop)
-    # If session-cli is currently pointed at this dev server, close active session & reset to :8090
     if [ -x "$SESSION_CLI" ] && [ -f "$HOME/.cache/agent-api/session-cli.json" ]; then
       current_url="$(python3 -c 'import json, os; p=os.path.expanduser("~/.cache/agent-api/session-cli.json"); print(json.load(open(p)).get("url",""))' 2>/dev/null || true)"
       if [ "$current_url" = "$TARGET_URL" ]; then
@@ -167,23 +249,16 @@ if os.path.exists(p):
 
     if is_running; then
       pid="$(cat "$PID_FILE")"
-      kill -TERM "$pid" 2>/dev/null || true
-      for _ in $(seq 1 20); do
-        if ! kill -0 "$pid" 2>/dev/null; then
-          break
-        fi
-        sleep 0.15
-      done
-      if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null || true
-      fi
+      terminate_pid "$pid" || true
       echo "Stopped dev-server PID ${pid} on ${TARGET_URL}"
     else
       echo "No running dev-server PID for port ${PORT}"
     fi
 
-    rm -rf "$STATE_DIR"
-    echo "Cleaned up ${STATE_DIR}"
+    if [ ! -L "$STATE_DIR" ] && [ -d "$STATE_DIR" ] && [ -O "$STATE_DIR" ]; then
+      rm -rf "$STATE_DIR"
+      echo "Cleaned up ${STATE_DIR}"
+    fi
     ;;
 
   *)

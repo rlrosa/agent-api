@@ -230,6 +230,23 @@ def build_codex_argv(
     raise NotImplementedError("codex agent is not installed on this system")
 
 
+def resolve_effective_session_model(
+    agent: str,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+) -> Optional[str]:
+    """Return the exact model name launched by the session argv builder (or None when omitted on CLI)."""
+    if agent == "agy":
+        resolved_model = resolve_model("agy", model)
+        return strip_model_tier(resolved_model) if effort else resolved_model
+    if agent == "claude":
+        settings = get_settings()
+        spec = AGENTS["claude"]["spec"]
+        raw_model = model or settings.claude_default_model or spec.default_model
+        return resolve_model("claude", raw_model) if raw_model else None
+    return model
+
+
 def build_agy_session_argv(
     model: Optional[str] = None,
     effort: Optional[str] = None,
@@ -237,13 +254,12 @@ def build_agy_session_argv(
 ) -> List[str]:
     # Note: Do NOT pass -p in agy stream-json mode (agy drops -p and listens strictly on stdin).
     cmd = ["agy", "--input-format", "stream-json", "--output-format", "stream-json"]
-    resolved_model = resolve_model("agy", model)
+    eff_model = resolve_effective_session_model("agy", model=model, effort=effort)
     if effort:
-        base = strip_model_tier(resolved_model)
         resolved_eff = resolve_effort(effort)
-        cmd.extend(["--model", base, "--effort", resolved_eff])
+        cmd.extend(["--model", eff_model, "--effort", resolved_eff])
     else:
-        cmd.extend(["--model", resolved_model])
+        cmd.extend(["--model", eff_model])
 
     cmd.extend(get_agent_flags("agy"))
     if workspace_path:
@@ -257,13 +273,11 @@ def build_claude_session_argv(
     workspace_path: Optional[str] = None,
 ) -> List[str]:
     # Note: claude 2.1+ requires both -p (--print) and --verbose when using --output-format stream-json.
-    spec = AGENTS["claude"]["spec"]
     cmd = ["claude", "-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json"]
 
-    settings = get_settings()
-    raw_model = model or settings.claude_default_model or spec.default_model
-    if raw_model:
-        cmd.extend(["--model", resolve_model("claude", raw_model)])
+    eff_model = resolve_effective_session_model("claude", model=model, effort=effort)
+    if eff_model:
+        cmd.extend(["--model", eff_model])
     if effort:
         cmd.extend(["--effort", resolve_effort(effort)])
 

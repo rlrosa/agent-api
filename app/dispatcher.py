@@ -210,14 +210,15 @@ async def _retention_loop() -> None:
             else:
                 logger.debug(f"Scheduled retention purge: 0 rows removed (cutoff: {cutoff:.0f})")
 
-            from app.db import purge_old_sessions
-            from app.sessions import sweep_orphaned_session_workspaces
-
-            purged_sessions = purge_old_sessions(cutoff, db_path=settings.db_path)
-            if purged_sessions > 0:
-                logger.info(
-                    f"Scheduled retention purge: removed {purged_sessions} session rows older than {settings.job_retention_days} days (cutoff: {cutoff:.0f})"
-                )
+            try:
+                from app.db import purge_old_sessions
+                purged_sessions = purge_old_sessions(cutoff, db_path=settings.db_path)
+                if purged_sessions > 0:
+                    logger.info(
+                        f"Scheduled retention purge: removed {purged_sessions} session rows older than {settings.job_retention_days} days (cutoff: {cutoff:.0f})"
+                    )
+            except Exception as sess_purge_exc:
+                logger.error(f"Error purging old sessions in retention sweeper: {sess_purge_exc}", exc_info=True)
 
             # Build daily rollups on schedule
             rollups_cnt = build_daily_rollups(db_path=settings.db_path)
@@ -227,9 +228,13 @@ async def _retention_loop() -> None:
             if reaped_ws > 0:
                 logger.info(f"Scheduled retention purge: reaped {reaped_ws} orphaned workspace directories")
 
-            reaped_session_ws = sweep_orphaned_session_workspaces(db_path=settings.db_path)
-            if reaped_session_ws > 0:
-                logger.info(f"Scheduled retention purge: reaped {reaped_session_ws} orphaned session workspace directories")
+            try:
+                from app.sessions import sweep_orphaned_session_workspaces
+                reaped_session_ws = sweep_orphaned_session_workspaces(db_path=settings.db_path)
+                if reaped_session_ws > 0:
+                    logger.info(f"Scheduled retention purge: reaped {reaped_session_ws} orphaned session workspace directories")
+            except Exception as sess_ws_exc:
+                logger.error(f"Error sweeping orphaned session workspaces: {sess_ws_exc}", exc_info=True)
 
             await asyncio.sleep(3600)
         except asyncio.CancelledError:

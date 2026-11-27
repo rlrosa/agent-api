@@ -35,6 +35,46 @@ def main():
             sys.exit(1)
         if "TIMEOUT" in prompt:
             time.sleep(30)
+        if "SLOW_TURN:" in prompt:
+            # Format: SLOW_TURN:<seconds>:<label>
+            rest = prompt.split("SLOW_TURN:", 1)[1]
+            parts = rest.split(":", 1)
+            delay_s = float(parts[0])
+            time.sleep(delay_s)
+        if "NON_DICT_JSON" in prompt:
+            sys.stdout.write("[1, 2, 3]\n")
+            sys.stdout.flush()
+            continue
+        if "SOFT_ERROR" in prompt:
+            if args.mode == "agy":
+                err_payload = {
+                    "conversation_id": conv_id,
+                    "status": "ERROR",
+                    "response": "",
+                    "error": "Transient tool execution failure",
+                    "usage": {
+                        "input_tokens": 100 * turn,
+                        "output_tokens": 50 * turn,
+                        "cache_read_tokens": 0,
+                        "total_tokens": 150 * turn,
+                    },
+                }
+                sys.stdout.write(json.dumps({"event": "result", "result": err_payload}) + "\n")
+                sys.stdout.flush()
+                continue
+            else:
+                err_evt = {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "session_id": conv_id,
+                    "result": "Transient tool execution failure",
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0},
+                    "total_cost_usd": round(0.0012 * turn, 6),
+                }
+                sys.stdout.write(json.dumps(err_evt) + "\n")
+                sys.stdout.flush()
+                continue
         if "AUTH_EXPIRED" in prompt:
             if args.mode == "agy":
                 sys.stderr.write(

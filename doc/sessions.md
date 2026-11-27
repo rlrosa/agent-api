@@ -362,6 +362,27 @@ A conversational bot (e.g. Baileys, WhatsApp Business API, Twilio) should implem
 
 ```javascript
 // Example Node.js WhatsApp session handler
+async function waitForTurnResult(sessionId, data) {
+  if (data.latest_turn && data.latest_turn.status === "completed") {
+    return data.latest_turn.response;
+  }
+  const targetTurnId = data.submitted_turn_id;
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 1500));
+    const poll = await api.get(`/v1/sessions/${sessionId}?include_turns=true`);
+    const turns = poll.data.turns || [];
+    const match = targetTurnId
+      ? turns.find((t) => t.id === targetTurnId)
+      : turns[turns.length - 1];
+    if (match && match.status === "completed") return match.response;
+    if (match && match.status === "failed") throw new Error(match.error || "Turn failed");
+    if (["failed", "closed", "expired"].includes(poll.data.status)) {
+      throw new Error(poll.data.error || `Session ${poll.data.status}`);
+    }
+  }
+  throw new Error("Timed out polling for session turn completion");
+}
+
 async function handleUserMessage(chatId, text, mediaAttachment) {
   let sessionId = await cache.get(`session:${chatId}`);
 
@@ -376,7 +397,9 @@ async function handleUserMessage(chatId, text, mediaAttachment) {
     });
     sessionId = res.data.id;
     await cache.set(`session:${chatId}`, sessionId, 15 * 60); // 15m TTL
-    return res.data.latest_turn.response;
+    return res.status === 202
+      ? await waitForTurnResult(sessionId, res.data)
+      : res.data.latest_turn.response;
   }
 
   // 2. Subsequent turn: send message to existing session
@@ -386,7 +409,9 @@ async function handleUserMessage(chatId, text, mediaAttachment) {
       attachments: mediaAttachment ? [mediaAttachment] : []
     });
     await cache.expire(`session:${chatId}`, 15 * 60); // refresh TTL
-    return res.data.latest_turn.response;
+    return res.status === 202
+      ? await waitForTurnResult(sessionId, res.data)
+      : res.data.latest_turn.response;
   } catch (err) {
     if (err.response && err.response.status === 409) {
       // 3. Session expired or closed: seamlessly start a fresh session
@@ -398,7 +423,9 @@ async function handleUserMessage(chatId, text, mediaAttachment) {
         attachments: mediaAttachment ? [mediaAttachment] : []
       });
       await cache.set(`session:${chatId}`, freshRes.data.id, 15 * 60);
-      return freshRes.data.latest_turn.response;
+      return freshRes.status === 202
+        ? await waitForTurnResult(freshRes.data.id, freshRes.data)
+        : freshRes.data.latest_turn.response;
     }
     throw err;
   }

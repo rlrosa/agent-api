@@ -182,7 +182,12 @@ def send_message_or_spawn(
 
     if force_new and state.get("session_id"):
         old_id = state["session_id"]
-        api_request(state["url"], state["api_key"], "DELETE", f"/v1/sessions/{old_id}", timeout=15.0)
+        del_code, del_data = api_request(state["url"], state["api_key"], "DELETE", f"/v1/sessions/{old_id}", timeout=15.0)
+        if del_code not in (200, 404):
+            err_print(
+                f"[error HTTP {del_code}] Failed to close cached session {old_id[:8]}: {del_data.get('detail') or del_data}"
+            )
+            return None
         state["session_id"] = None
         save_state(state_path, state)
 
@@ -205,7 +210,7 @@ def send_message_or_spawn(
             elapsed = time.time() - t0
             return _emit_turn_output(data, elapsed)
         if code == 202:
-            return _poll_until_turn_done(state, session_id, t0)
+            return _poll_until_turn_done(state, session_id, t0, submitted_turn_id=data.get("submitted_turn_id"))
         if code in (404, 409):
             warn(f"[notice] Previous session {session_id[:8]} unavailable ({data.get('detail', code)}); starting fresh session...")
             state["session_id"] = None
@@ -247,32 +252,68 @@ def send_message_or_spawn(
         if sid:
             state["session_id"] = sid
             save_state(state_path, state)
-            return _poll_until_turn_done(state, sid, t0)
+            return _poll_until_turn_done(state, sid, t0, submitted_turn_id=data.get("submitted_turn_id"))
     err_print(f"[error HTTP {code}] {data.get('detail') or data}")
     return None
 
 
-def _poll_until_turn_done(state: Dict[str, Any], session_id: str, t0: float) -> Optional[Dict[str, Any]]:
+def _fetch_all_session_turns(state: Dict[str, Any], session_id: str) -> Tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
+    all_turns: List[Dict[str, Any]] = []
+    cursor: Optional[int] = None
+    last_sess: Dict[str, Any] = {}
+    while True:
+        q = f"/v1/sessions/{session_id}?include_turns=true&turns_limit=200"
+        if cursor is not None:
+            q += f"&after_turn={cursor}"
+        code, sdata = api_request(state["url"], state["api_key"], "GET", q, timeout=15.0)
+        if code != 200:
+            return code, sdata, all_turns
+        last_sess = sdata
+        page = sdata.get("turns") or []
+        all_turns.extend(page)
+        if sdata.get("turns_has_more") and sdata.get("next_after_turn") is not None:
+            cursor = int(sdata["next_after_turn"])
+        else:
+            break
+    return 200, last_sess, all_turns
+
+
+def _poll_until_turn_done(
+    state: Dict[str, Any],
+    session_id: str,
+    t0: float,
+    submitted_turn_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     info(f"[waiting] Turn still running on session {session_id[:8]}... polling for completion")
-    prev_turns = None
+    baseline_max_idx: Optional[int] = None
     while True:
         time.sleep(1.5)
-        code, sdata = api_request(
-            state["url"],
-            state["api_key"],
-            "GET",
-            f"/v1/sessions/{session_id}?include_turns=true",
-            timeout=15.0,
-        )
+        code, sdata, turns = _fetch_all_session_turns(state, session_id)
         if code != 200:
             err_print(f"[error HTTP {code}] {sdata.get('detail') or sdata}")
             return None
-        turns = sdata.get("turns") or []
-        if prev_turns is None:
-            prev_turns = len(turns)
-        if sdata.get("status") == "idle" and turns and turns[-1].get("status") == "completed":
-            sdata["latest_turn"] = turns[-1]
-            return _emit_turn_output(sdata, time.time() - t0)
+
+        if submitted_turn_id:
+            matched = next((t for t in turns if t.get("id") == submitted_turn_id), None)
+            if matched is not None:
+                if matched.get("status") == "completed":
+                    sdata["latest_turn"] = matched
+                    return _emit_turn_output(sdata, time.time() - t0)
+                if matched.get("status") == "failed":
+                    err_print(f"[turn failed] {matched.get('error') or sdata.get('error') or 'Turn failed'}")
+                    return None
+        else:
+            if baseline_max_idx is None:
+                completed_indices = [int(t.get("turn_index", -1)) for t in turns if t.get("status") == "completed"]
+                baseline_max_idx = max(completed_indices) if completed_indices else -1
+            newer_completed = [
+                t for t in turns
+                if t.get("status") == "completed" and int(t.get("turn_index", -1)) > baseline_max_idx
+            ]
+            if newer_completed:
+                sdata["latest_turn"] = newer_completed[0]
+                return _emit_turn_output(sdata, time.time() - t0)
+
         if sdata.get("status") in ("failed", "closed", "expired"):
             err_print(f"[session {sdata.get('status')}] {sdata.get('error') or ''}")
             return None
@@ -356,13 +397,18 @@ def cmd_close(state: Dict[str, Any], state_path: str) -> int:
         info("No active cached session to close.")
         return 0
     code, data = api_request(state["url"], state["api_key"], "DELETE", f"/v1/sessions/{sid}", timeout=15.0)
-    state["session_id"] = None
-    save_state(state_path, state)
     if code == 200:
+        state["session_id"] = None
+        save_state(state_path, state)
         info(f"[closed] Session {sid[:8]} closed and workspace reaped.")
         return 0
-    warn(f"[cleared local cache] Server returned HTTP {code}: {data.get('detail') or data}")
-    return 0
+    if code == 404:
+        state["session_id"] = None
+        save_state(state_path, state)
+        warn(f"[cleared local cache] Session {sid[:8]} already absent on server (HTTP 404).")
+        return 0
+    err_print(f"[error HTTP {code}] Failed to close session {sid[:8]} (keeping cached session_id): {data.get('detail') or data}")
+    return 1
 
 
 def ensure_warm_idle_session(state: Dict[str, Any], state_path: str) -> Optional[str]:

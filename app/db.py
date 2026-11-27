@@ -665,6 +665,9 @@ def create_session_row(
             return _row_to_dict(row)
 
 
+_UNSET = object()
+
+
 def update_session_state(
     session_id: str,
     status: Optional[str] = None,
@@ -676,7 +679,7 @@ def update_session_state(
     cached_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
     cost_usd: Optional[float] = None,
-    error: Optional[str] = None,
+    error: Any = _UNSET,
     last_active_at: Optional[float] = None,
     closed_at: Optional[float] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -713,7 +716,7 @@ def update_session_state(
     if cost_usd is not None:
         updates.append("cost_usd = ?")
         params.append(cost_usd)
-    if error is not None:
+    if error is not _UNSET:
         updates.append("error = ?")
         params.append(error)
     if last_active_at is not None:
@@ -877,18 +880,27 @@ def list_session_turns(
     session_id: str,
     db_path: Optional[str] = None,
     api_key_name: Optional[str] = None,
+    after_turn: Optional[int] = None,
+    limit: int = 100,
 ) -> Optional[List[Dict[str, Any]]]:
     path = _get_db_path(db_path)
     session = get_session(session_id, db_path=path, api_key_name=api_key_name)
     if session is None:
         return None
 
+    eff_limit = max(1, min(int(limit), 501))
     with _db_lock:
         with _connect(path) as conn:
-            cur = conn.execute(
-                "SELECT * FROM session_turns WHERE session_id = ? ORDER BY turn_index ASC;",
-                (session_id,),
-            )
+            if after_turn is not None:
+                cur = conn.execute(
+                    "SELECT * FROM session_turns WHERE session_id = ? AND turn_index > ? ORDER BY turn_index ASC LIMIT ?;",
+                    (session_id, int(after_turn), eff_limit),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT * FROM session_turns WHERE session_id = ? ORDER BY turn_index ASC LIMIT ?;",
+                    (session_id, eff_limit),
+                )
             rows = cur.fetchall()
             return [_row_to_dict(r) for r in rows]
 

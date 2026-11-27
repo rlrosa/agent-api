@@ -23,9 +23,9 @@ from app.db import (
 
 
 @pytest.fixture
-def tmp_db_path(tmp_path):
+def tmp_db_path(tmp_path, monkeypatch):
     db_file = str(tmp_path / "test_sessions.db")
-    os.environ["API_KEY"] = "testkey"
+    monkeypatch.setenv("API_KEY", "testkey")
     init_db(db_file)
     return db_file
 
@@ -117,6 +117,9 @@ def test_agents_registry_session_argv_builders():
 def test_build_agy_session_argv(monkeypatch):
     """Test agy session argv builder rules."""
     monkeypatch.setenv("API_KEY", "dev")
+    for k in ("AGY_DEFAULT_MODEL", "CLAUDE_DEFAULT_MODEL", "AGENT_FLAGS_AGY", "AGENT_FLAGS_CLAUDE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("SANDBOX_ENABLED", "1")
 
     # Basic call: --input-format stream-json --output-format stream-json, NO -p
     argv = build_agy_session_argv()
@@ -164,6 +167,9 @@ def test_build_agy_session_argv(monkeypatch):
 def test_build_claude_session_argv(monkeypatch):
     """Test claude session argv builder rules."""
     monkeypatch.setenv("API_KEY", "dev")
+    for k in ("AGY_DEFAULT_MODEL", "CLAUDE_DEFAULT_MODEL", "AGENT_FLAGS_AGY", "AGENT_FLAGS_CLAUDE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("SANDBOX_ENABLED", "1")
 
     # Basic call: claude -p --verbose --input-format stream-json --output-format stream-json
     argv = build_claude_session_argv()
@@ -645,6 +651,19 @@ def test_spawn_without_initial_prompt_and_wait_zero(http_client):
     http_client.delete(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
 
 
+def _poll_until_expired(http_client, session_id: str, headers: dict, timeout_s: float = 5.0) -> dict:
+    deadline = time.time() + timeout_s
+    last_resp = None
+    while time.time() < deadline:
+        r = http_client.get(f"/v1/sessions/{session_id}", headers=headers)
+        if r.status_code == 200:
+            last_resp = r.json()
+            if last_resp.get("status") == "expired" and not session_manager.is_session_active(session_id):
+                return last_resp
+        time.sleep(0.05)
+    raise AssertionError(f"Session {session_id} did not persist expired status within {timeout_s}s; last={last_resp}")
+
+
 def test_session_idle_auto_expiration(http_client):
     """Test idle reaper auto-expiration, child termination, and 409 Conflict rejection."""
     r1 = http_client.post(
@@ -656,22 +675,16 @@ def test_session_idle_auto_expiration(http_client):
     session_id = r1.json()["id"]
 
     live = session_manager._sessions[session_id]
-    child_proc = live.proc
     ws_path = live.workspace_path
     assert os.path.exists(ws_path)
 
     # Fast-forward last_active_at by 10s to trigger reaper immediately
     live.last_active_at = time.time() - 10.0
-    time.sleep(1.2)
 
-    # Session is reaped
+    expired_doc = _poll_until_expired(http_client, session_id, {"X-API-Key": "key-alice"})
+    assert expired_doc["status"] == "expired"
     assert not session_manager.is_session_active(session_id)
     assert not os.path.exists(ws_path)
-
-    # GET returns expired
-    r_get = http_client.get(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
-    assert r_get.status_code == 200
-    assert r_get.json()["status"] == "expired"
 
     # Subsequent POST /messages returns 409 Conflict
     r_msg = http_client.post(
@@ -717,16 +730,17 @@ def test_workspace_isolation_between_jobs_and_sessions(tmp_path, http_client):
     http_client.delete(f"/v1/sessions/{active_id}", headers={"X-API-Key": "key-alice"})
 
 
-def test_fifo_turn_serialization_and_queue_depth_cap(http_client):
-    """Test FIFO sequential execution and queue depth rejection (429)."""
+def test_fifo_turn_serialization_and_queue_depth_cap(http_client, monkeypatch):
+    """Test controlled FIFO sequential execution overlap and real queue depth rejection (429)."""
+    monkeypatch.setenv("MAX_QUEUED_TURNS_PER_SESSION", "2")
     r1 = http_client.post(
         "/v1/sessions",
         headers={"X-API-Key": "key-alice"},
         json={"agent": "mock_agy_session"},
     )
     session_id = r1.json()["id"]
+    live = session_manager._sessions[session_id]
 
-    # 2 concurrent turns execute sequentially
     def send_turn(turn_text):
         return http_client.post(
             f"/v1/sessions/{session_id}/messages",
@@ -734,27 +748,44 @@ def test_fifo_turn_serialization_and_queue_depth_cap(http_client):
             json={"prompt": turn_text},
         )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f1 = executor.submit(send_turn, "Msg 1")
-        f2 = executor.submit(send_turn, "Msg 2")
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Hold Turn 0 active on live.lock
+        f0 = executor.submit(send_turn, "SLOW_TURN:0.55:TurnZero")
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not live.lock.locked():
+            time.sleep(0.01)
+        assert live.lock.locked()
+
+        # Submit Turn 1 in known order and wait until queued_waiters == 1
+        f1 = executor.submit(send_turn, "QueuedFirst")
+        deadline = time.time() + 2.0
+        while time.time() < deadline and live.queued_waiters < 1:
+            time.sleep(0.01)
+        assert live.queued_waiters == 1
+
+        # Submit Turn 2 in known order and wait until queued_waiters == 2 (fills MAX_QUEUED_TURNS_PER_SESSION=2)
+        f2 = executor.submit(send_turn, "QueuedSecond")
+        deadline = time.time() + 2.0
+        while time.time() < deadline and live.queued_waiters < 2:
+            time.sleep(0.01)
+        assert live.queued_waiters == 2
+
+        # Additional turn while 2 real turns are waiting in queue -> HTTP 429 overflow
+        r_over = send_turn("RejectedOverflow")
+        assert r_over.status_code == 429, r_over.text
+        assert "Session turn queue full" in r_over.json()["detail"]
+        assert r_over.headers.get("Retry-After") == "5"
+
+        res0 = f0.result()
         res1 = f1.result()
         res2 = f2.result()
 
+    assert res0.status_code == 200
     assert res1.status_code == 200
     assert res2.status_code == 200
-
-    # Max queued turns guard: artificially set queued_waiters to max (3)
-    live = session_manager._sessions[session_id]
-    live.queued_waiters = 3
-    r_over = http_client.post(
-        f"/v1/sessions/{session_id}/messages",
-        headers={"X-API-Key": "key-alice"},
-        json={"prompt": "Rejected overflow"},
-    )
-    assert r_over.status_code == 429
-    assert "Session turn queue full" in r_over.json()["detail"]
-    assert r_over.headers.get("Retry-After") == "5"
-    live.queued_waiters = 0
+    assert "Echo [turn 1]: SLOW_TURN:0.55:TurnZero" in res0.json()["latest_turn"]["response"]
+    assert "Echo [turn 2]: QueuedFirst" in res1.json()["latest_turn"]["response"]
+    assert "Echo [turn 3]: QueuedSecond" in res2.json()["latest_turn"]["response"]
 
     http_client.delete(f"/v1/sessions/{session_id}", headers={"X-API-Key": "key-alice"})
 
@@ -928,6 +959,7 @@ def test_turn_timeout_crash_large_output_and_chatty_stderr(http_client):
 
 def test_session_spawn_bwrap_fail_closed(monkeypatch, tmp_path):
     """Test fail-closed confinement error when bwrap is missing and allow_unconfined=0."""
+    monkeypatch.setenv("API_KEY", "dev")
     monkeypatch.setenv("BWRAP_ENABLED", "1")
     monkeypatch.setenv("ALLOW_UNCONFINED", "0")
     monkeypatch.setattr("shutil.which", lambda cmd: None if cmd == "bwrap" else "/bin/python3")
@@ -938,10 +970,11 @@ def test_session_spawn_bwrap_fail_closed(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_agy_stream_driver_nested_wire_format():
+async def test_agy_stream_driver_nested_wire_format(monkeypatch):
     """Finding 1: Verify AgyStreamDriver correctly extracts from nested {"event": "result", "result": {...}} wire format."""
     import asyncio
     import json
+    monkeypatch.setenv("API_KEY", "dev")
     driver = AgyStreamDriver()
     raw = json.dumps({
         "event": "result",
@@ -1280,14 +1313,167 @@ def test_session_max_lifetime_and_default_effort(http_client, monkeypatch):
 
     # Keep last_active_at fresh, but advance wall-clock age past max_lifetime
     live = session_manager._sessions[sid]
+    ws_path = live.workspace_path
     live.last_active_at = time.time()
     live.created_at = time.time() - 7.0
-    time.sleep(1.3)
 
+    expired_doc = _poll_until_expired(http_client, sid, {"X-API-Key": "key-alice"})
+    assert expired_doc["status"] == "expired"
+    assert not os.path.exists(ws_path)
+
+
+def test_coderabbit_pr7_review_fixes(http_client, monkeypatch, tmp_path):
+    """Regression suite covering PR #7 review findings across jobs, db, pagination, security, and CLI."""
+    import io
+    import json
+    import subprocess
+    import sys
+
+    # 1. /v1/jobs rejects session-only mock agents whose argv_builder is None with HTTP 400
+    r_job = http_client.post(
+        "/v1/jobs",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session", "prompt": "Should fail 400"},
+    )
+    assert r_job.status_code == 400
+    assert "does not support one-shot jobs" in r_job.json()["detail"]
+
+    # 2. Multipart file upload passed as scalar 'prompt' field rejected with 400 before spawning session
+    r_bad_mp = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        data={"agent": "mock_agy_session"},
+        files={"prompt": ("evil.txt", io.BytesIO(b"hello"), "text/plain")},
+    )
+    assert r_bad_mp.status_code == 400
+    assert "scalar text" in r_bad_mp.json()["detail"]
+    assert session_manager.active_session_count() == 0
+
+    # 3. session.error clears after subsequent successful turn, and prompt paths are NOT probed on host
+    r_spawn = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r_spawn.status_code == 201
+    sid = r_spawn.json()["id"]
+
+    r_s = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "SOFT_ERROR"},
+    )
+    assert r_s.status_code == 500
+    s_after_err = http_client.get(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_after_err["error"] == "Transient tool execution failure"
+    assert s_after_err["status"] == "idle"
+
+    # Free-form prompt containing 'Attached files:\n- /nonexistent/host/secret' must NOT trigger missing-attachment 500
+    r_rec = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Normal prompt\n\nAttached files:\n- /nonexistent/host/secret.txt"},
+    )
+    assert r_rec.status_code == 200, r_rec.text
+    assert r_rec.json()["error"] is None
+
+    # Add one more turn and verify cursor pagination on GET ?include_turns=true
+    r_t3 = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Turn three"},
+    )
+    assert r_t3.status_code == 200
+
+    p1 = http_client.get(
+        f"/v1/sessions/{sid}?include_turns=true&turns_limit=2",
+        headers={"X-API-Key": "key-alice"},
+    ).json()
+    assert len(p1["turns"]) == 2
+    assert p1["turns_has_more"] is True
+    assert p1["next_after_turn"] == 1
+
+    p2 = http_client.get(
+        f"/v1/sessions/{sid}?include_turns=true&turns_limit=2&after_turn={p1['next_after_turn']}",
+        headers={"X-API-Key": "key-alice"},
+    ).json()
+    assert len(p2["turns"]) == 1
+    assert p2["turns"][0]["turn_index"] == 2
+    assert p2["turns_has_more"] is False
+
+    # 4. WAIT_DEFAULT=0 honoured when JSON omits wait, returning 202 with submitted_turn_id and max_expires_at
+    monkeypatch.setenv("WAIT_DEFAULT", "0")
+    r_async = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Async via WAIT_DEFAULT=0"},
+    )
+    assert r_async.status_code == 202
+    d_async = r_async.json()
+    assert d_async.get("submitted_turn_id") is not None
+    assert d_async.get("max_expires_at") is not None
+    monkeypatch.delenv("WAIT_DEFAULT", raising=False)
+
+    # Wait briefly for async turn to finish, then test NON_DICT_JSON stream failure finalizes & closes session
+    for _ in range(40):
+        g = http_client.get(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"}).json()
+        if g["turn_count"] >= 4 and g["status"] == "idle":
+            break
+        time.sleep(0.05)
+
+    r_bad_stream = http_client.post(
+        f"/v1/sessions/{sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "NON_DICT_JSON"},
+    )
+    assert r_bad_stream.status_code == 500
     assert not session_manager.is_session_active(sid)
-    r_get = http_client.get(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"})
-    assert r_get.status_code == 200
-    assert r_get.json()["status"] == "expired"
+    g_closed = http_client.get(f"/v1/sessions/{sid}", headers={"X-API-Key": "key-alice"}).json()
+    assert g_closed["status"] == "failed"
+
+    # 5. Dead idle child retired on /messages (frees active slot)
+    r_dead = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    dead_sid = r_dead.json()["id"]
+    dead_live = session_manager._sessions[dead_sid]
+    dead_live.proc.kill()
+    for _ in range(40):
+        if dead_live.proc.returncode is not None:
+            break
+        time.sleep(0.02)
+    r_dead_msg = http_client.post(
+        f"/v1/sessions/{dead_sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Child already dead"},
+    )
+    assert r_dead_msg.status_code == 409
+    assert not session_manager.is_session_active(dead_sid)
+
+    # 6. session-cli --close preserves cached session_id and returns nonzero on non-200/404 response
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    cli_path = os.path.join(repo_root, "scripts", "session-cli")
+    st_file = str(tmp_path / "preserve-close.json")
+    with open(st_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "url": "http://127.0.0.1:9",  # connection refused -> non-200
+                "api_key": "bad",
+                "session_id": "keep-this-id-1234",
+            },
+            f,
+        )
+    os.chmod(st_file, 0o600)
+    res_close = subprocess.run(
+        [sys.executable, cli_path, "--state-file", st_file, "--close"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_close.returncode != 0
+    assert json.load(open(st_file))["session_id"] == "keep-this-id-1234"
 
 
 

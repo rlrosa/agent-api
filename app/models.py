@@ -50,7 +50,7 @@ class CreateSessionRequest(BaseModel):
     idle_timeout: Optional[int] = None
     turn_timeout: Optional[int] = None
     max_lifetime: Optional[int] = None
-    wait: int = 60
+    wait: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
 
     model_config = ConfigDict(extra="forbid")
@@ -60,7 +60,7 @@ class SessionMessageRequest(BaseModel):
     prompt: str
     attachments: Optional[List[AttachmentSpec]] = None
     turn_timeout: Optional[int] = None
-    wait: int = 60
+    wait: Optional[int] = None
 
     model_config = ConfigDict(extra="forbid")
 

@@ -196,10 +196,16 @@ def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List
             bwrap_cmd.extend([
                 "--ro-bind", claude_json, claude_json,
             ])
-
-
-
-
+    elif settings.allow_mock_agent and agent in ("mock_agy_session", "mock_claude_session"):
+        import sys
+        mock_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "mock_stream_agent.py")
+        )
+        if os.path.exists(mock_script):
+            bwrap_cmd.extend(["--ro-bind", mock_script, mock_script])
+        venv_prefix = os.path.abspath(sys.prefix)
+        if os.path.exists(venv_prefix) and not venv_prefix.startswith(("/usr/", "/bin/", "/lib/")):
+            bwrap_cmd.extend(["--ro-bind", venv_prefix, venv_prefix])
 
     bwrap_cmd.extend([
         "--bind", workspace_path, workspace_path,
