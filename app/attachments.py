@@ -1,4 +1,6 @@
 import base64
+import contextlib
+import contextvars
 import ipaddress
 import mimetypes
 import os
@@ -111,22 +113,39 @@ def get_filename_from_response(response: httpx.Response, url: str) -> str:
     return "downloaded_file"
 
 
+_DEFERRED_STAGE_QUEUE: contextvars.ContextVar[Optional[List[Tuple[str, str]]]] = contextvars.ContextVar(
+    "_DEFERRED_STAGE_QUEUE", default=None
+)
+
+
+@contextlib.contextmanager
+def deferred_attachment_commits():
+    """Defer publishing staged files into attachments/ until every attachment in a turn has succeeded."""
+    staged: List[Tuple[str, str]] = []
+    token = _DEFERRED_STAGE_QUEUE.set(staged)
+    try:
+        yield staged
+    finally:
+        _DEFERRED_STAGE_QUEUE.reset(token)
+
+
 def get_upload_staging_dir(workspace_path: str) -> str:
     """Return an upload-owned staging directory outside workspace_path (invisible inside bwrap)."""
     abs_ws = os.path.abspath(workspace_path.rstrip(os.sep))
     return os.path.join(os.path.dirname(abs_ws), ".staging", os.path.basename(abs_ws))
 
 
-def _open_unique_staging_file(attachments_dir: str) -> Tuple[int, str]:
+def _open_unique_staging_file(attachments_dir: str, clean_filename: str = "part") -> Tuple[int, str]:
     abs_att = os.path.abspath(attachments_dir.rstrip(os.sep))
     ws_path = os.path.dirname(abs_att)
     staging_dir = get_upload_staging_dir(ws_path)
     os.makedirs(staging_dir, mode=0o700, exist_ok=True)
-    return tempfile.mkstemp(prefix=".part-", suffix=".upload", dir=staging_dir)
+    safe_prefix = os.path.basename(clean_filename)[:48] or "part"
+    return tempfile.mkstemp(prefix=f"{safe_prefix}.", suffix=".upload", dir=staging_dir)
 
 
-def _commit_staged_file(temp_path: str, attachments_dir: str, clean_filename: str) -> str:
-    """Atomically publish temp_path into attachments_dir without overwriting any existing or agent-created file."""
+def _publish_staged_file(temp_path: str, attachments_dir: str, clean_filename: str) -> str:
+    """Atomically link temp_path into attachments_dir without overwriting any existing or agent-created file."""
     abs_attachments = os.path.abspath(attachments_dir)
     base_name, ext = os.path.splitext(clean_filename)
     counter = 0
@@ -145,6 +164,15 @@ def _commit_staged_file(temp_path: str, attachments_dir: str, clean_filename: st
             return os.path.basename(target_path)
         except FileExistsError:
             counter += 1
+
+
+def _commit_staged_file(temp_path: str, attachments_dir: str, clean_filename: str) -> str:
+    """Either defer publication (during multi-attachment turn staging) or publish immediately."""
+    deferred = _DEFERRED_STAGE_QUEUE.get()
+    if deferred is not None:
+        deferred.append((temp_path, clean_filename))
+        return temp_path
+    return _publish_staged_file(temp_path, attachments_dir, clean_filename)
 
 
 async def fetch_url_attachment(
@@ -185,7 +213,7 @@ async def fetch_url_attachment(
                 clean_filename = sanitize_filename(raw_filename, content_type=content_type)
 
                 bytes_written_this_file = 0
-                sfd, temp_path = _open_unique_staging_file(attachments_dir)
+                sfd, temp_path = _open_unique_staging_file(attachments_dir, clean_filename)
 
                 try:
                     with open(sfd, "wb") as f:
@@ -255,7 +283,7 @@ def materialize_base64_attachment(
     if total_bytes_written + data_len > max_total_bytes:
         raise ValueError(f"Job total attachments size exceeds limit ({max_total_bytes} bytes)")
 
-    sfd, temp_path = _open_unique_staging_file(attachments_dir)
+    sfd, temp_path = _open_unique_staging_file(attachments_dir, clean_filename)
     try:
         with open(sfd, "wb") as f:
             f.write(data)
@@ -283,7 +311,7 @@ def materialize_bytes_attachment(
     if total_bytes_written + data_len > max_total_bytes:
         raise ValueError(f"Job total attachments size exceeds limit ({max_total_bytes} bytes)")
 
-    sfd, temp_path = _open_unique_staging_file(attachments_dir)
+    sfd, temp_path = _open_unique_staging_file(attachments_dir, clean_filename)
     try:
         with open(sfd, "wb") as f:
             f.write(content_bytes)

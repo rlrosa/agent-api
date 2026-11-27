@@ -13,7 +13,13 @@ from fastapi import HTTPException, status
 import httpx
 
 from app.agents import AGENTS, resolve_effective_session_model, strip_model_tier
-from app.attachments import compose_prompt, get_upload_staging_dir, materialize_attachment
+from app.attachments import (
+    _publish_staged_file,
+    compose_prompt,
+    deferred_attachment_commits,
+    get_upload_staging_dir,
+    materialize_attachment,
+)
 from app.config import Settings, get_settings
 from app.db import (
     _UNSET,
@@ -357,16 +363,36 @@ class LiveSession:
         self.active_turn_task: Optional[asyncio.Task] = None
 
 
-def _rollback_turn_uploads(live: "LiveSession", saved_this_turn: List[Tuple[str, int]]) -> None:
-    """Remove newly saved files from a failed turn; keep byte accounting & tracking for any file whose unlink failed."""
-    for fp, bc in saved_this_turn:
+def _rollback_turn_uploads(
+    live: "LiveSession",
+    saved_this_turn: List[Union[Tuple[str, int], Tuple[str, int, Optional[int], Optional[int]]]],
+) -> None:
+    """Remove newly saved files from a failed turn; protect any agent replacement with a different inode."""
+    for entry in saved_this_turn:
+        if len(entry) == 4:
+            fp, bc, exp_dev, exp_ino = entry
+        else:
+            fp, bc = entry
+            exp_dev, exp_ino = None, None
+
         try:
-            os.remove(fp)
-            removed = True
+            st = os.lstat(fp)
         except FileNotFoundError:
             removed = True
         except OSError:
             removed = False
+        else:
+            if exp_dev is not None and exp_ino is not None and (st.st_dev, st.st_ino) != (exp_dev, exp_ino):
+                # Path was replaced by a different inode (e.g. agent replaced published file); never delete replacement!
+                removed = True
+            else:
+                try:
+                    os.remove(fp)
+                    removed = True
+                except FileNotFoundError:
+                    removed = True
+                except OSError:
+                    removed = False
 
         if removed:
             live.total_attachment_bytes = max(0, live.total_attachment_bytes - bc)
@@ -934,7 +960,7 @@ class SessionManager:
                 live.queued_waiters = max(0, live.queued_waiters - 1)
                 decremented_waiter = True
                 live.active_turn_task = asyncio.current_task()
-                saved_this_turn: List[Tuple[str, int]] = []
+                saved_this_turn: List[Tuple[str, int, Optional[int], Optional[int]]] = []
 
                 try:
                     now_start = time.time()
@@ -998,29 +1024,58 @@ class SessionManager:
 
                     attachment_filenames: List[str] = []
                     if attachments:
+                        att_dir_abs = os.path.abspath(os.path.join(live.workspace_path, "attachments"))
+                        os.makedirs(att_dir_abs, exist_ok=True)
                         try:
-                            for att in attachments:
-                                if live.closing or live.status in ("closed", "expired", "failed"):
-                                    raise FileNotFoundError("Session closed during attachment upload")
-                                att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
-                                    att if isinstance(att, dict) else dict(att)
-                                )
-                                saved_name, byte_count = await materialize_attachment(
-                                    att_dict,
-                                    live.workspace_path,
-                                    total_bytes_so_far=live.total_attachment_bytes,
-                                    allowlist=allowlist,
-                                )
-                                full_saved = os.path.abspath(os.path.join(live.workspace_path, "attachments", saved_name))
-                                saved_this_turn.append((full_saved, byte_count))
-                                live.total_attachment_bytes += byte_count
-                                if live.closing or live.status in ("closed", "expired", "failed"):
-                                    raise FileNotFoundError("Session closed after attachment upload")
-                                if live.total_attachment_bytes > settings.max_total_bytes:
-                                    raise ValueError(
-                                        f"Cumulative attachment size ({live.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
+                            with deferred_attachment_commits() as deferred_staged:
+                                for att in attachments:
+                                    if live.closing or live.status in ("closed", "expired", "failed"):
+                                        raise FileNotFoundError("Session closed during attachment upload")
+                                    att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
+                                        att if isinstance(att, dict) else dict(att)
                                     )
-                                attachment_filenames.append(os.path.basename(saved_name))
+                                    before_def_len = len(deferred_staged)
+                                    saved_name, byte_count = await materialize_attachment(
+                                        att_dict,
+                                        live.workspace_path,
+                                        total_bytes_so_far=live.total_attachment_bytes,
+                                        allowlist=allowlist,
+                                    )
+                                    if len(deferred_staged) > before_def_len:
+                                        staged_path, clean_fn = deferred_staged[-1]
+                                        full_saved = os.path.abspath(staged_path)
+                                    else:
+                                        clean_fn = os.path.basename(saved_name)
+                                        full_saved = os.path.abspath(os.path.join(att_dir_abs, clean_fn))
+                                    try:
+                                        st_s = os.lstat(full_saved)
+                                        s_dev, s_ino = st_s.st_dev, st_s.st_ino
+                                    except OSError:
+                                        s_dev, s_ino = None, None
+                                    saved_this_turn.append((full_saved, byte_count, s_dev, s_ino))
+                                    live.total_attachment_bytes += byte_count
+                                    if live.closing or live.status in ("closed", "expired", "failed"):
+                                        raise FileNotFoundError("Session closed after attachment upload")
+                                    if live.total_attachment_bytes > settings.max_total_bytes:
+                                        raise ValueError(
+                                            f"Cumulative attachment size ({live.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
+                                        )
+                                    if len(deferred_staged) <= before_def_len:
+                                        attachment_filenames.append(clean_fn)
+
+                                # All attachments succeeded: atomically publish deferred staged files into attachments/
+                                deferred_map = {os.path.abspath(sp): cfn for sp, cfn in deferred_staged}
+                                for idx, (fp, bc, s_dev, s_ino) in enumerate(list(saved_this_turn)):
+                                    if fp in deferred_map:
+                                        pub_name = _publish_staged_file(fp, att_dir_abs, deferred_map[fp])
+                                        pub_full = os.path.abspath(os.path.join(att_dir_abs, pub_name))
+                                        try:
+                                            st_p = os.lstat(pub_full)
+                                            p_dev, p_ino = st_p.st_dev, st_p.st_ino
+                                        except OSError:
+                                            p_dev, p_ino = s_dev, s_ino
+                                        saved_this_turn[idx] = (pub_full, bc, p_dev, p_ino)
+                                        attachment_filenames.append(os.path.basename(pub_name))
                         except (ValueError, httpx.RequestError) as att_err:
                             _rollback_turn_uploads(live, saved_this_turn)
                             saved_this_turn.clear()
@@ -1139,7 +1194,7 @@ class SessionManager:
                                 detail=bounded_io_err,
                             )
 
-                        for fp, _ in saved_this_turn:
+                        for fp, *_ in saved_this_turn:
                             live.managed_attachments.add(fp)
                         saved_this_turn.clear()
 

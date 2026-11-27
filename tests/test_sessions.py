@@ -2588,19 +2588,39 @@ def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monk
     assert os.path.exists(agent_tmp)
     assert real_open(agent_tmp, "rb").read() == b"agent-tmp-payload"
 
-    # (2) Concurrent agent file creation mid-stream
+    # (2) Concurrent agent file creation AND two-attachment replacement protection mid-stream (4715616293)
     rate_limiter.history.clear()
     r_conc_url = http_client.post(
         f"/v1/sessions/{sid_att}/messages",
         headers={"X-API-Key": "key-alice"},
         json={
-            "prompt": "Download report.txt while agent creates files mid-stream",
-            "attachments": [{"url": "https://files.example.test/report.txt?case=concurrent_create_fail"}],
+            "prompt": "Two attachments: first.txt + failing second URL while agent writes/replaces report.txt",
+            "attachments": [
+                {"filename": "report.txt", "content_b64": payload_32},
+                {"url": "https://files.example.test/second.txt?case=concurrent_create_fail"},
+            ],
         },
     )
     assert r_conc_url.status_code == 502
     assert os.path.exists(concurrent_agent_file) and real_open(concurrent_agent_file, "rb").read() == b"agent-concurrent-data"
     assert os.path.exists(concurrent_report_file) and real_open(concurrent_report_file, "rb").read() == b"agent-report-v1"
+
+    # Also verify inode-verified _rollback_turn_uploads directly when an already-published path was replaced by a new inode
+    orig_pub = os.path.join(att_dir, "inode_guard.txt")
+    with real_open(orig_pub, "wb") as gf:
+        gf.write(b"orig-10-by")
+    orig_st = os.lstat(orig_pub)
+    repl_tmp = os.path.join(att_dir, "inode_guard_repl.tmp")
+    with real_open(repl_tmp, "wb") as rf:
+        rf.write(b"agent-replacement-protected")
+    os.replace(repl_tmp, orig_pub)
+    assert os.lstat(orig_pub).st_ino != orig_st.st_ino
+    live_att_obj = session_manager._sessions[sid_att]
+    before_bytes = live_att_obj.total_attachment_bytes
+    live_att_obj.total_attachment_bytes += 10
+    _sess_mod._rollback_turn_uploads(live_att_obj, [(orig_pub, 10, orig_st.st_dev, orig_st.st_ino)])
+    assert os.path.exists(orig_pub) and real_open(orig_pub, "rb").read() == b"agent-replacement-protected"
+    assert live_att_obj.total_attachment_bytes == before_bytes
 
     # (3) Repeated oversize URL downloads for the SAME filename ('report.bin') when staging unlink fails:
     # first retains 8192B (43 + 8192 = 8235), second retains 16384B in a DISTINCT staging file (8235 + 16384 = 24619, zero undercount!)
