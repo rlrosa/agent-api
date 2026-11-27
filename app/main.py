@@ -971,7 +971,10 @@ async def create_session_endpoint(
                 try:
                     for att in attachments_input:
                         if live_session.closing or not session_manager.is_session_active(live_session.id):
-                            raise FileNotFoundError("Session closed during initial attachment fetch")
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail=f"Session '{live_session.id}' was closed or expired while fetching attachments",
+                            )
                         att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
                             att if isinstance(att, dict) else dict(att)
                         )
@@ -990,7 +993,10 @@ async def create_session_endpoint(
                                 f"Cumulative attachment size ({live_session.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
                             )
                     if live_session.closing or not session_manager.is_session_active(live_session.id):
-                        raise FileNotFoundError("Session closed after initial attachment fetch")
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Session '{live_session.id}' was closed or expired while fetching attachments",
+                        )
                     now_done = time.time()
                     live_session.status = "idle"
                     live_session.last_active_at = now_done
@@ -1000,11 +1006,6 @@ async def create_session_endpoint(
                         total_attachment_bytes=live_session.total_attachment_bytes,
                         last_active_at=now_done,
                         db_path=settings.db_path,
-                    )
-                except FileNotFoundError:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Session '{live_session.id}' was closed or expired while fetching attachments",
                     )
                 except ValueError as att_err:
                     await session_manager.close_session(

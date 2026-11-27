@@ -2146,6 +2146,115 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
     )
     assert r_ov_cur.status_code == 422
 
+    # 5. Spawn-only attachment FileNotFoundError: active session closes as 'failed' (500), concurrent close preserves 'closed' (409)
+    import base64 as _b64
+    import app.main as _main_mod
+    from app.db import list_sessions as _list_sessions
+    from app.sessions import session_manager as _sm
+    from app.security import rate_limiter as _rl
+    _rl.history.clear()
+
+    real_materialize = _main_mod.materialize_attachment
+    call_idx = {"n": 0, "ws": None}
+
+    async def _fail_second_active(att_dict, workspace_path, **kwargs):
+        call_idx["n"] += 1
+        call_idx["ws"] = workspace_path
+        if call_idx["n"] == 1:
+            return await real_materialize(att_dict, workspace_path, **kwargs)
+        raise FileNotFoundError("Simulated missing staging file on second attachment")
+
+    monkeypatch.setattr(_main_mod, "materialize_attachment", _fail_second_active)
+    b64_payload = _b64.b64encode(b"first-ok").decode("ascii")
+    before_ids = {s["id"] for s in _list_sessions(limit=100)}
+    r_fnf_active = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "agent": "mock_agy_session",
+            "attachments": [
+                {"filename": "first.txt", "content_b64": b64_payload},
+                {"filename": "second.txt", "content_b64": b64_payload},
+            ],
+        },
+    )
+    assert r_fnf_active.status_code == 500
+    assert call_idx["n"] == 2
+    after_rows = [s for s in _list_sessions(limit=100) if s["id"] not in before_ids]
+    assert len(after_rows) == 1
+    assert after_rows[0]["status"] == "failed"
+    assert not _sm.is_session_active(after_rows[0]["id"])
+    assert call_idx["ws"] is not None and not os.path.exists(call_idx["ws"])
+
+    # Separate test: concurrent closure during second attachment raises FileNotFoundError -> preserves 409 & 'closed' status
+    conc_idx = {"n": 0, "sid": None}
+
+    async def _fail_second_after_concurrent_close(att_dict, workspace_path, **kwargs):
+        conc_idx["n"] += 1
+        if conc_idx["n"] == 1:
+            return await real_materialize(att_dict, workspace_path, **kwargs)
+        sid = os.path.basename(workspace_path.rstrip("/"))
+        conc_idx["sid"] = sid
+        await _sm.close_session(sid, reason="closed", db_path=_main_mod.get_settings().db_path)
+        raise FileNotFoundError("Workspace deleted by concurrent session close")
+
+    monkeypatch.setattr(_main_mod, "materialize_attachment", _fail_second_after_concurrent_close)
+    r_fnf_conc = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "agent": "mock_agy_session",
+            "attachments": [
+                {"filename": "first.txt", "content_b64": b64_payload},
+                {"filename": "second.txt", "content_b64": b64_payload},
+            ],
+        },
+    )
+    assert r_fnf_conc.status_code == 409
+    assert conc_idx["n"] == 2 and conc_idx["sid"] is not None
+    conc_row = next(s for s in _list_sessions(limit=100) if s["id"] == conc_idx["sid"])
+    assert conc_row["status"] == "closed"
+    assert not _sm.is_session_active(conc_idx["sid"])
+    monkeypatch.setattr(_main_mod, "materialize_attachment", real_materialize)
+
+    # Also verify turn-level FileNotFoundError on an active session rolls back to 'idle' with 500 (not 409)
+    import app.sessions as _sess_mod
+    real_sess_mat = _sess_mod.materialize_attachment
+    r_turn_s = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r_turn_s.status_code == 201
+    turn_sid = r_turn_s.json()["id"]
+    t_idx = {"n": 0}
+
+    async def _fail_turn_second(att_dict, workspace_path, **kwargs):
+        t_idx["n"] += 1
+        if t_idx["n"] == 1:
+            return await real_sess_mat(att_dict, workspace_path, **kwargs)
+        raise FileNotFoundError("Simulated missing staging file during turn attachment")
+
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", _fail_turn_second)
+    r_turn_fnf = http_client.post(
+        f"/v1/sessions/{turn_sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Attach two files",
+            "attachments": [
+                {"filename": "t1.txt", "content_b64": b64_payload},
+                {"filename": "t2.txt", "content_b64": b64_payload},
+            ],
+        },
+    )
+    assert r_turn_fnf.status_code == 500
+    monkeypatch.setattr(_sess_mod, "materialize_attachment", real_sess_mat)
+    r_turn_get = http_client.get(f"/v1/sessions/{turn_sid}", headers={"X-API-Key": "key-alice"})
+    assert r_turn_get.status_code == 200
+    assert r_turn_get.json()["status"] == "idle"
+    assert r_turn_get.json()["total_attachment_bytes"] == 0
+    http_client.delete(f"/v1/sessions/{turn_sid}", headers={"X-API-Key": "key-alice"})
+
 
 
 

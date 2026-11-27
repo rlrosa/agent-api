@@ -945,24 +945,6 @@ class SessionManager:
                                         f"Cumulative attachment size ({live.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
                                     )
                                 attachment_filenames.append(os.path.basename(saved_name))
-                        except FileNotFoundError:
-                            _rollback_turn_uploads(live, saved_this_turn)
-                            saved_this_turn.clear()
-                            update_session_state(
-                                session_id,
-                                total_attachment_bytes=live.total_attachment_bytes,
-                                db_path=db_path,
-                            )
-                            finish_session_turn(
-                                turn_id=turn_id,
-                                status="failed",
-                                error="Session closed while materializing attachments",
-                                db_path=db_path,
-                            )
-                            raise HTTPException(
-                                status_code=status.HTTP_409_CONFLICT,
-                                detail=f"Session '{session_id}' is {live.closed_reason or 'closed'} and cannot accept new messages",
-                            )
                         except ValueError as att_err:
                             _rollback_turn_uploads(live, saved_this_turn)
                             saved_this_turn.clear()
@@ -997,6 +979,22 @@ class SessionManager:
                         except OSError as storage_err:
                             _rollback_turn_uploads(live, saved_this_turn)
                             saved_this_turn.clear()
+                            if live.closing or live.status in ("closed", "expired", "failed") or not self.is_session_active(session_id):
+                                update_session_state(
+                                    session_id,
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    db_path=db_path,
+                                )
+                                finish_session_turn(
+                                    turn_id=turn_id,
+                                    status="failed",
+                                    error="Session closed while materializing attachments",
+                                    db_path=db_path,
+                                )
+                                raise HTTPException(
+                                    status_code=status.HTTP_409_CONFLICT,
+                                    detail=f"Session '{session_id}' is {live.closed_reason or 'closed'} and cannot accept new messages",
+                                )
                             bounded_io_err = _truncate_diag(f"Attachment storage error: {storage_err}", MAX_AUTH_DIAG_CHARS)
                             finish_session_turn(
                                 turn_id=turn_id,
@@ -1004,23 +1002,16 @@ class SessionManager:
                                 error=bounded_io_err,
                                 db_path=db_path,
                             )
-                            if not live.closing and live.status not in ("closed", "expired", "failed"):
-                                live.status = "idle"
-                                now_idle = time.time()
-                                live.last_active_at = now_idle
-                                update_session_state(
-                                    session_id,
-                                    status="idle",
-                                    total_attachment_bytes=live.total_attachment_bytes,
-                                    last_active_at=now_idle,
-                                    db_path=db_path,
-                                )
-                            else:
-                                update_session_state(
-                                    session_id,
-                                    total_attachment_bytes=live.total_attachment_bytes,
-                                    db_path=db_path,
-                                )
+                            live.status = "idle"
+                            now_idle = time.time()
+                            live.last_active_at = now_idle
+                            update_session_state(
+                                session_id,
+                                status="idle",
+                                total_attachment_bytes=live.total_attachment_bytes,
+                                last_active_at=now_idle,
+                                db_path=db_path,
+                            )
                             raise HTTPException(
                                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 detail=bounded_io_err,
