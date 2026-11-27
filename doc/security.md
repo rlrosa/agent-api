@@ -33,6 +33,38 @@
 - A separate watchdog script in `/home/ubuntu/agent/check_agent_api_auth.py` monitors this endpoint over loopback (`http://127.0.0.1:8090`) via a dedicated systemd user timer (`agent-api-auth-check.timer`).
 - Threshold-exceeding failures trigger programmatic Telegram alerts with 30-minute deduplication. `agent-api` retains zero Telegram code or credentials.
 
+### 6. Warm Session Confinement & Stdio Trust Boundary
+For multi-turn conversational sessions (`/v1/sessions`), the execution boundary strictly separates control arguments from untrusted data:
+
+```mermaid
+flowchart TD
+    Req["Untrusted HTTP Request (CreateSessionRequest)"] --> Val["Pydantic Validation (extra='forbid')"]
+    Val --> Resolvers["Literal-only Resolvers (resolve_model / resolve_effort)"]
+    Resolvers -->|"Matched literal arguments only"| Argv["create_subprocess_exec(*argv)"]
+    Req -->|"Prompt serialized strictly as JSON"| Stdin["proc.stdin Pipe (NDJSON stream)"]
+    Req -->|"SSRF check + streaming byte cap"| Att["SESSION_WORK_ROOT/id/attachments (RW --bind)"]
+
+    subgraph Sandbox ["bwrap Namespace (--die-with-parent)"]
+        Argv --> CLI["Warm Agent CLI Process (agy / claude)"]
+        Stdin --> CLI
+        Att --> CLI
+        TmpState["--tmpfs State (brain, conversations, .claude in RAM)"] --- CLI
+        RoSys["--ro-bind System Paths (/usr, /etc/ssl, OAuth token)"] --- CLI
+    end
+
+    CLI -->|"NDJSON result stream"| Stdout["proc.stdout (16 MiB line reader)"]
+    CLI -->|"Diagnostic logs"| Stderr["proc.stderr (Continuous drain loop)"]
+    Stdout --> Filter["Response data extracted (Never regex-scanned)"]
+    Stderr --> Classifier["Rate-Limit Classifier (Scans stderr/error metadata only)"]
+```
+
+Key security properties:
+- **Zero Caller Strings in Subprocess Argv**: `model` and `effort` are resolved against static literal sets; untrusted user inputs never reach `argv` or shell execution (Security Invariant #1).
+- **Prompt Data Isolation**: User prompts are serialized strictly as NDJSON over `proc.stdin`.
+- **Pure In-Memory Session State**: Agent working directories (`brain`, `conversations`, `.claude`) reside on `--tmpfs` mounts in RAM, completely isolated between sessions and vanished immediately upon process group termination.
+- **Attachment Quotas & Cumulative Caps**: Attachments uploaded across multiple turns are saved under `<session_ws>/attachments/` enforcing streaming `MAX_TOTAL_BYTES` checks and SSRF redirect validation.
+- **Agent Output is Data, Never Control**: Agent responses are treated strictly as output data. The rate-limit classifier never scans response text, preventing OCR strings (such as prices like `$ 429,00` or addresses like `AV ITALIA 4429`) from triggering accidental AIMD rate-limit backoffs (Security Invariant #8).
+
 ## Residual Risks & Accepted Decisions
 
 1. **Prompt-Injection Egress Exfiltration (Accepted / Research-Gated)**:

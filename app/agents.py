@@ -1,6 +1,8 @@
 import difflib
 import logging
+import os
 import shutil
+import sys
 from typing import Any, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 from app.config import get_settings
@@ -68,10 +70,10 @@ def resolve_model(agent: str, raw_model: Optional[str]) -> str:
     Returns a safe, hardcoded literal string from the supported set.
     """
     settings = get_settings()
-    if agent == "agy":
+    if agent in ("agy", "mock_agy_session"):
         supported = VALID_AGY_MODELS
         default = settings.agy_default_model or "gemini-3.8-flash-low"
-    elif agent == "claude":
+    elif agent in ("claude", "mock_claude_session"):
         supported = VALID_CLAUDE_MODELS
         default = settings.claude_default_model or "claude-sonnet-5"
     else:
@@ -228,6 +230,60 @@ def build_codex_argv(
     raise NotImplementedError("codex agent is not installed on this system")
 
 
+def resolve_effective_session_model(
+    agent: str,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+) -> Optional[str]:
+    """Return the exact model name launched by the session argv builder (or None when omitted on CLI)."""
+    if agent == "agy":
+        resolved_model = resolve_model("agy", model)
+        return strip_model_tier(resolved_model) if effort else resolved_model
+    if agent == "claude":
+        settings = get_settings()
+        spec = AGENTS["claude"]["spec"]
+        raw_model = model or settings.claude_default_model or spec.default_model
+        return resolve_model("claude", raw_model) if raw_model else None
+    return model
+
+
+def build_agy_session_argv(
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> List[str]:
+    # Note: Do NOT pass -p in agy stream-json mode (agy drops -p and listens strictly on stdin).
+    cmd = ["agy", "--input-format", "stream-json", "--output-format", "stream-json"]
+    eff_model = resolve_effective_session_model("agy", model=model, effort=effort)
+    if effort:
+        resolved_eff = resolve_effort(effort)
+        cmd.extend(["--model", eff_model, "--effort", resolved_eff])
+    else:
+        cmd.extend(["--model", eff_model])
+
+    cmd.extend(get_agent_flags("agy"))
+    if workspace_path:
+        cmd.extend(["--add-dir", workspace_path])
+    return cmd
+
+
+def build_claude_session_argv(
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+) -> List[str]:
+    # Note: claude 2.1+ requires both -p (--print) and --verbose when using --output-format stream-json.
+    cmd = ["claude", "-p", "--verbose", "--input-format", "stream-json", "--output-format", "stream-json"]
+
+    eff_model = resolve_effective_session_model("claude", model=model, effort=effort)
+    if eff_model:
+        cmd.extend(["--model", eff_model])
+    if effort:
+        cmd.extend(["--effort", resolve_effort(effort)])
+
+    cmd.extend(get_agent_flags("claude"))
+    return cmd
+
 
 AGENTS: Dict[str, Dict] = {
     "agy": {
@@ -240,6 +296,7 @@ AGENTS: Dict[str, Dict] = {
             default_flags="--sandbox",
         ),
         "argv_builder": build_agy_argv,
+        "session_argv_builder": build_agy_session_argv,
     },
     "claude": {
         "spec": AgentSpec(
@@ -251,6 +308,7 @@ AGENTS: Dict[str, Dict] = {
             default_flags="--allowed-tools View,Read --permission-mode dontAsk",
         ),
         "argv_builder": build_claude_argv,
+        "session_argv_builder": build_claude_session_argv,
     },
     "codex": {
         "spec": AgentSpec(
@@ -262,6 +320,7 @@ AGENTS: Dict[str, Dict] = {
             default_flags="",
         ),
         "argv_builder": build_codex_argv,
+        "session_argv_builder": None,
     },
     "mock_429": {
         "spec": AgentSpec(
@@ -273,6 +332,43 @@ AGENTS: Dict[str, Dict] = {
             default_flags="",
         ),
         "argv_builder": None,
+        "session_argv_builder": None,
+    },
+    "mock_agy_session": {
+        "spec": AgentSpec(
+            name="mock_agy_session",
+            binary_name="python3",
+            prompt_delivery="stdin",
+            supports_model_flag=True,
+            default_model=None,
+            default_flags="",
+        ),
+        "argv_builder": None,
+        "session_argv_builder": lambda model=None, effort=None, workspace_path=None: [
+            sys.executable,
+            "-u",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "mock_stream_agent.py")),
+            "--mode",
+            "agy",
+        ],
+    },
+    "mock_claude_session": {
+        "spec": AgentSpec(
+            name="mock_claude_session",
+            binary_name="python3",
+            prompt_delivery="stdin",
+            supports_model_flag=True,
+            default_model=None,
+            default_flags="",
+        ),
+        "argv_builder": None,
+        "session_argv_builder": lambda model=None, effort=None, workspace_path=None: [
+            sys.executable,
+            "-u",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "mock_stream_agent.py")),
+            "--mode",
+            "claude",
+        ],
     },
 }
 
@@ -282,10 +378,10 @@ def get_agent_availability() -> Dict[str, Dict[str, Any]]:
     settings = get_settings()
 
     for agent_name, info in AGENTS.items():
-        if agent_name == "mock_429":
+        if agent_name in ("mock_429", "mock_agy_session", "mock_claude_session"):
             result[agent_name] = {
                 "available": settings.allow_mock_agent,
-                "path": "/bin/mock_429" if settings.allow_mock_agent else None,
+                "path": sys.executable if settings.allow_mock_agent else None,
             }
             continue
 
@@ -303,10 +399,10 @@ def ensure_available(agent_name: str) -> str:
         raise ValueError(f"Unknown agent: '{agent_name}'")
 
     settings = get_settings()
-    if agent_name == "mock_429":
+    if agent_name in ("mock_429", "mock_agy_session", "mock_claude_session"):
         if not settings.allow_mock_agent:
             raise ValueError(f"Agent '{agent_name}' is unavailable (ALLOW_MOCK_AGENT disabled)")
-        return "/bin/mock_429"
+        return sys.executable
 
     cmd = AGENTS[agent_name]["spec"].binary_name
     path = shutil.which(cmd)

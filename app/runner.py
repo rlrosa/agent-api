@@ -196,10 +196,16 @@ def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List
             bwrap_cmd.extend([
                 "--ro-bind", claude_json, claude_json,
             ])
-
-
-
-
+    elif settings.allow_mock_agent and agent in ("mock_agy_session", "mock_claude_session"):
+        import sys
+        mock_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "mock_stream_agent.py")
+        )
+        if os.path.exists(mock_script):
+            bwrap_cmd.extend(["--ro-bind", mock_script, mock_script])
+        venv_prefix = os.path.abspath(sys.prefix)
+        if os.path.exists(venv_prefix) and not venv_prefix.startswith(("/usr/", "/bin/", "/lib/")):
+            bwrap_cmd.extend(["--ro-bind", venv_prefix, venv_prefix])
 
     bwrap_cmd.extend([
         "--bind", workspace_path, workspace_path,
@@ -468,6 +474,8 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         if not should_keep:
             if os.path.exists(workspace_path):
                 shutil.rmtree(workspace_path, ignore_errors=True)
+            from app.attachments import get_upload_staging_dir
+            shutil.rmtree(get_upload_staging_dir(workspace_path), ignore_errors=True)
 
     result = finish_job(
         job_id=job_id,
@@ -487,6 +495,19 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
     return result
 
 
+def validate_distinct_work_roots(work_root: str, session_work_root: str) -> None:
+    """Reject equal or nested WORK_ROOT and SESSION_WORK_ROOT so neither sweeper touches the other's tree."""
+    real_jobs = os.path.realpath(os.path.abspath(work_root))
+    real_sess = os.path.realpath(os.path.abspath(session_work_root))
+    if real_jobs == real_sess:
+        raise ValueError(f"WORK_ROOT and SESSION_WORK_ROOT must be distinct (both resolve to '{real_jobs}')")
+    common = os.path.commonpath([real_jobs, real_sess])
+    if common in (real_jobs, real_sess):
+        raise ValueError(
+            f"WORK_ROOT ('{real_jobs}') and SESSION_WORK_ROOT ('{real_sess}') must not be nested inside each other"
+        )
+
+
 def sweep_orphaned_workspaces(
     work_root: Optional[str] = None,
     db_path: Optional[str] = None,
@@ -494,6 +515,7 @@ def sweep_orphaned_workspaces(
 ) -> int:
     settings = get_settings()
     root = work_root or settings.work_root
+    validate_distinct_work_roots(root, settings.session_work_root)
     if not os.path.exists(root):
         return 0
 
@@ -501,6 +523,22 @@ def sweep_orphaned_workspaces(
     reaped = 0
 
     for item in os.listdir(root):
+        if item == ".staging":
+            staging_root = os.path.join(root, ".staging")
+            if os.path.isdir(staging_root):
+                for sub_item in os.listdir(staging_root):
+                    sub_dir = os.path.join(staging_root, sub_item)
+                    if not os.path.isdir(sub_dir):
+                        continue
+                    try:
+                        if (now - os.path.getmtime(sub_dir)) < min_age_seconds:
+                            continue
+                    except OSError:
+                        continue
+                    sub_job = get_job(sub_item, db_path=db_path)
+                    if sub_job is None or sub_job.get("status") in ("completed", "failed", "canceled"):
+                        shutil.rmtree(sub_dir, ignore_errors=True)
+            continue
         job_dir = os.path.join(root, item)
         if not os.path.isdir(job_dir):
             continue

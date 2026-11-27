@@ -1,6 +1,20 @@
 # Agent API Service
 
-A lightweight, secure FastAPI HTTP service that exposes CLI-based AI agents (`agy` and `claude`) as non-interactive backend jobs for document and image processing tasks.
+A lightweight, secure FastAPI HTTP service that exposes CLI-based AI agents (`agy` and `claude`) as non-interactive backend jobs for document and image processing tasks, and warm conversational sessions for interactive messaging bots.
+
+## Architecture Overview
+
+`agent-api` provides dual execution surfaces: one-shot queue jobs (`/v1/jobs`) for batch OCR and document tasks, and warm conversational sessions (`/v1/sessions`) for interactive WhatsApp/chat bots with stdio prompt cache reuse.
+
+```mermaid
+flowchart LR
+    Ingress["Client Ingress (Cloudflare Tunnel / Trusted LAN)"] --> Auth["Auth Boundary & Rate Limiter"]
+    Auth --> Surface{"API Surface"}
+    Surface -->|"One-Shot (/v1/jobs)"| Jobs["Job Queue & Dispatcher"]
+    Jobs --> BwrapJobs["bwrap Sandbox (Fresh per job)"]
+    Surface -->|"Multi-Turn (/v1/sessions)"| Sessions["Warm Session Pool (SessionManager)"]
+    Sessions --> BwrapSessions["bwrap Sandbox (Warm stdin stream)"]
+```
 
 ## Security & Sandbox Confinement
 - **Fail-Closed Sandbox**: Jobs execute inside isolated `bubblewrap` (`bwrap`) mounts. If confinement is missing or unexecutable, jobs fail closed by default (`ALLOW_UNCONFINED=0`).
@@ -10,6 +24,7 @@ A lightweight, secure FastAPI HTTP service that exposes CLI-based AI agents (`ag
 - **Observability Dashboard**: Single-page monitoring dashboard at `http://192.168.87.132:8090/dashboard` or `https://agent-api.rela.uy/dashboard`.
 
 ### Detailed Documentation Links
+- [Multi-Turn Sessions Guide](doc/sessions.md) — Warm conversational sessions, stream-json adapters, FIFO queuing, and 15m idle auto-close.
 - [Security Architecture](doc/security.md) — Threat model, fail-closed sandbox, SSRF protections, and residual risks.
 - [Operations & Monitoring](doc/operations.md) — Service management, logs, and auth-failure watchdog timer.
 - [Networking & IP Whitelisting](doc/networking.md) — Network paths and step-by-step IP whitelisting guide.
@@ -188,9 +203,17 @@ The server is configured via environment variables.
 | `BWRAP_ENABLED` | `1` | Enable Bubblewrap OS sandboxing for `agy` and `claude` (1=true, 0=false). |
 | `JOB_TIMEOUT` | `120` | Max job execution timeout in seconds. |
 | `MAX_CONCURRENT_JOBS` | `3` | Maximum worker concurrency for background jobs. |
-| `PURGE_AFTER_HOURS` | `24` | Automated background purge window for old job records. |
+| `JOB_RETENTION` | `30d` | Retention window in days for automated purging of old terminal job and session records. |
+| `DEFAULT_EFFORT` | *(Optional)* | Default reasoning effort (`low`, `med`, `high`) when requests omit `effort`. |
 | `AGY_USAGE_CMD` | `agy -p /usage` | Shell command executed to retrieve raw agy usage TSV. |
 | `AGY_QUOTA_TTL_S` | `1800` | In-memory cache TTL for agy quota query in seconds (30m). |
+| `SESSION_WORK_ROOT` | `/var/tmp/agent-api/sessions` | Directory tree for isolated warm session workspaces. |
+| `SESSION_IDLE_TIMEOUT` | `900` | Inactivity threshold in seconds (15m) before warm session auto-close and workspace reaping. |
+| `SESSION_IDLE_MAX` | `3600` | Maximum client-configurable idle timeout in seconds (60m). |
+| `SESSION_TURN_TIMEOUT` | `120` | Max execution timeout per individual session turn in seconds. |
+| `SESSION_MAX_LIFETIME` | `86400` | Hard wall-clock lifetime cap in seconds (24h) before an idle session expires regardless of activity. |
+| `MAX_ACTIVE_SESSIONS` | `10` | Hard cap on total concurrently warm agent subprocesses. |
+| `MAX_QUEUED_TURNS_PER_SESSION` | `3` | Maximum pending messages queued on a single session's FIFO lock. |
 
 ---
 
@@ -396,6 +419,59 @@ curl -s http://127.0.0.1:8090/v1/stats/sources?by=key -H "X-API-Key: $AGENT_API_
     "error_rate": 0.0133
   }
 ]
+```
+
+### 11. Multi-Turn Conversational Sessions (/v1/sessions)
+For interactive WhatsApp bots and conversational frontends, `/v1/sessions` maintains warm `bwrap` agent processes across multiple turns with ~99% prompt cache hits. Full documentation lives in [doc/sessions.md](doc/sessions.md).
+
+For local testing without touching `:8090`, use the bundled helper scripts:
+```bash
+./scripts/dev-server.sh start   # isolated server on 127.0.0.1:8091 + auto-cached key
+./scripts/session-cli           # interactive REPL (or ./scripts/session-cli "Hello!")
+./scripts/dev-server.sh stop    # clean teardown when finished
+```
+
+#### Step 1: Start Session with Turn 1 Prompt & Attachment
+```bash
+curl -s -X POST https://agent-api.rela.uy/v1/sessions \
+  -H "X-API-Key: $AGENT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent": "agy",
+    "model": "flash",
+    "effort": "med",
+    "prompt": "Remember codeword ORBIT-19 and inspect the attached receipt.",
+    "attachments": [
+      {
+        "filename": "receipt.txt",
+        "content_b64": "VG90YWw6ICQ0Mi41MA=="
+      }
+    ],
+    "wait": 60
+  }' | jq .
+```
+
+#### Step 2: Send Turn 2 Follow-Up (Context & Attachment Reused)
+```bash
+curl -s -X POST https://agent-api.rela.uy/v1/sessions/SESSION_ID/messages \
+  -H "X-API-Key: $AGENT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "What was the total from receipt.txt and what was the codeword?",
+    "wait": 60
+  }' | jq .
+```
+
+#### Step 3: Inspect Session History & Turn Details
+```bash
+curl -s "https://agent-api.rela.uy/v1/sessions/SESSION_ID?include_turns=true" \
+  -H "X-API-Key: $AGENT_API_KEY" | jq .
+```
+
+#### Step 4: Explicit Session Close
+```bash
+curl -s -X DELETE https://agent-api.rela.uy/v1/sessions/SESSION_ID \
+  -H "X-API-Key: $AGENT_API_KEY" | jq .
 ```
 
 ---
