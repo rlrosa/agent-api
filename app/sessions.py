@@ -619,6 +619,7 @@ class SessionManager:
                     detail=f"Failed to spawn session subprocess: {exc}",
                 )
 
+            self._unreaped_procs[session_id] = proc
             drain_task: Optional[asyncio.Task] = None
             try:
                 live_session = LiveSession(
@@ -654,20 +655,23 @@ class SessionManager:
                     status="idle",
                     db_path=db_path,
                 )
-            except Exception:
-                if drain_task and not drain_task.done():
-                    drain_task.cancel()
-                    try:
-                        await drain_task
-                    except asyncio.CancelledError:
-                        pass
-                await _terminate_and_reap_proc(proc)
-                if proc.returncode is None:
-                    self._unreaped_procs[session_id] = proc
-                shutil.rmtree(workspace_path, ignore_errors=True)
+            except BaseException:
+                try:
+                    if drain_task and not drain_task.done():
+                        drain_task.cancel()
+                        try:
+                            await drain_task
+                        except asyncio.CancelledError:
+                            pass
+                    await _terminate_and_reap_proc(proc)
+                finally:
+                    if proc.returncode is not None:
+                        self._unreaped_procs.pop(session_id, None)
+                    shutil.rmtree(workspace_path, ignore_errors=True)
                 raise
 
             self._sessions[session_id] = live_session
+            self._unreaped_procs.pop(session_id, None)
             logger.info(f"Created session '{session_id}' (PID: {proc.pid}, agent: {agent}, model: {eff_model})")
             return live_session
 

@@ -7,10 +7,10 @@
 #   ./scripts/dev-server.sh logs   [port] [-f]
 #   ./scripts/dev-server.sh stop   [port]
 #
-# Starts uvicorn bound strictly to 127.0.0.1:<port> with isolated SQLite DBs and
-# workspaces under /tmp/agent-api-dev-<port> (mode 0700), SSH_CONNECTION=1, and
-# BWRAP_ENABLED=1, and configures ~/.cache/agent-api/session-cli.json (mode 0600)
-# so ./scripts/session-cli talks to it out of the box.
+# Starts uvicorn via an inherited pre-bound loopback socket (127.0.0.1:<port>) with
+# isolated SQLite DBs and workspaces under /tmp/agent-api-dev-<port> (mode 0700),
+# SSH_CONNECTION=1, and BWRAP_ENABLED=1, and configures ~/.cache/agent-api/session-cli.json
+# (mode 0600) so ./scripts/session-cli talks to it out of the box.
 
 set -euo pipefail
 
@@ -59,8 +59,98 @@ PID_FILE="${STATE_DIR}/uvicorn.pid"
 LOG_FILE="${STATE_DIR}/uvicorn.log"
 TARGET_URL="http://127.0.0.1:${PORT}"
 
+# Validate any pre-existing STATE_DIR / PID_FILE / LOG_FILE BEFORE reading PIDs or logs in ANY action.
+validate_state_dir() {
+  local create_mode="${1:-0}"
+  python3 - "$STATE_DIR" "$LOG_FILE" "$PID_FILE" "$create_mode" <<'PY'
+import errno, os, stat, sys
+
+state_dir, log_file, pid_file, create_mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+uid = os.getuid()
+
+if create_mode:
+    try:
+        os.mkdir(state_dir, 0o700)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+try:
+    st = os.lstat(state_dir)
+except FileNotFoundError:
+    sys.exit(0)
+
+if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+    sys.exit(f"error: refusing unsafe state path {state_dir} (symlink or non-directory)")
+if st.st_uid != uid:
+    sys.exit(f"error: refusing state directory {state_dir} owned by uid {st.st_uid} (expected {uid})")
+if (st.st_mode & 0o077) != 0:
+    sys.exit(f"error: refusing state directory {state_dir} with group/world permissions ({oct(st.st_mode & 0o777)})")
+
+for existing in (pid_file, log_file):
+    try:
+        fst = os.lstat(existing)
+    except FileNotFoundError:
+        continue
+    if stat.S_ISLNK(fst.st_mode) or not stat.S_ISREG(fst.st_mode):
+        sys.exit(f"error: refusing unsafe file {existing} (symlink or non-regular)")
+    if fst.st_uid != uid:
+        sys.exit(f"error: refusing file {existing} owned by uid {fst.st_uid} (expected {uid})")
+    if not create_mode and (fst.st_mode & 0o077) != 0:
+        sys.exit(f"error: refusing file {existing} with group/world permissions ({oct(fst.st_mode & 0o777)})")
+
+if create_mode:
+    os.chmod(state_dir, 0o700)
+    for sub in ("jobs", "sessions"):
+        p = os.path.join(state_dir, sub)
+        try:
+            os.mkdir(p, 0o700)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+        sub_st = os.lstat(p)
+        if stat.S_ISLNK(sub_st.st_mode) or not stat.S_ISDIR(sub_st.st_mode) or sub_st.st_uid != uid:
+            sys.exit(f"error: refusing unsafe subdirectory {p}")
+        os.chmod(p, 0o700)
+
+    for fpath in (log_file, pid_file):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(fpath, flags, 0o600)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid:
+                sys.exit(f"error: refusing unsafe file {fpath}")
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+PY
+}
+
+read_safe_pid() {
+  python3 - "$PID_FILE" <<'PY'
+import os, stat, sys
+p = sys.argv[1]
+try:
+    fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    sys.exit(1)
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or (st.st_mode & 0o077) != 0:
+        sys.exit(1)
+    raw = os.read(fd, 64).decode("utf-8", errors="replace").strip()
+    if not raw.isdigit():
+        sys.exit(1)
+    print(raw)
+finally:
+    os.close(fd)
+PY
+}
+
 is_running() {
-  [ ! -L "$PID_FILE" ] && [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+  local pid
+  pid="$(read_safe_pid 2>/dev/null)" || return 1
+  kill -0 "$pid" 2>/dev/null
 }
 
 terminate_pid() {
@@ -90,94 +180,87 @@ case "$ACTION" in
       echo "error: uvicorn not found at $UVICORN_BIN (create .venv first)" >&2
       exit 1
     fi
+
+    # Validate any pre-existing state directory BEFORE touching PID_FILE
+    validate_state_dir 0
     if is_running; then
-      echo "dev-server already running on ${TARGET_URL} (PID $(cat "$PID_FILE"))"
+      echo "dev-server already running on ${TARGET_URL} (PID $(read_safe_pid))"
       exit 0
     fi
 
-    # Reject if another process already owns 127.0.0.1:<PORT>
-    if ! python3 - "$PORT" <<'PY'
-import socket, sys
-port = int(sys.argv[1])
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-try:
-    s.bind(("127.0.0.1", port))
-except OSError:
-    sys.exit(1)
-finally:
-    s.close()
-PY
-    then
-      echo "error: port 127.0.0.1:${PORT} is already in use by another process" >&2
-      exit 1
-    fi
-
-    # Securely create/validate STATE_DIR (reject symlinks, foreign ownership, or unsafe permissions)
-    python3 - "$STATE_DIR" "$LOG_FILE" "$PID_FILE" <<'PY'
-import errno, os, stat, sys
-
-state_dir, log_file, pid_file = sys.argv[1], sys.argv[2], sys.argv[3]
-uid = os.getuid()
-
-try:
-    os.mkdir(state_dir, 0o700)
-except OSError as e:
-    if e.errno != errno.EEXIST:
-        raise
-
-st = os.lstat(state_dir)
-if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-    sys.exit(f"error: refusing unsafe state path {state_dir} (symlink or non-directory)")
-if st.st_uid != uid:
-    sys.exit(f"error: refusing state directory {state_dir} owned by uid {st.st_uid} (expected {uid})")
-if (st.st_mode & 0o077) != 0:
-    sys.exit(f"error: refusing state directory {state_dir} with group/world permissions ({oct(st.st_mode & 0o777)})")
-
-os.chmod(state_dir, 0o700)
-for sub in ("jobs", "sessions"):
-    p = os.path.join(state_dir, sub)
-    try:
-        os.mkdir(p, 0o700)
-    except OSError as e:
-        if e.errno != errno.EEXIST:
-            raise
-    sub_st = os.lstat(p)
-    if stat.S_ISLNK(sub_st.st_mode) or not stat.S_ISDIR(sub_st.st_mode) or sub_st.st_uid != uid:
-        sys.exit(f"error: refusing unsafe subdirectory {p}")
-
-for fpath in (log_file, pid_file):
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(fpath, flags, 0o600)
-    os.close(fd)
-PY
+    # Create/lock down STATE_DIR, bind 127.0.0.1:<PORT>, and pass the bound socket fd directly to uvicorn (--fd)
+    validate_state_dir 1
 
     DEV_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
 
-    umask 077
-    env \
-      SSH_CONNECTION=1 \
-      API_KEY="$DEV_KEY" \
-      HOST=127.0.0.1 \
-      PORT="$PORT" \
-      DB_PATH="${STATE_DIR}/jobs.db" \
-      LOG_EVENTS_DB="${STATE_DIR}/events.db" \
-      WORK_ROOT="${STATE_DIR}/jobs" \
-      SESSION_WORK_ROOT="${STATE_DIR}/sessions" \
-      BWRAP_ENABLED=1 \
-      ALLOW_UNCONFINED=0 \
-      setsid "$UVICORN_BIN" app.main:app --host 127.0.0.1 --port "$PORT" \
-      </dev/null >>"$LOG_FILE" 2>&1 &
-    NEW_PID=$!
-    echo "$NEW_PID" > "$PID_FILE"
+    NEW_PID="$(
+      DEV_KEY="$DEV_KEY" python3 - "$UVICORN_BIN" "$PORT" "$STATE_DIR" "$LOG_FILE" "$PID_FILE" "$REPO_ROOT" <<'PY'
+import os, socket, stat, subprocess, sys
+
+uvicorn_bin, port_s, state_dir, log_file, pid_file, repo_root = sys.argv[1:7]
+port = int(port_s)
+uid = os.getuid()
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(("127.0.0.1", port))
+    sock.listen(128)
+except OSError as e:
+    sock.close()
+    sys.exit(f"error: port 127.0.0.1:{port} is already in use ({e})")
+
+sock.set_inheritable(True)
+log_fd = os.open(log_file, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
+os.fchmod(log_fd, 0o600)
+
+child_env = os.environ.copy()
+child_env.update({
+    "SSH_CONNECTION": "1",
+    "API_KEY": os.environ["DEV_KEY"],
+    "HOST": "127.0.0.1",
+    "PORT": str(port),
+    "DB_PATH": os.path.join(state_dir, "jobs.db"),
+    "LOG_EVENTS_DB": os.path.join(state_dir, "events.db"),
+    "WORK_ROOT": os.path.join(state_dir, "jobs"),
+    "SESSION_WORK_ROOT": os.path.join(state_dir, "sessions"),
+    "BWRAP_ENABLED": "1",
+    "ALLOW_UNCONFINED": "0",
+})
+
+try:
+    proc = subprocess.Popen(
+        [uvicorn_bin, "app.main:app", "--fd", str(sock.fileno())],
+        cwd=repo_root,
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        stdout=log_fd,
+        stderr=log_fd,
+        pass_fds=(sock.fileno(),),
+        start_new_session=True,
+    )
+finally:
+    os.close(log_fd)
+    sock.close()
+
+pid_fd = os.open(pid_file, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.fchmod(pid_fd, 0o600)
+    os.write(pid_fd, f"{proc.pid}\n".encode("ascii"))
+finally:
+    os.close(pid_fd)
+
+print(proc.pid)
+PY
+    )"
 
     ready=0
     for _ in $(seq 1 35); do
       if ! kill -0 "$NEW_PID" 2>/dev/null; then
         break
       fi
-      if curl -sf "${TARGET_URL}/healthz" >/dev/null 2>&1; then
-        sleep 0.05
+      # Authenticate against /v1/me with the newly generated DEV_KEY so readiness can only come from THIS instance
+      if curl -sf -H "X-API-Key: ${DEV_KEY}" "${TARGET_URL}/v1/me" >/dev/null 2>&1; then
         if kill -0 "$NEW_PID" 2>/dev/null; then
           ready=1
           break
@@ -217,8 +300,9 @@ if os.path.exists(p):
     ;;
 
   status)
+    validate_state_dir 0
     if is_running; then
-      echo "RUNNING on ${TARGET_URL} (PID $(cat "$PID_FILE"), dir ${STATE_DIR})"
+      echo "RUNNING on ${TARGET_URL} (PID $(read_safe_pid), dir ${STATE_DIR})"
       curl -s "${TARGET_URL}/healthz" && echo
     else
       echo "STOPPED (no active dev-server for port ${PORT})"
@@ -227,6 +311,7 @@ if os.path.exists(p):
     ;;
 
   logs)
+    validate_state_dir 0
     if [ ! -f "$LOG_FILE" ] || [ -L "$LOG_FILE" ]; then
       echo "No valid log file at ${LOG_FILE}" >&2
       exit 1
@@ -239,6 +324,7 @@ if os.path.exists(p):
     ;;
 
   stop)
+    validate_state_dir 0
     if [ -x "$SESSION_CLI" ] && [ -f "$HOME/.cache/agent-api/session-cli.json" ]; then
       current_url="$(python3 -c 'import json, os; p=os.path.expanduser("~/.cache/agent-api/session-cli.json"); print(json.load(open(p)).get("url",""))' 2>/dev/null || true)"
       if [ "$current_url" = "$TARGET_URL" ]; then
@@ -248,7 +334,7 @@ if os.path.exists(p):
     fi
 
     if is_running; then
-      pid="$(cat "$PID_FILE")"
+      pid="$(read_safe_pid)"
       terminate_pid "$pid" || true
       echo "Stopped dev-server PID ${pid} on ${TARGET_URL}"
     else

@@ -46,12 +46,13 @@ def main():
             sys.stdout.flush()
             continue
         if "SOFT_ERROR" in prompt:
+            long_err = ("Not logged in · Please run /login — " + ("Q" * 500)) if "LONG_AUTH" in prompt else "Transient tool execution failure"
             if args.mode == "agy":
                 err_payload = {
                     "conversation_id": conv_id,
                     "status": "ERROR",
                     "response": "",
-                    "error": "Transient tool execution failure",
+                    "error": long_err,
                     "usage": {
                         "input_tokens": 100 * turn,
                         "output_tokens": 50 * turn,
@@ -68,7 +69,7 @@ def main():
                     "subtype": "error",
                     "is_error": True,
                     "session_id": conv_id,
-                    "result": "Transient tool execution failure",
+                    "result": long_err,
                     "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0},
                     "total_cost_usd": round(0.0012 * turn, 6),
                 }

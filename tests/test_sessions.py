@@ -1762,6 +1762,325 @@ def test_coderabbit_followup_6_threads(http_client, monkeypatch, tmp_path):
     http_client.delete(f"/v1/sessions/{rm_sid}", headers={"X-API-Key": "key-alice"})
 
 
+@pytest.mark.asyncio
+async def test_raw_asgi_incremental_multipart_early_rejection(tmp_path, monkeypatch):
+    """4714711391: Send multiple raw ASGI http.request messages without Content-Length and verify early 400 before consuming trailing body."""
+    rate_limiter.history.clear()
+    test_db = str(tmp_path / "asgi_mp.db")
+    sess_root = str(tmp_path / "asgi_sess")
+    os.makedirs(sess_root, exist_ok=True)
+    monkeypatch.setenv("DB_PATH", test_db)
+    monkeypatch.setenv("SESSION_WORK_ROOT", sess_root)
+    monkeypatch.setenv("API_KEY", "test-secret-key")
+    monkeypatch.setenv("API_KEYS", "alice:key-alice:jobs")
+    monkeypatch.setenv("ALLOW_MOCK_AGENT", "1")
+    monkeypatch.setenv("BWRAP_ENABLED", "0")
+    monkeypatch.setenv("MAX_ATTACHMENT_BYTES", "16")
+    monkeypatch.setenv("MAX_TOTAL_BYTES", "24")
+    init_db(test_db)
+
+    boundary = "----RawAsgiBoundary77"
+
+    async def run_raw_asgi_multipart(path: str, file_chunks: list):
+        header_part = (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"agent\"\r\n\r\nmock_agy_session\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"prompt\"\r\n\r\nhello\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"file\"; filename=\"streamed.bin\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8")
+        trailer_part = f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        messages = [{"type": "http.request", "body": header_part, "more_body": True}]
+        for ch in file_chunks:
+            messages.append({"type": "http.request", "body": ch, "more_body": True})
+        messages.append({"type": "http.request", "body": trailer_part, "more_body": False})
+
+        idx = 0
+        trailing_sentinel_consumed = False
+
+        async def receive():
+            nonlocal idx, trailing_sentinel_consumed
+            if idx >= len(messages):
+                return {"type": "http.disconnect"}
+            msg = messages[idx]
+            if idx == len(messages) - 2:  # last file chunk (sentinel)
+                trailing_sentinel_consumed = True
+            idx += 1
+            return msg
+
+        sent_events = []
+
+        async def send(event):
+            sent_events.append(event)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": [
+                (b"x-api-key", b"key-alice"),
+                (b"content-type", f"multipart/form-data; boundary={boundary}".encode("ascii")),
+            ],
+            "client": ("127.0.0.1", 51000),
+            "server": ("testserver", 80),
+        }
+        await app(scope, receive, send)
+        start_evt = next(e for e in sent_events if e["type"] == "http.response.start")
+        body_bytes = b"".join(e.get("body", b"") for e in sent_events if e["type"] == "http.response.body")
+        return start_evt["status"], body_bytes.decode("utf-8"), trailing_sentinel_consumed
+
+    # 1. POST /v1/sessions rejects after 2nd 10-byte chunk (20 > 16) BEFORE reading 3rd sentinel chunk!
+    st1, body1, consumed1 = await run_raw_asgi_multipart(
+        "/v1/sessions",
+        [b"0123456789", b"abcdefghij", b"SENTINEL_NEVER_READ" * 100],
+    )
+    assert st1 == 400, body1
+    assert "max single file size limit" in body1
+    assert consumed1 is False
+
+    # 2. Spawn a session with 14 bytes, then test cumulative overflow (14 + 12 = 26 > 24) on POST /messages before sentinel!
+    live = await session_manager.create_session(
+        agent="mock_agy_session",
+        api_key_name="alice",
+        db_path=test_db,
+    )
+    live.total_attachment_bytes = 14
+    from app.db import update_session_state
+    update_session_state(live.id, total_attachment_bytes=14, db_path=test_db)
+
+    st2, body2, consumed2 = await run_raw_asgi_multipart(
+        f"/v1/sessions/{live.id}/messages",
+        [b"012345", b"6789ab", b"SENTINEL_NEVER_READ" * 100],
+    )
+    assert st2 == 400, body2
+    assert "MAX_TOTAL_BYTES" in body2
+    assert consumed2 is False
+    await session_manager.close_session(live.id, reason="closed", db_path=test_db)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_creation_cleanup_retains_capacity_and_split_stderr(tmp_path, monkeypatch):
+    """4714711426 & 4714711406: Cancelled creation cleanup retains capacity while child is alive; deterministic split stderr read."""
+    import asyncio
+    import collections
+    import app.sessions as sessions_mod
+    from app.sessions import _drain_stderr, LiveSession, AgyStreamDriver
+
+    test_db = str(tmp_path / "cancel_cap.db")
+    sess_root = str(tmp_path / "cancel_sess")
+    os.makedirs(sess_root, exist_ok=True)
+    monkeypatch.setenv("DB_PATH", test_db)
+    monkeypatch.setenv("SESSION_WORK_ROOT", sess_root)
+    monkeypatch.setenv("API_KEY", "dev")
+    monkeypatch.setenv("ALLOW_MOCK_AGENT", "1")
+    monkeypatch.setenv("BWRAP_ENABLED", "0")
+    monkeypatch.setenv("MAX_ACTIVE_SESSIONS", "1")
+    init_db(test_db)
+
+    entered_cleanup = asyncio.Event()
+    spawned_procs = []
+    orig_exec = asyncio.create_subprocess_exec
+
+    async def tracking_exec(*args, **kwargs):
+        p = await orig_exec(*args, **kwargs)
+        spawned_procs.append(p)
+        return p
+
+    def failing_create_row(*args, **kwargs):
+        raise RuntimeError("simulated DB insert failure")
+
+    orig_term = sessions_mod._terminate_and_reap_proc
+
+    async def slow_term(proc):
+        entered_cleanup.set()
+        await asyncio.sleep(10.0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", tracking_exec)
+    monkeypatch.setattr(sessions_mod, "create_session_row", failing_create_row)
+    monkeypatch.setattr(sessions_mod, "_terminate_and_reap_proc", slow_term)
+
+    create_task = asyncio.create_task(
+        session_manager.create_session(agent="mock_agy_session", db_path=test_db)
+    )
+    await asyncio.wait_for(entered_cleanup.wait(), timeout=3.0)
+    create_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await create_task
+
+    assert len(spawned_procs) == 1
+    leaked_proc = spawned_procs[0]
+    assert leaked_proc.returncode is None
+    assert session_manager.active_session_count() == 1
+
+    # Restore create_session_row & _terminate_and_reap_proc; new session MUST be rejected (429) while leaked_proc is alive
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        await session_manager.create_session(agent="mock_agy_session", db_path=test_db)
+    assert exc_info.value.status_code == 429
+
+    monkeypatch.setattr(sessions_mod, "_terminate_and_reap_proc", orig_term)
+    await orig_term(leaked_proc)
+    assert session_manager.active_session_count() == 0
+
+    # Deterministic two-chunk split stderr unit test for _drain_stderr
+    class FakeStderr:
+        def __init__(self):
+            self._chunks = [b"prefix\nAuthenti", b"cation required: " + (b"Z" * 500) + b"\n", b""]
+
+        async def read(self, n):
+            await asyncio.sleep(0.005)
+            return self._chunks.pop(0) if self._chunks else b""
+
+    killed = []
+
+    class FakeProc:
+        pid = 99999999
+        returncode = None
+        stderr = FakeStderr()
+
+        def kill(self):
+            killed.append(True)
+            self.returncode = -9
+
+    dummy_live = LiveSession("s1", "agy", None, None, str(tmp_path), FakeProc(), AgyStreamDriver(), 60, 60, "alice")
+    await _drain_stderr(dummy_live.proc, collections.deque(maxlen=20), dummy_live)
+    assert killed == [True]
+    assert dummy_live.auth_abort_reason is not None
+    assert len(dummy_live.auth_abort_reason) <= 240
+
+
+def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkeypatch, tmp_path):
+    """4714717249, 4714717258, 4714717273, 4714717280, 4714711406: dev-server & session-cli edge cases."""
+    import importlib.machinery
+    import importlib.util
+    import json
+    import socket
+    import subprocess
+    import sys
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    dev_srv = os.path.join(repo_root, "scripts", "dev-server.sh")
+    cli_path = os.path.join(repo_root, "scripts", "session-cli")
+
+    # 1. Upstream 600-char auth error via LONG_AUTH is bounded <= 240 chars in persisted turn & session
+    rate_limiter.history.clear()
+    r_la = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_claude_session"},
+    )
+    la_sid = r_la.json()["id"]
+    r_la_turn = http_client.post(
+        f"/v1/sessions/{la_sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "SOFT_ERROR LONG_AUTH"},
+    )
+    assert r_la_turn.status_code == 503
+    assert len(r_la_turn.json()["detail"]) <= 240
+    la_doc = http_client.get(f"/v1/sessions/{la_sid}?include_turns=true", headers={"X-API-Key": "key-alice"}).json()
+    assert len(la_doc["error"] or "") <= 240
+    assert len(la_doc["turns"][0]["error"] or "") <= 240
+
+    # 2. dev-server.sh rejects unsafe group/world-writable STATE_DIR BEFORE reading PID in both start and stop
+    test_port = 18943
+    unsafe_dir = f"/tmp/agent-api-dev-{test_port}"
+    shutil.rmtree(unsafe_dir, ignore_errors=True) if "shutil" in dir() else None
+    import shutil as _sh
+    _sh.rmtree(unsafe_dir, ignore_errors=True)
+    os.mkdir(unsafe_dir, 0o777)
+    os.chmod(unsafe_dir, 0o777)
+    # Put current test process PID in uvicorn.pid — stop MUST refuse unsafe dir and NOT signal us!
+    with open(os.path.join(unsafe_dir, "uvicorn.pid"), "w") as f:
+        f.write(f"{os.getpid()}\n")
+    try:
+        for action in ("start", "stop", "status"):
+            res = subprocess.run(["bash", dev_srv, action, str(test_port)], capture_output=True, text=True, check=False)
+            assert res.returncode != 0
+            assert "refusing" in res.stderr
+        # Also test competing bind on occupied port rejected cleanly
+        _sh.rmtree(unsafe_dir, ignore_errors=True)
+        occ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occ.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        occ.bind(("127.0.0.1", test_port))
+        occ.listen(5)
+        try:
+            res_occ = subprocess.run(["bash", dev_srv, "start", str(test_port)], capture_output=True, text=True, check=False)
+            assert res_occ.returncode != 0
+            assert "already in use" in res_occ.stderr
+        finally:
+            occ.close()
+    finally:
+        _sh.rmtree(unsafe_dir, ignore_errors=True)
+
+    # 3. session-cli module unit tests: preserve session_id on 404/401 across --close, --new, REPL /new, and 202 polling
+    loader = importlib.machinery.SourceFileLoader("session_cli_mod", cli_path)
+    spec = importlib.util.spec_from_loader("session_cli_mod", loader)
+    cli_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli_mod)
+
+    st_path = str(tmp_path / "cli_unit.json")
+    state = {
+        "url": "http://testserver",
+        "api_key": "key-bob",
+        "agent": "mock_agy_session",
+        "model": None,
+        "effort": None,
+        "idle_timeout": 900,
+        "wait": 60,
+        "session_id": "alice-owned-session-id",
+    }
+    cli_mod.save_state(st_path, state)
+
+    # Mock api_request returning 404 (e.g. wrong tenant key) on DELETE and GET
+    monkeypatch.setattr(cli_mod, "api_request", lambda *a, **kw: (404, {"detail": "Session not found"}))
+    assert cli_mod.cmd_close(state, st_path) == 1
+    assert state["session_id"] == "alice-owned-session-id"
+    assert json.load(open(st_path))["session_id"] == "alice-owned-session-id"
+
+    assert cli_mod.send_message_or_spawn(state, st_path, prompt="hi", force_new=True) is None
+    assert state["session_id"] == "alice-owned-session-id"
+
+    assert cli_mod.ensure_warm_idle_session(state, st_path) is None
+    assert state["session_id"] == "alice-owned-session-id"
+
+    # CLI subprocess with --new and no prompt exits 1 when DELETE returns 401/404 and preserves session_id
+    bad_state_path = str(tmp_path / "cli_sub_new.json")
+    cli_mod.save_state(bad_state_path, {**state, "url": "http://127.0.0.1:9"})
+    res_new = subprocess.run(
+        [sys.executable, cli_path, "--state-file", bad_state_path, "--new"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_new.returncode != 0
+    assert json.load(open(bad_state_path))["session_id"] == "alice-owned-session-id"
+
+    # 202 polling: rejects missing submitted_turn_id, and selects exact submitted_turn_id even when later turn completed
+    assert cli_mod._poll_until_turn_done(state, "sid-1", time.time(), submitted_turn_id=None) is None
+
+    monkeypatch.setattr(cli_mod.time, "sleep", lambda _: None)
+    fake_turns = [
+        {"id": "turn-A", "turn_index": 0, "status": "completed", "response": "Exact Turn A"},
+        {"id": "turn-B", "turn_index": 1, "status": "completed", "response": "Later Turn B"},
+    ]
+    monkeypatch.setattr(
+        cli_mod,
+        "_fetch_all_session_turns",
+        lambda st, sid: (200, {"id": sid, "status": "idle", "turn_count": 2}, fake_turns),
+    )
+    polled = cli_mod._poll_until_turn_done(state, "sid-1", time.time(), submitted_turn_id="turn-A")
+    assert polled is not None
+    assert polled["latest_turn"]["response"] == "Exact Turn A"
+
+
 
 
 

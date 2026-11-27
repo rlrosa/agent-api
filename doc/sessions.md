@@ -367,17 +367,32 @@ async function waitForTurnResult(sessionId, data) {
     return data.latest_turn.response;
   }
   const targetTurnId = data.submitted_turn_id;
+  if (!targetTurnId) {
+    throw new Error("202 response missing submitted_turn_id");
+  }
   for (let i = 0; i < 60; i++) {
     await new Promise((r) => setTimeout(r, 1500));
-    const poll = await api.get(`/v1/sessions/${sessionId}?include_turns=true`);
-    const turns = poll.data.turns || [];
-    const match = targetTurnId
-      ? turns.find((t) => t.id === targetTurnId)
-      : turns[turns.length - 1];
+    let cursor = null;
+    let lastSession = null;
+    let match = null;
+    do {
+      const qs = cursor !== null
+        ? `?include_turns=true&turns_limit=200&after_turn=${cursor}`
+        : "?include_turns=true&turns_limit=200";
+      const poll = await api.get(`/v1/sessions/${sessionId}${qs}`);
+      lastSession = poll.data;
+      const turns = lastSession.turns || [];
+      match = turns.find((t) => t.id === targetTurnId) || null;
+      if (match) break;
+      cursor = lastSession.turns_has_more && lastSession.next_after_turn !== null
+        ? lastSession.next_after_turn
+        : null;
+    } while (cursor !== null);
+
     if (match && match.status === "completed") return match.response;
     if (match && match.status === "failed") throw new Error(match.error || "Turn failed");
-    if (["failed", "closed", "expired"].includes(poll.data.status)) {
-      throw new Error(poll.data.error || `Session ${poll.data.status}`);
+    if (lastSession && ["failed", "closed", "expired"].includes(lastSession.status)) {
+      throw new Error(lastSession.error || `Session ${lastSession.status}`);
     }
   }
   throw new Error("Timed out polling for session turn completion");
