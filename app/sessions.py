@@ -329,6 +329,26 @@ class LiveSession:
 
         self.stderr_buffer = collections.deque(maxlen=200)
         self.drain_task: Optional[asyncio.Task] = None
+        self.active_turn_task: Optional[asyncio.Task] = None
+
+
+def _rollback_turn_uploads(live: "LiveSession", saved_this_turn: List[Tuple[str, int]]) -> None:
+    """Remove newly saved files from a failed turn; keep byte accounting & tracking for any file whose unlink failed."""
+    for fp, bc in saved_this_turn:
+        removed = False
+        try:
+            if not os.path.exists(fp):
+                removed = True
+            else:
+                os.remove(fp)
+                removed = True
+        except OSError:
+            removed = False
+
+        if removed:
+            live.total_attachment_bytes = max(0, live.total_attachment_bytes - bc)
+        else:
+            live.managed_attachments.add(fp)
 
 
 async def _drain_stderr(
@@ -398,6 +418,7 @@ class SessionManager:
     def __init__(self):
         self._sessions: Dict[str, LiveSession] = {}
         self._closing: Dict[str, asyncio.Task] = {}
+        self._unreaped_procs: Dict[str, asyncio.subprocess.Process] = {}
         self._lock: Optional[asyncio.Lock] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -412,14 +433,22 @@ class SessionManager:
             self._lock = asyncio.Lock()
             self._loop = current_loop
             self._closing = {}
+            self._unreaped_procs = {}
         return self._lock
+
+    def _prune_exited_unreaped(self) -> int:
+        dead_ids = [sid for sid, proc in self._unreaped_procs.items() if proc.returncode is not None]
+        for sid in dead_ids:
+            self._unreaped_procs.pop(sid, None)
+        return sum(1 for sid in self._unreaped_procs if sid not in self._sessions and sid not in self._closing)
 
     def is_session_active(self, session_id: str) -> bool:
         live = self._sessions.get(session_id)
         return bool(live is not None and not live.closing)
 
     def active_session_count(self) -> int:
-        return len(self._sessions) + len(self._closing)
+        extra_unreaped = self._prune_exited_unreaped()
+        return len(self._sessions) + len(self._closing) + extra_unreaped
 
     async def start(self):
         current_loop = asyncio.get_running_loop()
@@ -467,6 +496,11 @@ class SessionManager:
         pending_closes = [t for t in self._closing.values() if not t.done()]
         if pending_closes:
             await asyncio.gather(*pending_closes, return_exceptions=True)
+
+        for sid, proc in list(self._unreaped_procs.items()):
+            await _terminate_and_reap_proc(proc)
+            if proc.returncode is not None:
+                self._unreaped_procs.pop(sid, None)
 
         logger.info("Stopped SessionManager")
 
@@ -516,7 +550,7 @@ class SessionManager:
         settings = get_settings()
 
         async with self.lock:
-            if (len(self._sessions) + len(self._closing)) >= settings.max_active_sessions:
+            if self.active_session_count() >= settings.max_active_sessions:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail=f"Max active sessions limit reached ({settings.max_active_sessions})",
@@ -628,6 +662,8 @@ class SessionManager:
                     except asyncio.CancelledError:
                         pass
                 await _terminate_and_reap_proc(proc)
+                if proc.returncode is None:
+                    self._unreaped_procs[session_id] = proc
                 shutil.rmtree(workspace_path, ignore_errors=True)
                 raise
 
@@ -643,17 +679,18 @@ class SessionManager:
     ) -> None:
         await asyncio.sleep(0.02)
         recent_stderr = "".join(live.stderr_buffer)
+        bounded_stderr = _truncate_diag(recent_stderr, MAX_AUTH_DIAG_CHARS)
         if live.auth_abort_reason or is_auth_error(recent_stderr):
-            diag = live.auth_abort_reason or _truncate_diag(recent_stderr) or "authentication required"
-            err_msg = f"Agent authentication expired or missing ({live.agent}): {diag}"
+            diag = _truncate_diag(live.auth_abort_reason or recent_stderr) or "authentication required"
+            err_msg = _truncate_diag(f"Agent authentication expired or missing ({live.agent}): {diag}", MAX_AUTH_DIAG_CHARS)
             if turn_id:
-                finish_session_turn(turn_id=turn_id, status="failed", stderr=recent_stderr, error=err_msg, db_path=db_path)
+                finish_session_turn(turn_id=turn_id, status="failed", stderr=bounded_stderr, error=err_msg, db_path=db_path)
             await self.close_session(live.id, reason="failed", error=err_msg, db_path=db_path)
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=err_msg)
 
-        exit_err = f"Session subprocess exited (code {live.proc.returncode})"
+        exit_err = _truncate_diag(f"Session subprocess exited (code {live.proc.returncode})", MAX_AUTH_DIAG_CHARS)
         if turn_id:
-            finish_session_turn(turn_id=turn_id, status="failed", stderr=recent_stderr, error=exit_err, db_path=db_path)
+            finish_session_turn(turn_id=turn_id, status="failed", stderr=bounded_stderr, error=exit_err, db_path=db_path)
         await self.close_session(live.id, reason="failed", error=exit_err, db_path=db_path)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -762,366 +799,439 @@ class SessionManager:
             async with live.lock:
                 live.queued_waiters = max(0, live.queued_waiters - 1)
                 decremented_waiter = True
-
-                now_start = time.time()
-                if live.closing or live.status in ("closed", "expired", "failed"):
-                    finish_session_turn(
-                        turn_id=turn_id,
-                        status="failed",
-                        error=f"Session {live.closed_reason or live.status} before turn started",
-                        db_path=db_path,
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Session '{session_id}' is {live.closed_reason or live.status} and cannot accept new messages",
-                    )
-
-                if (now_start - live.created_at) >= live.max_lifetime:
-                    finish_session_turn(
-                        turn_id=turn_id,
-                        status="failed",
-                        error="Session max_lifetime reached before turn started",
-                        db_path=db_path,
-                    )
-                    await self.close_session(session_id, reason="expired", db_path=db_path)
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Session '{session_id}' is expired and cannot accept new messages",
-                    )
-
-                if live.proc.returncode is not None:
-                    await self._retire_dead_child_and_raise(live, db_path=db_path, turn_id=turn_id)
-
-                live.status = "busy"
-                live.last_active_at = now_start
-                live.stderr_buffer.clear()
-                update_session_state(session_id, status="busy", last_active_at=now_start, db_path=db_path)
-
-                if rate_limit_manager.is_in_cooldown():
-                    rem = rate_limit_manager.get_cooldown_remaining()
-                    await asyncio.sleep(min(rem, float(turn_timeout or live.turn_timeout)))
-
-                if live.closing or live.status in ("closed", "expired", "failed"):
-                    finish_session_turn(
-                        turn_id=turn_id,
-                        status="failed",
-                        error=f"Session {live.closed_reason or live.status} during cooldown",
-                        db_path=db_path,
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Session '{session_id}' is {live.closed_reason or live.status} and cannot accept new messages",
-                    )
-
-                attachment_filenames: List[str] = []
+                live.active_turn_task = asyncio.current_task()
                 saved_this_turn: List[Tuple[str, int]] = []
-                if attachments:
-                    try:
-                        for att in attachments:
-                            if live.closing or live.status in ("closed", "expired", "failed"):
-                                raise FileNotFoundError("Session closed during attachment upload")
-                            att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
-                                att if isinstance(att, dict) else dict(att)
-                            )
-                            saved_name, byte_count = await materialize_attachment(
-                                att_dict,
-                                live.workspace_path,
-                                total_bytes_so_far=live.total_attachment_bytes,
-                                allowlist=allowlist,
-                            )
-                            full_saved = os.path.abspath(os.path.join(live.workspace_path, "attachments", saved_name))
-                            saved_this_turn.append((full_saved, byte_count))
-                            live.total_attachment_bytes += byte_count
-                            if live.total_attachment_bytes > settings.max_total_bytes:
-                                raise ValueError(
-                                    f"Cumulative attachment size ({live.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
-                                )
-                            attachment_filenames.append(os.path.basename(saved_name))
-                    except FileNotFoundError:
-                        for fp, bc in saved_this_turn:
-                            try:
-                                if os.path.exists(fp):
-                                    os.remove(fp)
-                            except OSError:
-                                pass
-                            live.total_attachment_bytes = max(0, live.total_attachment_bytes - bc)
+
+                try:
+                    now_start = time.time()
+                    if live.closing or live.status in ("closed", "expired", "failed"):
                         finish_session_turn(
                             turn_id=turn_id,
                             status="failed",
-                            error="Session closed while materializing attachments",
+                            error=f"Session {live.closed_reason or live.status} before turn started",
                             db_path=db_path,
                         )
                         raise HTTPException(
                             status_code=status.HTTP_409_CONFLICT,
-                            detail=f"Session '{session_id}' is {live.closed_reason or 'closed'} and cannot accept new messages",
+                            detail=f"Session '{session_id}' is {live.closed_reason or live.status} and cannot accept new messages",
                         )
-                    except ValueError as att_err:
-                        for fp, bc in saved_this_turn:
-                            try:
-                                if os.path.exists(fp):
-                                    os.remove(fp)
-                            except OSError:
-                                pass
-                            live.total_attachment_bytes = max(0, live.total_attachment_bytes - bc)
 
+                    if (now_start - live.created_at) >= live.max_lifetime:
                         finish_session_turn(
                             turn_id=turn_id,
                             status="failed",
-                            error=f"Attachment error: {att_err}",
+                            error="Session max_lifetime reached before turn started",
                             db_path=db_path,
                         )
-                        if not live.closing and live.status not in ("closed", "expired", "failed"):
-                            live.status = "idle"
-                            now_idle = time.time()
-                            live.last_active_at = now_idle
-                            update_session_state(
-                                session_id,
-                                status="idle",
-                                total_attachment_bytes=live.total_attachment_bytes,
-                                last_active_at=now_idle,
-                                db_path=db_path,
-                            )
+                        await self.close_session(session_id, reason="expired", db_path=db_path)
                         raise HTTPException(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"Attachment error: {att_err}",
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Session '{session_id}' is expired and cannot accept new messages",
                         )
 
-                    for fp, _ in saved_this_turn:
-                        live.managed_attachments.add(fp)
+                    if live.proc.returncode is not None:
+                        await self._retire_dead_child_and_raise(live, db_path=db_path, turn_id=turn_id)
 
-                # Verify only session-managed attachment files (never probe paths parsed from free-form prompt text)
-                for att_path in sorted(live.managed_attachments):
-                    if not os.path.exists(att_path):
-                        err_msg = f"Session attachment missing prior to turn execution: {os.path.basename(att_path)}"
-                        logger.error(f"Session {session_id} pre-execution guard failed: {err_msg}")
+                    live.status = "busy"
+                    live.last_active_at = now_start
+                    live.stderr_buffer.clear()
+                    update_session_state(session_id, status="busy", last_active_at=now_start, db_path=db_path)
+
+                    if rate_limit_manager.is_in_cooldown():
+                        rem = rate_limit_manager.get_cooldown_remaining()
+                        await asyncio.sleep(min(rem, float(turn_timeout or live.turn_timeout)))
+
+                    if live.closing or live.status in ("closed", "expired", "failed"):
+                        finish_session_turn(
+                            turn_id=turn_id,
+                            status="failed",
+                            error=f"Session {live.closed_reason or live.status} during cooldown",
+                            db_path=db_path,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Session '{session_id}' is {live.closed_reason or live.status} and cannot accept new messages",
+                        )
+
+                    attachment_filenames: List[str] = []
+                    if attachments:
+                        try:
+                            for att in attachments:
+                                if live.closing or live.status in ("closed", "expired", "failed"):
+                                    raise FileNotFoundError("Session closed during attachment upload")
+                                att_dict = att.model_dump(exclude_none=True) if hasattr(att, "model_dump") else (
+                                    att if isinstance(att, dict) else dict(att)
+                                )
+                                saved_name, byte_count = await materialize_attachment(
+                                    att_dict,
+                                    live.workspace_path,
+                                    total_bytes_so_far=live.total_attachment_bytes,
+                                    allowlist=allowlist,
+                                )
+                                full_saved = os.path.abspath(os.path.join(live.workspace_path, "attachments", saved_name))
+                                saved_this_turn.append((full_saved, byte_count))
+                                live.total_attachment_bytes += byte_count
+                                if live.closing or live.status in ("closed", "expired", "failed"):
+                                    raise FileNotFoundError("Session closed after attachment upload")
+                                if live.total_attachment_bytes > settings.max_total_bytes:
+                                    raise ValueError(
+                                        f"Cumulative attachment size ({live.total_attachment_bytes} bytes) exceeds MAX_TOTAL_BYTES ({settings.max_total_bytes})"
+                                    )
+                                attachment_filenames.append(os.path.basename(saved_name))
+                        except FileNotFoundError:
+                            _rollback_turn_uploads(live, saved_this_turn)
+                            saved_this_turn.clear()
+                            update_session_state(
+                                session_id,
+                                total_attachment_bytes=live.total_attachment_bytes,
+                                db_path=db_path,
+                            )
+                            finish_session_turn(
+                                turn_id=turn_id,
+                                status="failed",
+                                error="Session closed while materializing attachments",
+                                db_path=db_path,
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail=f"Session '{session_id}' is {live.closed_reason or 'closed'} and cannot accept new messages",
+                            )
+                        except ValueError as att_err:
+                            _rollback_turn_uploads(live, saved_this_turn)
+                            saved_this_turn.clear()
+                            bounded_att_err = _truncate_diag(f"Attachment error: {att_err}", MAX_AUTH_DIAG_CHARS)
+                            finish_session_turn(
+                                turn_id=turn_id,
+                                status="failed",
+                                error=bounded_att_err,
+                                db_path=db_path,
+                            )
+                            if not live.closing and live.status not in ("closed", "expired", "failed"):
+                                live.status = "idle"
+                                now_idle = time.time()
+                                live.last_active_at = now_idle
+                                update_session_state(
+                                    session_id,
+                                    status="idle",
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    last_active_at=now_idle,
+                                    db_path=db_path,
+                                )
+                            else:
+                                update_session_state(
+                                    session_id,
+                                    total_attachment_bytes=live.total_attachment_bytes,
+                                    db_path=db_path,
+                                )
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Attachment error: {att_err}",
+                            )
+
+                        for fp, _ in saved_this_turn:
+                            live.managed_attachments.add(fp)
+                        saved_this_turn.clear()
+
+                    if live.closing or live.status in ("closed", "expired", "failed"):
+                        finish_session_turn(
+                            turn_id=turn_id,
+                            status="failed",
+                            error=f"Session {live.closed_reason or live.status} before stdin write",
+                            db_path=db_path,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Session '{session_id}' is {live.closed_reason or live.status} and cannot accept new messages",
+                        )
+
+                    # Verify only session-managed attachment files (never probe paths parsed from free-form prompt text)
+                    for att_path in sorted(live.managed_attachments):
+                        if not os.path.exists(att_path):
+                            err_msg = _truncate_diag(
+                                f"Session attachment missing prior to turn execution: {os.path.basename(att_path)}",
+                                MAX_AUTH_DIAG_CHARS,
+                            )
+                            logger.error(f"Session {session_id} pre-execution guard failed: {err_msg}")
+                            finish_session_turn(turn_id=turn_id, status="failed", error=err_msg, db_path=db_path)
+                            live.status = "failed"
+                            await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
+                            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
+
+                    composed_prompt = compose_prompt(prompt, attachment_filenames, workspace_path=live.workspace_path)
+                    input_bytes = live.driver.format_prompt(composed_prompt)
+
+                    eff_timeout = float(turn_timeout or live.turn_timeout)
+                    deadline = time.monotonic() + eff_timeout
+
+                    try:
+                        live.proc.stdin.write(input_bytes)
+                        await asyncio.wait_for(
+                            live.proc.stdin.drain(),
+                            timeout=max(0.01, deadline - time.monotonic()),
+                        )
+
+                        rem_timeout = max(0.01, deadline - time.monotonic())
+                        if isinstance(live.driver, ClaudeStreamDriver):
+                            result_data = await asyncio.wait_for(
+                                live.driver.parse_response(
+                                    live.proc.stdout,
+                                    model=live.model or "",
+                                    settings=settings,
+                                    prev_cum_usage=live.cumulative_usage,
+                                    prev_cum_cost=live.cumulative_cost,
+                                ),
+                                timeout=rem_timeout,
+                            )
+                        else:
+                            result_data = await asyncio.wait_for(
+                                live.driver.parse_response(
+                                    live.proc.stdout,
+                                    model=live.model or "",
+                                    settings=settings,
+                                    prev_cum_usage=live.cumulative_usage,
+                                ),
+                                timeout=rem_timeout,
+                            )
+                    except asyncio.TimeoutError:
+                        err_msg = f"Turn execution timed out after {eff_timeout}s"
+                        logger.error(f"Session {session_id} turn {turn_index} timed out")
+                        finish_session_turn(turn_id=turn_id, status="failed", error=err_msg, db_path=db_path)
+                        live.status = "failed"
+                        await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
+                        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=err_msg)
+                    except (BrokenPipeError, ConnectionResetError) as pipe_err:
+                        if live.closing and live.closed_reason in ("closed", "expired"):
+                            finish_session_turn(
+                                turn_id=turn_id,
+                                status="failed",
+                                error=f"Session {live.closed_reason} during active turn",
+                                db_path=db_path,
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail=f"Session '{session_id}' is {live.closed_reason} and cannot accept new messages",
+                            )
+                        err_msg = _truncate_diag(f"Failed writing to session stdin (process died): {pipe_err}", MAX_AUTH_DIAG_CHARS)
                         finish_session_turn(turn_id=turn_id, status="failed", error=err_msg, db_path=db_path)
                         live.status = "failed"
                         await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
                         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
+                    except EOFError as eof_err:
+                        await asyncio.sleep(0.05)
+                        recent_stderr = "".join(live.stderr_buffer)
+                        bounded_stderr = _truncate_diag(recent_stderr, MAX_AUTH_DIAG_CHARS)
+                        if live.closing and live.closed_reason in ("closed", "expired"):
+                            err_msg = f"Session {live.closed_reason} during active turn"
+                            finish_session_turn(
+                                turn_id=turn_id,
+                                status="failed",
+                                stderr=bounded_stderr,
+                                error=err_msg,
+                                db_path=db_path,
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail=f"Session '{session_id}' is {live.closed_reason} and cannot accept new messages",
+                            )
+                        if live.auth_abort_reason or is_auth_error(recent_stderr):
+                            reason_detail = (
+                                live.auth_abort_reason
+                                or _truncate_diag(recent_stderr)
+                                or _truncate_diag(str(eof_err))
+                            )
+                            err_msg = _truncate_diag(
+                                f"Agent authentication expired or missing ({live.agent}): {reason_detail}",
+                                MAX_AUTH_DIAG_CHARS,
+                            )
+                            logger.error(f"Session {session_id} auth failure: {err_msg}")
+                            finish_session_turn(
+                                turn_id=turn_id,
+                                status="failed",
+                                stderr=bounded_stderr,
+                                error=err_msg,
+                                db_path=db_path,
+                            )
+                            live.status = "failed"
+                            await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
+                            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=err_msg)
 
-                composed_prompt = compose_prompt(prompt, attachment_filenames, workspace_path=live.workspace_path)
-                input_bytes = live.driver.format_prompt(composed_prompt)
-
-                eff_timeout = float(turn_timeout or live.turn_timeout)
-                deadline = time.monotonic() + eff_timeout
-
-                try:
-                    live.proc.stdin.write(input_bytes)
-                    await asyncio.wait_for(
-                        live.proc.stdin.drain(),
-                        timeout=max(0.01, deadline - time.monotonic()),
-                    )
-
-                    rem_timeout = max(0.01, deadline - time.monotonic())
-                    if isinstance(live.driver, ClaudeStreamDriver):
-                        result_data = await asyncio.wait_for(
-                            live.driver.parse_response(
-                                live.proc.stdout,
-                                model=live.model or "",
-                                settings=settings,
-                                prev_cum_usage=live.cumulative_usage,
-                                prev_cum_cost=live.cumulative_cost,
-                            ),
-                            timeout=rem_timeout,
+                        stderr_tail = f" | stderr: {bounded_stderr}" if bounded_stderr else ""
+                        err_msg = _truncate_diag(
+                            f"Session process exited unexpectedly mid-turn: {eof_err}{stderr_tail}",
+                            MAX_AUTH_DIAG_CHARS,
                         )
-                    else:
-                        result_data = await asyncio.wait_for(
-                            live.driver.parse_response(
-                                live.proc.stdout,
-                                model=live.model or "",
-                                settings=settings,
-                                prev_cum_usage=live.cumulative_usage,
-                            ),
-                            timeout=rem_timeout,
-                        )
-                except asyncio.TimeoutError:
-                    err_msg = f"Turn execution timed out after {eff_timeout}s"
-                    logger.error(f"Session {session_id} turn {turn_index} timed out")
-                    finish_session_turn(turn_id=turn_id, status="failed", error=err_msg, db_path=db_path)
-                    live.status = "failed"
-                    await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
-                    raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=err_msg)
-                except (BrokenPipeError, ConnectionResetError) as pipe_err:
-                    err_msg = f"Failed writing to session stdin (process died): {pipe_err}"
-                    finish_session_turn(turn_id=turn_id, status="failed", error=err_msg, db_path=db_path)
-                    live.status = "failed"
-                    await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
-                except EOFError as eof_err:
-                    await asyncio.sleep(0.05)
-                    recent_stderr = "".join(live.stderr_buffer)
-                    if live.closing and live.closed_reason in ("closed", "expired"):
-                        err_msg = f"Session {live.closed_reason} during active turn"
+                        logger.error(f"Session {session_id} EOF: {err_msg}")
                         finish_session_turn(
                             turn_id=turn_id,
                             status="failed",
-                            stderr=recent_stderr,
-                            error=err_msg,
-                            db_path=db_path,
-                        )
-                        raise HTTPException(
-                            status_code=status.HTTP_409_CONFLICT,
-                            detail=f"Session '{session_id}' is {live.closed_reason} and cannot accept new messages",
-                        )
-                    if live.auth_abort_reason or is_auth_error(recent_stderr):
-                        reason_detail = (
-                            live.auth_abort_reason
-                            or _truncate_diag(recent_stderr)
-                            or _truncate_diag(str(eof_err))
-                        )
-                        err_msg = f"Agent authentication expired or missing ({live.agent}): {reason_detail}"
-                        logger.error(f"Session {session_id} auth failure: {err_msg}")
-                        finish_session_turn(
-                            turn_id=turn_id,
-                            status="failed",
-                            stderr=recent_stderr,
+                            stderr=bounded_stderr,
                             error=err_msg,
                             db_path=db_path,
                         )
                         live.status = "failed"
                         await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
-                        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=err_msg)
-
-                    stderr_tail = f" | stderr: {_truncate_diag(recent_stderr)}" if recent_stderr.strip() else ""
-                    err_msg = f"Session process exited unexpectedly mid-turn: {eof_err}{stderr_tail}"
-                    logger.error(f"Session {session_id} EOF: {err_msg}")
-                    finish_session_turn(
-                        turn_id=turn_id,
-                        status="failed",
-                        stderr=recent_stderr,
-                        error=err_msg,
-                        db_path=db_path,
-                    )
-                    live.status = "failed"
-                    await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
-                except Exception as stream_err:
-                    recent_stderr = "".join(live.stderr_buffer)
-                    err_msg = f"Session stream protocol error: {_truncate_diag(str(stream_err))}"
-                    logger.error(f"Session {session_id} stream parse failure: {err_msg}", exc_info=True)
-                    finish_session_turn(
-                        turn_id=turn_id,
-                        status="failed",
-                        stderr=recent_stderr,
-                        error=err_msg,
-                        db_path=db_path,
-                    )
-                    live.status = "failed"
-                    await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
-
-                response_text = result_data.get("response", "")
-                is_success = result_data.get("is_success", True)
-                err_text = result_data.get("error")
-                recent_stderr = "".join(live.stderr_buffer)
-
-                matched_pat = None
-                if response_text:
-                    resp_lower = response_text.lower()
-                    for pat in UNREADABLE_ATTACHMENT_PATTERNS:
-                        if pat in resp_lower:
-                            matched_pat = pat
-                            break
-
-                if matched_pat:
-                    is_success = False
-                    err_text = f"Output validation guard failed: agent reported missing attachment ('{matched_pat}')"
-                    logger.error(f"Session {session_id} output validation guard failed: {err_text}")
-
-                # Rate limit check (NEVER regex-scan response payload!)
-                if not is_success:
-                    if is_rate_limit_error(exit_code=1, stdout="", stderr=recent_stderr, error=err_text):
-                        await rate_limit_manager.handle_rate_limit(1)
-                else:
-                    await rate_limit_manager.handle_success()
-
-                turn_usage = result_data.get("turn_usage", {})
-                cum_usage = result_data.get("cum_usage", {})
-                turn_cost = result_data.get("turn_cost")
-                cum_cost = result_data.get("cum_cost")
-
-                live.cumulative_usage = cum_usage
-                live.cumulative_cost = cum_cost
-                live.turn_count += 1
-                if result_data.get("conversation_id"):
-                    live.upstream_conversation_id = result_data["conversation_id"]
-
-                turn_status = "completed" if is_success else "failed"
-                finished_turn = finish_session_turn(
-                    turn_id=turn_id,
-                    status=turn_status,
-                    response=response_text if is_success else None,
-                    stderr=recent_stderr,
-                    error=err_text,
-                    input_tokens=turn_usage.get("input_tokens"),
-                    output_tokens=turn_usage.get("output_tokens"),
-                    cached_tokens=turn_usage.get("cached_tokens"),
-                    total_tokens=turn_usage.get("total_tokens"),
-                    cost_usd=turn_cost,
-                    db_path=db_path,
-                )
-
-                now_finish = time.time()
-                live.last_active_at = now_finish
-                if not live.closing and live.status not in ("closed", "expired", "failed"):
-                    live.status = "idle"
-                    updated_session = update_session_state(
-                        session_id=session_id,
-                        status="idle",
-                        upstream_conversation_id=live.upstream_conversation_id,
-                        turn_count=live.turn_count,
-                        total_attachment_bytes=live.total_attachment_bytes,
-                        input_tokens=cum_usage.get("input_tokens"),
-                        output_tokens=cum_usage.get("output_tokens"),
-                        cached_tokens=cum_usage.get("cached_tokens"),
-                        total_tokens=cum_usage.get("total_tokens"),
-                        cost_usd=cum_cost,
-                        error=err_text if not is_success else None,
-                        last_active_at=now_finish,
-                        db_path=db_path,
-                    )
-                else:
-                    updated_session = update_session_state(
-                        session_id=session_id,
-                        upstream_conversation_id=live.upstream_conversation_id,
-                        turn_count=live.turn_count,
-                        total_attachment_bytes=live.total_attachment_bytes,
-                        input_tokens=cum_usage.get("input_tokens"),
-                        output_tokens=cum_usage.get("output_tokens"),
-                        cached_tokens=cum_usage.get("cached_tokens"),
-                        total_tokens=cum_usage.get("total_tokens"),
-                        cost_usd=cum_cost,
-                        db_path=db_path,
-                    )
-
-                if not is_success:
-                    if is_auth_error(err_text, recent_stderr):
-                        diag = _truncate_diag(err_text or recent_stderr)
-                        auth_detail = f"Agent authentication expired or missing ({live.agent}): {diag}"
-                        live.status = "failed"
-                        await self.close_session(session_id, reason="failed", error=auth_detail, db_path=db_path)
-                        raise HTTPException(
-                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail=auth_detail,
-                        )
-                    await asyncio.sleep(0.02)
-                    if live.proc.returncode is not None:
-                        live.status = "failed"
-                        await self.close_session(
-                            session_id,
-                            reason="failed",
-                            error=err_text or "Session process exited on turn error",
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as stream_err:
+                        recent_stderr = "".join(live.stderr_buffer)
+                        bounded_stderr = _truncate_diag(recent_stderr, MAX_AUTH_DIAG_CHARS)
+                        err_msg = _truncate_diag(f"Session stream protocol error: {stream_err}", MAX_AUTH_DIAG_CHARS)
+                        logger.error(f"Session {session_id} stream parse failure: {err_msg}", exc_info=True)
+                        finish_session_turn(
+                            turn_id=turn_id,
+                            status="failed",
+                            stderr=bounded_stderr,
+                            error=err_msg,
                             db_path=db_path,
                         )
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail=err_text or "Session turn failed",
+                        live.status = "failed"
+                        await self.close_session(session_id, reason="failed", error=err_msg, db_path=db_path)
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=err_msg)
+
+                    response_text = result_data.get("response", "")
+                    is_success = result_data.get("is_success", True)
+                    raw_err_text = result_data.get("error")
+                    err_text = _truncate_diag(raw_err_text, MAX_AUTH_DIAG_CHARS) if raw_err_text else None
+                    recent_stderr = "".join(live.stderr_buffer)
+                    bounded_stderr = _truncate_diag(recent_stderr, MAX_AUTH_DIAG_CHARS)
+
+                    matched_pat = None
+                    if response_text:
+                        resp_lower = response_text.lower()
+                        for pat in UNREADABLE_ATTACHMENT_PATTERNS:
+                            if pat in resp_lower:
+                                matched_pat = pat
+                                break
+
+                    if matched_pat:
+                        is_success = False
+                        err_text = _truncate_diag(
+                            f"Output validation guard failed: agent reported missing attachment ('{matched_pat}')",
+                            MAX_AUTH_DIAG_CHARS,
+                        )
+                        logger.error(f"Session {session_id} output validation guard failed: {err_text}")
+
+                    # Rate limit check (NEVER regex-scan response payload!)
+                    if not is_success:
+                        if is_rate_limit_error(exit_code=1, stdout="", stderr=recent_stderr, error=raw_err_text or err_text):
+                            await rate_limit_manager.handle_rate_limit(1)
+                    else:
+                        await rate_limit_manager.handle_success()
+
+                    turn_usage = result_data.get("turn_usage", {})
+                    cum_usage = result_data.get("cum_usage", {})
+                    turn_cost = result_data.get("turn_cost")
+                    cum_cost = result_data.get("cum_cost")
+
+                    live.cumulative_usage = cum_usage
+                    live.cumulative_cost = cum_cost
+                    live.turn_count += 1
+                    if result_data.get("conversation_id"):
+                        live.upstream_conversation_id = result_data["conversation_id"]
+
+                    turn_status = "completed" if is_success else "failed"
+                    finished_turn = finish_session_turn(
+                        turn_id=turn_id,
+                        status=turn_status,
+                        response=response_text if is_success else None,
+                        stderr=bounded_stderr,
+                        error=err_text,
+                        input_tokens=turn_usage.get("input_tokens"),
+                        output_tokens=turn_usage.get("output_tokens"),
+                        cached_tokens=turn_usage.get("cached_tokens"),
+                        total_tokens=turn_usage.get("total_tokens"),
+                        cost_usd=turn_cost,
+                        db_path=db_path,
                     )
 
-                return {
-                    **(updated_session or {}),
-                    "latest_turn": finished_turn,
-                }
+                    now_finish = time.time()
+                    live.last_active_at = now_finish
+                    if not live.closing and live.status not in ("closed", "expired", "failed"):
+                        live.status = "idle"
+                        updated_session = update_session_state(
+                            session_id=session_id,
+                            status="idle",
+                            upstream_conversation_id=live.upstream_conversation_id,
+                            turn_count=live.turn_count,
+                            total_attachment_bytes=live.total_attachment_bytes,
+                            input_tokens=cum_usage.get("input_tokens"),
+                            output_tokens=cum_usage.get("output_tokens"),
+                            cached_tokens=cum_usage.get("cached_tokens"),
+                            total_tokens=cum_usage.get("total_tokens"),
+                            cost_usd=cum_cost,
+                            error=err_text if not is_success else None,
+                            last_active_at=now_finish,
+                            db_path=db_path,
+                        )
+                    else:
+                        updated_session = update_session_state(
+                            session_id=session_id,
+                            upstream_conversation_id=live.upstream_conversation_id,
+                            turn_count=live.turn_count,
+                            total_attachment_bytes=live.total_attachment_bytes,
+                            input_tokens=cum_usage.get("input_tokens"),
+                            output_tokens=cum_usage.get("output_tokens"),
+                            cached_tokens=cum_usage.get("cached_tokens"),
+                            total_tokens=cum_usage.get("total_tokens"),
+                            cost_usd=cum_cost,
+                            db_path=db_path,
+                        )
+
+                    if not is_success:
+                        if is_auth_error(raw_err_text, err_text, recent_stderr):
+                            diag = _truncate_diag(raw_err_text or err_text or recent_stderr)
+                            auth_detail = _truncate_diag(
+                                f"Agent authentication expired or missing ({live.agent}): {diag}",
+                                MAX_AUTH_DIAG_CHARS,
+                            )
+                            live.status = "failed"
+                            await self.close_session(session_id, reason="failed", error=auth_detail, db_path=db_path)
+                            raise HTTPException(
+                                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=auth_detail,
+                            )
+                        await asyncio.sleep(0.02)
+                        if live.proc.returncode is not None:
+                            live.status = "failed"
+                            await self.close_session(
+                                session_id,
+                                reason="failed",
+                                error=err_text or "Session process exited on turn error",
+                                db_path=db_path,
+                            )
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=err_text or "Session turn failed",
+                        )
+
+                    return {
+                        **(updated_session or {}),
+                        "latest_turn": finished_turn,
+                    }
+                except asyncio.CancelledError:
+                    if saved_this_turn:
+                        _rollback_turn_uploads(live, saved_this_turn)
+                        saved_this_turn.clear()
+                        update_session_state(
+                            session_id,
+                            total_attachment_bytes=live.total_attachment_bytes,
+                            db_path=db_path,
+                        )
+                    finish_session_turn(
+                        turn_id=turn_id,
+                        status="failed",
+                        error=f"Turn cancelled ({live.closed_reason or 'cancelled'})",
+                        db_path=db_path,
+                    )
+                    if live.closing or live.status in ("closed", "expired", "failed"):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"Session '{session_id}' is {live.closed_reason or live.status} and cannot accept new messages",
+                        )
+                    raise
+                finally:
+                    live.active_turn_task = None
         finally:
             if not decremented_waiter:
                 live.queued_waiters = max(0, live.queued_waiters - 1)
@@ -1139,6 +1249,7 @@ class SessionManager:
         error: Optional[str],
         api_key_name: Optional[str],
         db_path: Optional[str],
+        caller_task: Optional[asyncio.Task] = None,
     ) -> Optional[Dict[str, Any]]:
         settings = get_settings()
         try:
@@ -1148,10 +1259,13 @@ class SessionManager:
             clean_exit = False
             if reason in ("closed", "expired") and not live.lock.locked():
                 try:
-                    if live.proc.stdin and not live.proc.stdin.is_closing():
-                        live.proc.stdin.close()
-                        await live.proc.stdin.wait_closed()
-                    await asyncio.wait_for(live.proc.wait(), timeout=2.0)
+                    async def _graceful_eof_and_wait() -> None:
+                        if live.proc.stdin and not live.proc.stdin.is_closing():
+                            live.proc.stdin.close()
+                            await live.proc.stdin.wait_closed()
+                        await live.proc.wait()
+
+                    await asyncio.wait_for(_graceful_eof_and_wait(), timeout=2.0)
                     clean_exit = True
                 except Exception:
                     clean_exit = False
@@ -1159,12 +1273,15 @@ class SessionManager:
             if not clean_exit and live.proc.returncode is None:
                 await _terminate_and_reap_proc(live.proc)
 
-            # Wait briefly for any unwinding active turn (unblocked by child exit) before deleting workspace
-            if live.lock.locked():
-                for _ in range(40):
-                    if not live.lock.locked():
-                        break
-                    await asyncio.sleep(0.05)
+            active_task = live.active_turn_task
+            if (
+                active_task is not None
+                and not active_task.done()
+                and active_task is not caller_task
+                and active_task is not asyncio.current_task()
+            ):
+                active_task.cancel()
+                await asyncio.gather(active_task, return_exceptions=True)
 
             if not (reason == "failed" and settings.keep_workspace_on_failure):
                 try:
@@ -1172,15 +1289,18 @@ class SessionManager:
                 except Exception as exc:
                     logger.warning(f"Failed deleting session workspace {live.workspace_path}: {exc}")
 
+            bounded_err = _truncate_diag(error, MAX_AUTH_DIAG_CHARS) if error else None
             return close_session_row(
                 session_id=live.id,
                 status=reason,
-                error=error,
+                error=bounded_err,
                 db_path=db_path,
                 api_key_name=api_key_name,
             )
         finally:
             async with self.lock:
+                if live.proc.returncode is None:
+                    self._unreaped_procs[live.id] = live.proc
                 self._closing.pop(live.id, None)
 
     async def close_session(
@@ -1219,6 +1339,7 @@ class SessionManager:
                         error=error,
                         api_key_name=api_key_name,
                         db_path=db_path,
+                        caller_task=asyncio.current_task(),
                     )
                 )
                 self._closing[session_id] = close_task

@@ -1476,6 +1476,292 @@ def test_coderabbit_pr7_review_fixes(http_client, monkeypatch, tmp_path):
     assert json.load(open(st_file))["session_id"] == "keep-this-id-1234"
 
 
+def test_coderabbit_followup_6_threads(http_client, monkeypatch, tmp_path):
+    """Covers all 6 CodeRabbit follow-up verification requests:
+    1. Multi-turn mock_agy_session & mock_claude_session with BWRAP_ENABLED=1 (4714711356)
+    2. Streamed multipart per-file & cumulative limits without Content-Length on both endpoints (4714711391)
+    3. Split stderr auth marker & <=240-char persisted turn/session error+stderr diagnostics (4714711406)
+    4. Unreaped child retains MAX_ACTIVE_SESSIONS capacity when termination fails (4714711426)
+    5. DELETE cancels & joins blocked upload before workspace delete and returns 409 (4714711445)
+    6. Partial upload rollback retains & persists bytes when os.remove fails (4714711458)
+    """
+    import asyncio
+    import base64
+    import shutil
+    import threading
+    import app.sessions as sessions_mod
+
+    # --- 1. Multi-turn mock_agy_session & mock_claude_session under BWRAP_ENABLED=1 ---
+    if shutil.which("bwrap"):
+        monkeypatch.setenv("BWRAP_ENABLED", "1")
+        monkeypatch.setenv("ALLOW_UNCONFINED", "0")
+        for mock_agent in ("mock_agy_session", "mock_claude_session"):
+            rb1 = http_client.post(
+                "/v1/sessions",
+                headers={"X-API-Key": "key-alice"},
+                json={"agent": mock_agent, "prompt": f"Bwrap Turn 1 ({mock_agent})"},
+            )
+            assert rb1.status_code == 200, rb1.text
+            bsid = rb1.json()["id"]
+            rb2 = http_client.post(
+                f"/v1/sessions/{bsid}/messages",
+                headers={"X-API-Key": "key-alice"},
+                json={"prompt": f"Bwrap Turn 2 ({mock_agent})"},
+            )
+            assert rb2.status_code == 200, rb2.text
+            assert "Turn 2" in rb2.json()["latest_turn"]["response"]
+            http_client.delete(f"/v1/sessions/{bsid}", headers={"X-API-Key": "key-alice"})
+        monkeypatch.setenv("BWRAP_ENABLED", "0")
+
+    # --- 2. Streamed multipart limits without Content-Length on both endpoints ---
+    rate_limiter.history.clear()
+    monkeypatch.setenv("MAX_ATTACHMENT_BYTES", "20")
+    monkeypatch.setenv("MAX_TOTAL_BYTES", "30")
+
+    boundary = "----TestStreamBoundary991"
+
+    def make_multipart_chunks(fields_dict, files_list):
+        parts = []
+        for k, v in fields_dict.items():
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
+            )
+        for fname, raw_bytes in files_list:
+            header = (
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n"
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode("utf-8")
+            parts.append(header)
+            # Yield body in small 7-byte chunks so streaming parser sees incremental chunks without Content-Length
+            for idx in range(0, len(raw_bytes), 7):
+                parts.append(raw_bytes[idx : idx + 7])
+            parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+        for chunk in parts:
+            yield chunk
+
+    # 2a. Per-file overflow (25 > 20) streamed to POST /v1/sessions
+    r_mp_create_over = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        content=make_multipart_chunks({"agent": "mock_agy_session", "prompt": "hi"}, [("big.bin", b"A" * 25)]),
+    )
+    assert r_mp_create_over.status_code == 400
+    assert "max single file size limit" in r_mp_create_over.json()["detail"]
+
+    # 2b. Cumulative overflow (18 + 18 = 36 > 30) streamed to POST /v1/sessions
+    r_mp_create_cum = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        content=make_multipart_chunks(
+            {"agent": "mock_agy_session", "prompt": "hi"},
+            [("f1.bin", b"B" * 18), ("f2.bin", b"C" * 18)],
+        ),
+    )
+    assert r_mp_create_cum.status_code == 400
+    assert "MAX_TOTAL_BYTES" in r_mp_create_cum.json()["detail"]
+
+    # 2c. Valid 18-byte upload on create, then streamed per-file & cumulative overflow on POST /messages
+    r_mp_ok = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        content=make_multipart_chunks({"agent": "mock_agy_session"}, [("ok.bin", b"D" * 18)]),
+    )
+    assert r_mp_ok.status_code == 201, r_mp_ok.text
+    mp_sid = r_mp_ok.json()["id"]
+
+    r_mp_msg_over = http_client.post(
+        f"/v1/sessions/{mp_sid}/messages",
+        headers={"X-API-Key": "key-alice", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        content=make_multipart_chunks({"prompt": "hi"}, [("big2.bin", b"E" * 25)]),
+    )
+    assert r_mp_msg_over.status_code == 400
+    assert "max single file size limit" in r_mp_msg_over.json()["detail"]
+
+    r_mp_msg_cum = http_client.post(
+        f"/v1/sessions/{mp_sid}/messages",
+        headers={"X-API-Key": "key-alice", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        content=make_multipart_chunks({"prompt": "hi"}, [("add.bin", b"F" * 15)]),  # 18 + 15 = 33 > 30
+    )
+    assert r_mp_msg_cum.status_code == 400
+    assert "MAX_TOTAL_BYTES" in r_mp_msg_cum.json()["detail"]
+    http_client.delete(f"/v1/sessions/{mp_sid}", headers={"X-API-Key": "key-alice"})
+
+    monkeypatch.delenv("MAX_ATTACHMENT_BYTES", raising=False)
+    monkeypatch.delenv("MAX_TOTAL_BYTES", raising=False)
+
+    # --- 3. Split stderr auth marker & <=240-char persisted diagnostics ---
+    rate_limiter.history.clear()
+    r_sp = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    sp_sid = r_sp.json()["id"]
+    r_sp_auth = http_client.post(
+        f"/v1/sessions/{sp_sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "AUTH_EXPIRED SPLIT_LONG"},
+    )
+    assert r_sp_auth.status_code == 503
+    assert len(r_sp_auth.json()["detail"]) <= 240
+    sp_doc = http_client.get(
+        f"/v1/sessions/{sp_sid}?include_turns=true",
+        headers={"X-API-Key": "key-alice"},
+    ).json()
+    assert len(sp_doc["error"] or "") <= 240
+    assert len(sp_doc["turns"][0]["error"] or "") <= 240
+    assert len(sp_doc["turns"][0]["stderr"] or "") <= 240
+
+    # Also test long Claude result auth error bounded <= 240 chars in persisted turn & session
+    r_cl_sp = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_claude_session"},
+    )
+    cl_sid = r_cl_sp.json()["id"]
+    r_cl_auth = http_client.post(
+        f"/v1/sessions/{cl_sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "SOFT_ERROR " + ("Z" * 600)},
+    )
+    assert r_cl_auth.status_code == 500
+    cl_doc = http_client.get(
+        f"/v1/sessions/{cl_sid}?include_turns=true",
+        headers={"X-API-Key": "key-alice"},
+    ).json()
+    assert len(cl_doc["error"] or "") <= 240
+    assert len(cl_doc["turns"][0]["error"] or "") <= 240
+    http_client.delete(f"/v1/sessions/{cl_sid}", headers={"X-API-Key": "key-alice"})
+
+    # --- 4. Simulated termination failure retains MAX_ACTIVE_SESSIONS capacity until child exit ---
+    rate_limiter.history.clear()
+    monkeypatch.setenv("MAX_ACTIVE_SESSIONS", "1")
+    r_cap1 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r_cap1.status_code == 201
+    cap_sid = r_cap1.json()["id"]
+    cap_proc = session_manager._sessions[cap_sid].proc
+    # Hold live.lock lookalike? No, force clean_exit=False by closing with reason='failed' or monkeypatching stdin & _terminate_and_reap_proc
+    orig_term = sessions_mod._terminate_and_reap_proc
+
+    async def noop_terminate(proc):
+        return None
+
+    monkeypatch.setattr(sessions_mod, "_terminate_and_reap_proc", noop_terminate)
+    # Also prevent stdin EOF clean exit so proc stays alive
+    monkeypatch.setattr(cap_proc.stdin, "close", lambda: None)
+
+    r_del_cap = http_client.delete(f"/v1/sessions/{cap_sid}", headers={"X-API-Key": "key-alice"})
+    assert r_del_cap.status_code == 200
+    assert cap_proc.returncode is None
+    assert session_manager.active_session_count() == 1
+
+    # Attempt to create a new session while unkilled child is still running -> rejected with 429!
+    r_cap2 = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r_cap2.status_code == 429
+
+    # Now actually terminate child -> capacity is released!
+    monkeypatch.setattr(sessions_mod, "_terminate_and_reap_proc", orig_term)
+    cap_proc.kill()
+    for _ in range(50):
+        h = http_client.get("/healthz").json()
+        if h["active_sessions"] == 0 and cap_proc.returncode is not None:
+            break
+        time.sleep(0.02)
+    assert cap_proc.returncode is not None
+    monkeypatch.delenv("MAX_ACTIVE_SESSIONS", raising=False)
+
+    # --- 5. Blocked attachment upload cancelled & joined on DELETE (returns 409, workspace stays deleted) ---
+    rate_limiter.history.clear()
+    r_blk = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    blk_sid = r_blk.json()["id"]
+    blk_ws = session_manager._sessions[blk_sid].workspace_path
+    upload_entered = threading.Event()
+    upload_cancelled = threading.Event()
+    orig_mat = sessions_mod.materialize_attachment
+
+    async def slow_materialize(spec, workspace_path, total_bytes_so_far=0, allowlist=None):
+        upload_entered.set()
+        try:
+            await asyncio.sleep(10.0)
+            return await orig_mat(spec, workspace_path, total_bytes_so_far=total_bytes_so_far, allowlist=allowlist)
+        except asyncio.CancelledError:
+            upload_cancelled.set()
+            raise
+
+    monkeypatch.setattr(sessions_mod, "materialize_attachment", slow_materialize)
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fut_msg = ex.submit(
+            http_client.post,
+            f"/v1/sessions/{blk_sid}/messages",
+            headers={"X-API-Key": "key-alice"},
+            json={
+                "prompt": "Slow upload",
+                "attachments": [{"filename": "slow.txt", "content_b64": base64.b64encode(b"hi").decode("ascii")}],
+            },
+        )
+        assert upload_entered.wait(timeout=3.0)
+        r_del_blk = http_client.delete(f"/v1/sessions/{blk_sid}", headers={"X-API-Key": "key-alice"})
+        assert r_del_blk.status_code == 200
+        res_msg_blk = fut_msg.result(timeout=5.0)
+
+    assert upload_cancelled.is_set()
+    assert res_msg_blk.status_code == 409, res_msg_blk.text
+    assert not os.path.exists(blk_ws)
+    monkeypatch.setattr(sessions_mod, "materialize_attachment", orig_mat)
+
+    # --- 6. Partial upload rollback retains & persists bytes when os.remove raises OSError ---
+    monkeypatch.setenv("MAX_ATTACHMENT_BYTES", "10")
+    r_rm = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    rm_sid = r_rm.json()["id"]
+
+    orig_remove = os.remove
+
+    def failing_remove(path, *a, **kw):
+        if "keep8.bin" in os.path.basename(path):
+            raise PermissionError("simulated unlink failure")
+        return orig_remove(path, *a, **kw)
+
+    monkeypatch.setattr(os, "remove", failing_remove)
+    r_partial = http_client.post(
+        f"/v1/sessions/{rm_sid}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Two files, second too big",
+            "attachments": [
+                {"filename": "keep8.bin", "content_b64": base64.b64encode(b"12345678").decode("ascii")},
+                {"filename": "toobig.bin", "content_b64": base64.b64encode(b"123456789012345").decode("ascii")},
+            ],
+        },
+    )
+    monkeypatch.setattr(os, "remove", orig_remove)
+    monkeypatch.delenv("MAX_ATTACHMENT_BYTES", raising=False)
+
+    assert r_partial.status_code == 400
+    rm_doc = http_client.get(f"/v1/sessions/{rm_sid}", headers={"X-API-Key": "key-alice"}).json()
+    assert rm_doc["status"] == "idle"
+    assert rm_doc["total_attachment_bytes"] == 8
+    http_client.delete(f"/v1/sessions/{rm_sid}", headers={"X-API-Key": "key-alice"})
+
+
 
 
 

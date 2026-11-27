@@ -302,7 +302,11 @@ async def create_job_endpoint(
     metadata: Optional[Dict[str, Any]] = None
 
     if "multipart/form-data" in content_type:
-        form = await request.form()
+        form = await _parse_bounded_multipart(
+            request,
+            max_file_bytes=settings.max_attachment_bytes,
+            max_total_bytes=settings.max_total_bytes,
+        )
         agent_name = form.get("agent")
         prompt = form.get("prompt", "")
         model = form.get("model")
@@ -672,6 +676,72 @@ def _enrich_session_expiry(sess: Optional[Dict[str, Any]]) -> Optional[Dict[str,
     return sess
 
 
+from starlette.formparsers import MultiPartException, MultiPartParser
+
+
+class _BoundedMultiPartParser(MultiPartParser):
+    """Enforces per-file and cumulative attachment byte caps while streaming multipart chunks, before spooling."""
+
+    def __init__(
+        self,
+        headers: Any,
+        stream: Any,
+        *,
+        max_file_bytes: int,
+        max_total_bytes: int,
+        initial_total: int = 0,
+        max_part_size: int = 1024 * 1024,
+    ) -> None:
+        super().__init__(headers, stream, max_part_size=max_part_size)
+        self.max_file_bytes = max_file_bytes
+        self.max_total_bytes = max_total_bytes
+        self._running_total = initial_total
+        self._current_file_bytes = 0
+
+    def on_part_begin(self) -> None:
+        super().on_part_begin()
+        self._current_file_bytes = 0
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._current_part.file is not None:
+            chunk_len = end - start
+            if self._current_file_bytes + chunk_len > self.max_file_bytes:
+                raise MultiPartException(
+                    f"Attachment error: Attachment exceeds max single file size limit ({self.max_file_bytes} bytes)"
+                )
+            if self._running_total + self._current_file_bytes + chunk_len > self.max_total_bytes:
+                raise MultiPartException(
+                    f"Attachment error: Cumulative attachment size exceeds MAX_TOTAL_BYTES ({self.max_total_bytes})"
+                )
+            self._current_file_bytes += chunk_len
+        super().on_part_data(data, start, end)
+
+    def on_part_end(self) -> None:
+        if self._current_part.file is not None:
+            self._running_total += self._current_file_bytes
+        super().on_part_end()
+
+
+async def _parse_bounded_multipart(
+    request: Request,
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
+    initial_total: int = 0,
+) -> Any:
+    parser = _BoundedMultiPartParser(
+        request.headers,
+        request.stream(),
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+        initial_total=initial_total,
+    )
+    try:
+        return await parser.parse()
+    except MultiPartException as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
 def _extract_scalar_form_str(form: Any, key: str, default: Optional[str] = None) -> Optional[str]:
     found = False
     last_val: Optional[str] = None
@@ -696,32 +766,40 @@ async def _read_bounded_form_uploads(
 ) -> List[Dict[str, Any]]:
     uploads: List[Dict[str, Any]] = []
     running_total = initial_total
-    for _, field_value in form.multi_items():
-        if hasattr(field_value, "read") and getattr(field_value, "filename", None):
-            buf = bytearray()
-            while True:
-                chunk = await field_value.read(65536)
-                if not chunk:
-                    break
-                if len(buf) + len(chunk) > max_file_bytes:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Attachment error: Attachment exceeds max single file size limit ({max_file_bytes} bytes)",
-                    )
-                if running_total + len(buf) + len(chunk) > max_total_bytes:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Attachment error: Cumulative attachment size exceeds MAX_TOTAL_BYTES ({max_total_bytes})",
-                    )
-                buf.extend(chunk)
-            running_total += len(buf)
-            uploads.append(
-                {
-                    "filename": field_value.filename or "uploaded_file.bin",
-                    "bytes": bytes(buf),
-                }
-            )
-    return uploads
+    try:
+        for _, field_value in form.multi_items():
+            if hasattr(field_value, "read") and getattr(field_value, "filename", None):
+                buf = bytearray()
+                while True:
+                    chunk = await field_value.read(65536)
+                    if not chunk:
+                        break
+                    if len(buf) + len(chunk) > max_file_bytes:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Attachment error: Attachment exceeds max single file size limit ({max_file_bytes} bytes)",
+                        )
+                    if running_total + len(buf) + len(chunk) > max_total_bytes:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Attachment error: Cumulative attachment size exceeds MAX_TOTAL_BYTES ({max_total_bytes})",
+                        )
+                    buf.extend(chunk)
+                running_total += len(buf)
+                uploads.append(
+                    {
+                        "filename": field_value.filename or "uploaded_file.bin",
+                        "bytes": bytes(buf),
+                    }
+                )
+        return uploads
+    finally:
+        for _, field_value in form.multi_items():
+            if hasattr(field_value, "close"):
+                try:
+                    await field_value.close()
+                except Exception:
+                    pass
 
 
 def _suppress_bg_task_exc(task: asyncio.Task) -> None:
@@ -749,7 +827,11 @@ async def create_session_endpoint(
     metadata: Optional[Dict[str, Any]] = None
 
     if "multipart/form-data" in content_type:
-        form = await request.form()
+        form = await _parse_bounded_multipart(
+            request,
+            max_file_bytes=settings.max_attachment_bytes,
+            max_total_bytes=settings.max_total_bytes,
+        )
         agent_name = _extract_scalar_form_str(form, "agent")
         prompt = _extract_scalar_form_str(form, "prompt")
         model = _extract_scalar_form_str(form, "model")
@@ -1006,7 +1088,14 @@ async def session_message_endpoint(
     wait_time: int = settings.wait_default
 
     if "multipart/form-data" in content_type:
-        form = await request.form()
+        live_curr = session_manager._sessions.get(session_id)
+        initial_bytes = live_curr.total_attachment_bytes if live_curr is not None else int(sess_row.get("total_attachment_bytes") or 0)
+        form = await _parse_bounded_multipart(
+            request,
+            max_file_bytes=settings.max_attachment_bytes,
+            max_total_bytes=settings.max_total_bytes,
+            initial_total=initial_bytes,
+        )
         prompt = _extract_scalar_form_str(form, "prompt", default="") or ""
         turn_raw = _extract_scalar_form_str(form, "turn_timeout")
         if turn_raw is not None:
@@ -1021,8 +1110,6 @@ async def session_message_endpoint(
             except ValueError:
                 pass
 
-        live_curr = session_manager._sessions.get(session_id)
-        initial_bytes = live_curr.total_attachment_bytes if live_curr is not None else int(sess_row.get("total_attachment_bytes") or 0)
         attachments_input = await _read_bounded_form_uploads(
             form,
             max_file_bytes=settings.max_attachment_bytes,

@@ -76,6 +76,14 @@ def main():
                 sys.stdout.flush()
                 continue
         if "AUTH_EXPIRED" in prompt:
+            if "SPLIT_LONG" in prompt:
+                sys.stderr.write("X" * 400 + "\nAuthenti")
+                sys.stderr.flush()
+                time.sleep(0.05)
+                sys.stderr.write("cation required: " + ("Y" * 500) + "\n")
+                sys.stderr.flush()
+                time.sleep(60)
+                sys.exit(1)
             if args.mode == "agy":
                 sys.stderr.write(
                     "Authentication required. Please visit the URL to log in:\n"
