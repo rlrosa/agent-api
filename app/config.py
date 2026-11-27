@@ -48,9 +48,12 @@ class Settings(BaseModel):
     )
     recover_successes: int = Field(default=3)
     allow_mock_agent: bool = Field(default=False)
+    sandbox_backend: str = Field(default="bwrap")
     bwrap_enabled: bool = Field(default=True)
     allow_unconfined: bool = Field(default=False)
     egress_restrict: bool = Field(default=False)
+    openshell_policy_path: str = Field(default="./policies/openshell-policy.yaml")
+    openshell_image: str = Field(default="agent-api-sandbox:latest")
     api_keys: str = Field(default="")
     rate_limit_per_min: int = Field(default=60)
     max_pending_jobs: int = Field(default=100)
@@ -132,9 +135,12 @@ def get_settings() -> Settings:
         claude_disallowed_tools=os.environ.get("CLAUDE_DISALLOWED_TOOLS", "Bash,WebFetch"),
         recover_successes=int(os.environ.get("RECOVER_SUCCESSES", "3")),
         allow_mock_agent=os.environ.get("ALLOW_MOCK_AGENT", "0").lower() in ("1", "true", "yes"),
+        sandbox_backend=os.environ.get("SANDBOX_BACKEND", "bwrap").strip().lower() or "bwrap",
         bwrap_enabled=os.environ.get("BWRAP_ENABLED", "1").lower() in ("1", "true", "yes"),
         allow_unconfined=os.environ.get("ALLOW_UNCONFINED", "0").lower() in ("1", "true", "yes"),
         egress_restrict=os.environ.get("EGRESS_RESTRICT", "0").lower() in ("1", "true", "yes"),
+        openshell_policy_path=os.environ.get("OPENSHELL_POLICY_PATH", "./policies/openshell-policy.yaml"),
+        openshell_image=os.environ.get("OPENSHELL_IMAGE", "agent-api-sandbox:latest"),
         api_keys=os.environ.get("API_KEYS", ""),
         rate_limit_per_min=int(os.environ.get("RATE_LIMIT_PER_MIN", "60")),
         max_pending_jobs=int(os.environ.get("MAX_PENDING_JOBS", "100")),

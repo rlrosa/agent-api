@@ -40,6 +40,7 @@ from app.runner import (
     validate_distinct_work_roots,
     wrap_cmd_with_bwrap,
 )
+from app.sandbox import cleanup_sandbox_job
 
 logger = logging.getLogger("agent-api.sessions")
 
@@ -753,7 +754,7 @@ class SessionManager:
                 raw_argv = builder(model=model, effort=effort, workspace_path=workspace_path)
 
             try:
-                argv = wrap_cmd_with_bwrap(raw_argv, workspace_path, agent)
+                argv = wrap_cmd_with_bwrap(raw_argv, workspace_path, agent, job_id=session_id)
             except RuntimeError as conf_err:
                 shutil.rmtree(workspace_path, ignore_errors=True)
                 logger.error(f"Session {session_id} confinement error: {conf_err}")
@@ -1592,6 +1593,7 @@ class SessionManager:
                 active_task.cancel()
                 await asyncio.gather(active_task, return_exceptions=True)
 
+            await cleanup_sandbox_job(live.id)
             if not (reason == "failed" and settings.keep_workspace_on_failure):
                 try:
                     shutil.rmtree(live.workspace_path, ignore_errors=True)

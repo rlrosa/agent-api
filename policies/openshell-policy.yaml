@@ -1,0 +1,45 @@
+version: 1
+
+process:
+  run_as_user: "1000"
+  run_as_group: "1000"
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /bin
+    - /sbin
+    - /lib
+    - /lib64
+    - /etc
+  read_write:
+    - /tmp
+    - /home/rrosa
+    - /var/tmp/agent-api/jobs
+    - /var/tmp/agent-api/sessions
+
+network_policies:
+  llm_provider_egress:
+    binaries:
+      - path: /usr/local/bin/agy
+      - path: /usr/local/bin/claude
+      - path: /home/rrosa/.local/bin/agy
+      - path: /home/rrosa/.local/share/claude/versions/*
+    endpoints:
+      # Google / Gemini / Antigravity OAuth & inference endpoints
+      - host: oauth2.googleapis.com
+        port: 443
+      - host: generativelanguage.googleapis.com
+        port: 443
+      - host: cloudcode-pa.googleapis.com
+        port: 443
+      - host: "*.googleapis.com"
+        port: 443
+      # Anthropic Claude OAuth & inference endpoints
+      - host: api.anthropic.com
+        port: 443
+      - host: claude.ai
+        port: 443
+      - host: "*.anthropic.com"
+        port: 443

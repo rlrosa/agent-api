@@ -220,3 +220,7 @@ __marimo__/
 # Project data
 data/
 
+# Git worktrees for isolated feature development / testing
+.worktrees/
+
+

@@ -11,6 +11,12 @@ from app.config import get_settings
 from app.db import finish_job, get_job
 
 from app.ratelimit import is_rate_limit_error
+from app.sandbox import (
+    check_confinement,
+    clean_sandbox_stdout,
+    cleanup_sandbox_job,
+    wrap_command,
+)
 
 
 
@@ -107,113 +113,16 @@ def build_scrubbed_env(settings) -> Dict[str, str]:
 
 
 def check_bwrap_confinement() -> Dict[str, Any]:
-    settings = get_settings()
-    if not settings.bwrap_enabled:
-        return {"enabled": False, "available": False, "mode": "disabled"}
-
-    bwrap_path = shutil.which("bwrap")
-    if not bwrap_path:
-        mode = "unconfined_warning" if settings.allow_unconfined else "enforced"
-        return {"enabled": True, "available": False, "mode": mode}
-
-    return {"enabled": True, "available": True, "mode": "enforced"}
+    return check_confinement()
 
 
-def wrap_cmd_with_bwrap(cmd: List[str], workspace_path: str, agent: str) -> List[str]:
-    settings = get_settings()
-    if not settings.bwrap_enabled:
-        return cmd
-
-    bwrap_path = shutil.which("bwrap")
-    if not bwrap_path:
-        if not settings.allow_unconfined:
-            raise RuntimeError("Confinement error: bubblewrap (bwrap) binary missing or unexecutable, refusing unconfined execution")
-        logger.warning(f"UNCONFINED EXECUTION WARNING: bwrap missing/disabled, executing unconfined due to ALLOW_UNCONFINED=1 for agent '{agent}'")
-        return cmd
-
-
-    bwrap_cmd = [
-        bwrap_path,
-        "--die-with-parent",
-        "--new-session",
-        "--dir", "/etc",
-        "--ro-bind", "/usr", "/usr",
-        "--ro-bind", "/bin", "/bin",
-        "--ro-bind", "/sbin", "/sbin",
-        "--ro-bind", "/lib", "/lib",
-    ]
-
-    if os.path.exists("/lib64"):
-        bwrap_cmd.extend(["--ro-bind", "/lib64", "/lib64"])
-
-    for etc_item in ["resolv.conf", "ssl", "ca-certificates", "hosts", "nsswitch.conf", "gai.conf"]:
-        path = os.path.join("/etc", etc_item)
-        if os.path.exists(path):
-            bwrap_cmd.extend(["--ro-bind", path, path])
-
-    home_dir = os.environ.get("HOME") or os.path.expanduser("~")
-    bwrap_cmd.extend([
-        "--dev", "/dev",
-        "--proc", "/proc",
-        "--share-net",
-        "--tmpfs", "/tmp",
-        "--tmpfs", home_dir,
-    ])
-    local_dir = os.path.join(home_dir, ".local")
-    if os.path.exists(local_dir):
-        bwrap_cmd.extend(["--ro-bind", local_dir, local_dir])
-
-    if agent == "agy":
-        gemini_dir = os.path.join(home_dir, ".gemini")
-        if os.path.exists(gemini_dir):
-            bwrap_cmd.extend([
-                "--ro-bind", gemini_dir, gemini_dir,
-                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/brain"),
-                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/conversations"),
-                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/cache"),
-                "--tmpfs", os.path.join(gemini_dir, "antigravity-cli/log"),
-            ])
-        antigravity_config = os.path.join(home_dir, ".config", "antigravity")
-        if os.path.exists(antigravity_config):
-            bwrap_cmd.extend([
-                "--ro-bind", antigravity_config, antigravity_config,
-            ])
-    elif agent == "claude":
-        claude_dir = os.path.join(home_dir, ".claude")
-        bwrap_cmd.extend(["--tmpfs", claude_dir])
-        cred_file = os.path.join(claude_dir, ".credentials.json")
-        if os.path.exists(cred_file):
-            bwrap_cmd.extend([
-                "--ro-bind", cred_file, cred_file,
-            ])
-        settings_file = os.path.join(claude_dir, "settings.json")
-        if os.path.exists(settings_file):
-            bwrap_cmd.extend([
-                "--ro-bind", settings_file, settings_file,
-            ])
-        claude_json = os.path.join(home_dir, ".claude.json")
-        if os.path.exists(claude_json):
-            bwrap_cmd.extend([
-                "--ro-bind", claude_json, claude_json,
-            ])
-    elif settings.allow_mock_agent and agent in ("mock_agy_session", "mock_claude_session"):
-        import sys
-        mock_script = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "mock_stream_agent.py")
-        )
-        if os.path.exists(mock_script):
-            bwrap_cmd.extend(["--ro-bind", mock_script, mock_script])
-        venv_prefix = os.path.abspath(sys.prefix)
-        if os.path.exists(venv_prefix) and not venv_prefix.startswith(("/usr/", "/bin/", "/lib/")):
-            bwrap_cmd.extend(["--ro-bind", venv_prefix, venv_prefix])
-
-    bwrap_cmd.extend([
-        "--bind", workspace_path, workspace_path,
-        "--chdir", workspace_path,
-    ])
-    bwrap_cmd.extend(cmd)
-    return bwrap_cmd
-
+def wrap_cmd_with_bwrap(
+    cmd: List[str],
+    workspace_path: str,
+    agent: str,
+    job_id: Optional[str] = None,
+) -> List[str]:
+    return wrap_command(cmd=cmd, workspace_path=workspace_path, agent=agent, job_id=job_id)
 
 
 async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -231,7 +140,17 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
     prompt = job["prompt"]
 
     if custom_argv is not None:
-        argv = wrap_cmd_with_bwrap(custom_argv, workspace_path, agent_name)
+        try:
+            argv = wrap_cmd_with_bwrap(custom_argv, workspace_path, agent_name, job_id=job_id)
+        except RuntimeError as conf_err:
+            logger.error(f"Job {job_id} confinement error: {conf_err}")
+            return finish_job(
+                job_id=job_id,
+                status="failed",
+                exit_code=-1,
+                error=str(conf_err),
+                db_path=job.get("db_path"),
+            )
         stdin_bytes = None
     else:
         if job["agent"] == "mock_429":
@@ -255,7 +174,7 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
         )
 
         try:
-            argv = wrap_cmd_with_bwrap(raw_argv, workspace_path, agent_name)
+            argv = wrap_cmd_with_bwrap(raw_argv, workspace_path, agent_name, job_id=job_id)
         except RuntimeError as conf_err:
             logger.error(f"Job {job_id} confinement error: {conf_err}")
             return finish_job(
@@ -317,7 +236,7 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
             timeout=float(timeout),
         )
 
-        stdout_str = stdout_data.decode("utf-8", errors="replace")
+        stdout_str = clean_sandbox_stdout(stdout_data.decode("utf-8", errors="replace"))
         stderr_str = stderr_data.decode("utf-8", errors="replace")
         exit_code = proc.returncode
 
@@ -459,6 +378,7 @@ async def run_job(job: Dict[str, Any], custom_argv: Optional[List[str]] = None) 
 
     finally:
         ACTIVE_PROCESSES.pop(job_id, None)
+        await cleanup_sandbox_job(job_id)
         # Defer workspace deletion if job will be retried (F1)
         attempts = job.get("attempts", 1)
         max_attempts = settings.max_attempts
