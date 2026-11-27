@@ -466,6 +466,7 @@ class SessionManager:
         self._sessions: Dict[str, LiveSession] = {}
         self._closing: Dict[str, asyncio.Task] = {}
         self._unreaped_procs: Dict[str, asyncio.subprocess.Process] = {}
+        self._pending_db_reconcile: Dict[str, Tuple[Optional[str], str, Optional[str], Optional[str]]] = {}
         self._lock: Optional[asyncio.Lock] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -550,13 +551,25 @@ class SessionManager:
             if proc.returncode is not None:
                 self._unreaped_procs.pop(sid, None)
 
+        self.reconcile_pending_db_writes()
         logger.info("Stopped SessionManager")
+
+    def reconcile_pending_db_writes(self) -> None:
+        for sid, (turn_id, status_reason, err_msg, target_db) in list(self._pending_db_reconcile.items()):
+            try:
+                if turn_id is not None:
+                    finish_session_turn(turn_id=turn_id, status="failed", error=err_msg, db_path=target_db)
+                close_session_row(session_id=sid, status=status_reason, error=err_msg, db_path=target_db)
+                self._pending_db_reconcile.pop(sid, None)
+            except Exception as exc:
+                logger.warning(f"Deferred DB reconciliation for session '{sid}' still pending: {exc}")
 
     async def _idle_reaper_loop(self):
         logger.debug("Idle reaper loop started")
         while True:
             try:
                 await asyncio.sleep(1.0)
+                self.reconcile_pending_db_writes()
                 now = time.time()
                 to_expire: List[Tuple[str, str, bool]] = []
                 async with self.lock:
@@ -922,6 +935,8 @@ class SessionManager:
 
                     attachment_filenames: List[str] = []
                     if attachments:
+                        att_dir = os.path.join(live.workspace_path, "attachments")
+                        pre_turn_files = set(os.listdir(att_dir)) if os.path.isdir(att_dir) else set()
                         try:
                             for att in attachments:
                                 if live.closing or live.status in ("closed", "expired", "failed"):
@@ -979,6 +994,23 @@ class SessionManager:
                         except OSError as storage_err:
                             _rollback_turn_uploads(live, saved_this_turn)
                             saved_this_turn.clear()
+                            if os.path.isdir(att_dir):
+                                for leftover_name in list(os.listdir(att_dir)):
+                                    if leftover_name in pre_turn_files:
+                                        continue
+                                    leftover_fp = os.path.abspath(os.path.join(att_dir, leftover_name))
+                                    try:
+                                        os.unlink(leftover_fp)
+                                    except FileNotFoundError:
+                                        pass
+                                    except OSError:
+                                        try:
+                                            rem_size = os.stat(leftover_fp, follow_symlinks=False).st_size
+                                            if leftover_fp not in live.managed_attachments:
+                                                live.total_attachment_bytes += rem_size
+                                                live.managed_attachments.add(leftover_fp)
+                                        except OSError:
+                                            pass
                             if live.closing or live.status in ("closed", "expired", "failed") or not self.is_session_active(session_id):
                                 update_session_state(
                                     session_id,
@@ -1269,14 +1301,24 @@ class SessionManager:
                         persist_msg = _truncate_diag(f"Failed persisting turn result: {persist_err}", MAX_AUTH_DIAG_CHARS)
                         logger.error(f"Session {session_id} persistence failure: {persist_msg}", exc_info=True)
                         live.status = "failed"
+                        self._pending_db_reconcile[session_id] = (turn_id, "failed", persist_msg, db_path)
+                        turn_ok = False
                         try:
                             finish_session_turn(turn_id=turn_id, status="failed", error=persist_msg, db_path=db_path)
+                            turn_ok = True
                         except Exception:
                             pass
+                        sess_closed_row = None
                         try:
-                            await self.close_session(session_id, reason="failed", error=persist_msg, db_path=db_path)
+                            sess_closed_row = await self.close_session(
+                                session_id, reason="failed", error=persist_msg, db_path=db_path
+                            )
                         except Exception:
                             pass
+                        if turn_ok and sess_closed_row is not None:
+                            self._pending_db_reconcile.pop(session_id, None)
+                        elif turn_ok:
+                            self._pending_db_reconcile[session_id] = (None, "failed", persist_msg, db_path)
                         raise HTTPException(
                             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail=persist_msg,
@@ -1394,13 +1436,21 @@ class SessionManager:
                     logger.warning(f"Failed deleting session workspace {live.workspace_path}: {exc}")
 
             bounded_err = _truncate_diag(error, MAX_AUTH_DIAG_CHARS) if error else None
-            return close_session_row(
-                session_id=live.id,
-                status=reason,
-                error=bounded_err,
-                db_path=db_path,
-                api_key_name=api_key_name,
-            )
+            try:
+                closed_row = close_session_row(
+                    session_id=live.id,
+                    status=reason,
+                    error=bounded_err,
+                    db_path=db_path,
+                    api_key_name=api_key_name,
+                )
+                return closed_row
+            except Exception as db_exc:
+                logger.warning(f"Failed writing terminal session row for '{live.id}' (queued for reconciliation): {db_exc}")
+                existing = self._pending_db_reconcile.get(live.id)
+                pending_turn_id = existing[0] if existing is not None else None
+                self._pending_db_reconcile[live.id] = (pending_turn_id, reason, bounded_err, db_path)
+                return None
         finally:
             async with self.lock:
                 if live.proc.returncode is None:

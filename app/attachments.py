@@ -168,9 +168,11 @@ async def fetch_url_attachment(
 
                     os.rename(temp_path, target_path)
                     return os.path.basename(target_path), bytes_written_this_file
-                except Exception:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
+                except BaseException:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
                     raise
             finally:
                 await response.aclose()
@@ -201,8 +203,15 @@ def materialize_base64_attachment(
     if total_bytes_written + data_len > max_total_bytes:
         raise ValueError(f"Job total attachments size exceeds limit ({max_total_bytes} bytes)")
 
-    with open(target_path, "wb") as f:
-        f.write(data)
+    try:
+        with open(target_path, "wb") as f:
+            f.write(data)
+    except BaseException:
+        try:
+            os.unlink(target_path)
+        except OSError:
+            pass
+        raise
 
     return os.path.basename(target_path), data_len
 
@@ -224,8 +233,15 @@ def materialize_bytes_attachment(
     if total_bytes_written + data_len > max_total_bytes:
         raise ValueError(f"Job total attachments size exceeds limit ({max_total_bytes} bytes)")
 
-    with open(target_path, "wb") as f:
-        f.write(content_bytes)
+    try:
+        with open(target_path, "wb") as f:
+            f.write(content_bytes)
+    except BaseException:
+        try:
+            os.unlink(target_path)
+        except OSError:
+            pass
+        raise
 
     return os.path.basename(target_path), data_len
 

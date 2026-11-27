@@ -41,6 +41,10 @@ def main():
             deadline = time.time() + 10.0
             while time.time() < deadline and not os.path.exists(gate_path):
                 time.sleep(0.02)
+            if not os.path.exists(gate_path):
+                sys.stderr.write(f"WAIT_GATE timed out waiting for {gate_path}\n")
+                sys.stderr.flush()
+                sys.exit(1)
         if "SLOW_TURN:" in prompt:
             # Format: SLOW_TURN:<seconds>:<label>
             rest = prompt.split("SLOW_TURN:", 1)[1]

@@ -1997,13 +1997,19 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
     assert len(la_doc["turns"][0]["error"] or "") <= 240
 
     # 2. dev-server.sh rejects unsafe group/world-writable STATE_DIR BEFORE reading PID in both start and stop
-    # Pick a guaranteed-free port whose /tmp state dir does not already exist so we never disturb an active dev server
+    # 2. dev-server.sh isolated under tmp_path via DEV_SERVER_STATE_ROOT + HOME (never touches /tmp/agent-api-dev-*)
+    import fcntl
     import shutil as _sh
+    import urllib.error
+    import urllib.request
+
+    dev_state_root = tmp_path / "dev_srv_root"
+    dev_state_root.mkdir(mode=0o700)
+    dev_home = tmp_path / "dev_home"
+    dev_home.mkdir(mode=0o700)
+
     test_port = None
     for cand_port in range(28911, 28990):
-        cand_dir = os.path.join("/tmp", f"agent-api-dev-{cand_port}")  # noqa: S108
-        if os.path.exists(cand_dir):
-            continue
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             probe.bind(("127.0.0.1", cand_port))
@@ -2014,40 +2020,111 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
         finally:
             probe.close()
     assert test_port is not None
-    unsafe_dir = os.path.join("/tmp", f"agent-api-dev-{test_port}")  # noqa: S108
+
+    dev_env = os.environ.copy()
+    dev_env["DEV_SERVER_STATE_ROOT"] = str(dev_state_root)
+    dev_env["HOME"] = str(dev_home)
+
+    unsafe_dir = os.path.join(str(dev_state_root), f"agent-api-dev-{test_port}")
     os.mkdir(unsafe_dir, 0o777)
     os.chmod(unsafe_dir, 0o777)
     # Put current test process PID in uvicorn.pid — stop MUST refuse unsafe dir and NOT signal us!
     with open(os.path.join(unsafe_dir, "uvicorn.pid"), "w") as f:
         f.write(f"{os.getpid()}\n")
-    try:
-        for action in ("start", "stop", "status"):
-            res = subprocess.run(["bash", dev_srv, action, str(test_port)], capture_output=True, text=True, check=False)
-            assert res.returncode != 0
-            assert "refusing" in res.stderr
-        # Also test stale/mismatched starttime in PID file is ignored without signaling, and occupied port is rejected
-        _sh.rmtree(unsafe_dir, ignore_errors=True)
-        os.mkdir(unsafe_dir, 0o700)
-        pid_f = os.path.join(unsafe_dir, "uvicorn.pid")
-        with open(pid_f, "w") as f:
-            f.write(f"{os.getpid()}:0\n")  # mismatched /proc/<pid>/stat starttime -> must NOT signal os.getpid()!
-        os.chmod(pid_f, 0o600)
-        res_stale = subprocess.run(["bash", dev_srv, "stop", str(test_port)], capture_output=True, text=True, check=False)
-        assert res_stale.returncode == 0
-        assert "No running verified dev-server PID" in res_stale.stdout
+    for action in ("start", "stop", "status"):
+        res = subprocess.run(["bash", dev_srv, action, str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+        assert res.returncode != 0
+        assert "refusing" in res.stderr
 
-        occ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        occ.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        occ.bind(("127.0.0.1", test_port))
-        occ.listen(5)
-        try:
-            res_occ = subprocess.run(["bash", dev_srv, "start", str(test_port)], capture_output=True, text=True, check=False)
-            assert res_occ.returncode != 0
-            assert "already in use" in res_occ.stderr
-        finally:
-            occ.close()
+    # 4715131553(a): PID-only record inside valid 0700 state dir is rejected (exit != 0) without signaling os.getpid()
+    _sh.rmtree(unsafe_dir, ignore_errors=True)
+    os.mkdir(unsafe_dir, 0o700)
+    pid_f = os.path.join(unsafe_dir, "uvicorn.pid")
+    with open(pid_f, "w") as f:
+        f.write(f"{os.getpid()}\n")
+    os.chmod(pid_f, 0o600)
+    res_pid_only = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+    assert res_pid_only.returncode != 0
+    assert "without valid '<pid>:<starttime>'" in res_pid_only.stderr
+
+    # 4715131553(b): Valid <pid>:<starttime> when pidfd signaling is unavailable fails (exit != 0) without os.kill fallback
+    my_starttime = open(f"/proc/{os.getpid()}/stat", encoding="utf-8").read().rsplit(")", 1)[1].split()[19]
+    with open(pid_f, "w") as f:
+        f.write(f"{os.getpid()}:{my_starttime}\n")
+    os.chmod(pid_f, 0o600)
+    no_pidfd_pkg = tmp_path / "no_pidfd_site"
+    no_pidfd_pkg.mkdir(mode=0o700)
+    (no_pidfd_pkg / "sitecustomize.py").write_text(
+        "import os, signal\n"
+        "if hasattr(os, 'pidfd_open'): delattr(os, 'pidfd_open')\n"
+        "if hasattr(signal, 'pidfd_send_signal'): delattr(signal, 'pidfd_send_signal')\n",
+        encoding="utf-8",
+    )
+    no_pidfd_env = dev_env.copy()
+    no_pidfd_env["PYTHONPATH"] = str(no_pidfd_pkg) + (os.pathsep + dev_env["PYTHONPATH"] if dev_env.get("PYTHONPATH") else "")
+    res_no_pidfd = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=no_pidfd_env, capture_output=True, text=True, check=False)
+    assert res_no_pidfd.returncode != 0
+    assert "pidfd signaling" in res_no_pidfd.stderr
+
+    # Stale/mismatched starttime in PID file is ignored without signaling, and cleans up state dir while preserving lock inode
+    with open(pid_f, "w") as f:
+        f.write(f"{os.getpid()}:0\n")
+    os.chmod(pid_f, 0o600)
+    res_stale = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+    assert res_stale.returncode == 0
+    assert "No running verified dev-server PID" in res_stale.stdout
+    assert not os.path.exists(unsafe_dir)
+
+    # 4715131544: Stable per-port lock survives stop cleanup AND blocks stop even when STATE_DIR is absent
+    lock_path = os.path.join(str(dev_state_root), f".agent-api-dev-{test_port}.lock")
+    assert os.path.exists(lock_path)
+    lock_ino_before = os.stat(lock_path).st_ino
+    with open(lock_path, "r+b") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # STATE_DIR does not exist right now; stop MUST still block trying to acquire LOCK_FILE!
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, timeout=0.35, check=False)
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    res_after_unlock = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+    assert res_after_unlock.returncode == 0
+    assert os.stat(lock_path).st_ino == lock_ino_before
+
+    # Occupied port is rejected cleanly
+    occ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occ.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    occ.bind(("127.0.0.1", test_port))
+    occ.listen(5)
+    try:
+        res_occ = subprocess.run(["bash", dev_srv, "start", str(test_port)], env=dev_env, capture_output=True, text=True, check=False)
+        assert res_occ.returncode != 0
+        assert "already in use" in res_occ.stderr
     finally:
-        _sh.rmtree(unsafe_dir, ignore_errors=True)
+        occ.close()
+
+    # 4715131548: Start dev-server with inherited API_KEYS=default:... and verify generated key works while inherited key is 401
+    shadow_env = dev_env.copy()
+    shadow_env["API_KEYS"] = "default:inherited-shadow-secret:jobs+admin"
+    res_start = subprocess.run(["bash", dev_srv, "start", str(test_port)], env=shadow_env, capture_output=True, text=True, check=False)
+    try:
+        assert res_start.returncode == 0, f"stdout={res_start.stdout}\nstderr={res_start.stderr}"
+        saved_cli_cfg = json.loads((dev_home / ".cache" / "agent-api" / "session-cli.json").read_text(encoding="utf-8"))
+        gen_key = saved_cli_cfg["api_key"]
+        assert gen_key and gen_key != "inherited-shadow-secret"
+
+        req_ok = urllib.request.Request(f"http://127.0.0.1:{test_port}/v1/me", headers={"X-API-Key": gen_key})
+        with urllib.request.urlopen(req_ok, timeout=2.0) as resp_ok:
+            assert resp_ok.status == 200
+
+        req_bad = urllib.request.Request(
+            f"http://127.0.0.1:{test_port}/v1/me", headers={"X-API-Key": "inherited-shadow-secret"}
+        )
+        with pytest.raises(urllib.error.HTTPError) as http_err:
+            urllib.request.urlopen(req_bad, timeout=2.0)
+        assert http_err.value.code == 401
+    finally:
+        res_stop_live = subprocess.run(["bash", dev_srv, "stop", str(test_port)], env=shadow_env, capture_output=True, text=True, check=False)
+        assert res_stop_live.returncode == 0
+        assert os.stat(lock_path).st_ino == lock_ino_before
 
     # 3. session-cli module unit tests: preserve session_id on 404/401 across --close, --new, REPL /new, and 202 polling
     loader = importlib.machinery.SourceFileLoader("session_cli_mod", cli_path)
@@ -2128,6 +2205,14 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
     monkeypatch.setenv("API_KEYS", "bypass:evil-secret:jobs,alice:key-alice:jobs")
     parsed_keys = parse_api_keys()
     assert "bypass" not in parsed_keys
+    # 4715131507 HTTP checks: rejected 'bypass' key gets 401; trusted local loopback identity without X-API-Key gets 200 unscoped access
+    r_evil_http = http_client.get(f"/v1/sessions/{la_sid}", headers={"X-API-Key": "evil-secret"})
+    assert r_evil_http.status_code == 401
+    monkeypatch.setenv("TRUSTED_NETWORKS", "127.0.0.1/32")
+    r_local_bypass = http_client.get(f"/v1/sessions/{la_sid}")
+    assert r_local_bypass.status_code == 200
+    assert r_local_bypass.json()["id"] == la_sid
+    monkeypatch.delenv("TRUSTED_NETWORKS", raising=False)
 
     monkeypatch.setenv("DEFAULT_EFFORT", "high")
     r_j_def = http_client.post(
@@ -2259,3 +2344,147 @@ def test_dev_server_and_session_cli_security_and_race_guards(http_client, monkey
 
 
 
+
+
+def test_partial_attachment_write_and_db_outage_reconciliation(http_client, monkeypatch):
+    """4715131526 & 4715131535: partial write cleanup + unremovable byte accounting, and live DB outage reconciliation."""
+    import base64
+    import builtins
+    import errno
+    import sqlite3
+    import app.attachments as _att_mod
+    import app.sessions as _sess_mod
+    from app.db import get_session
+
+    rate_limiter.history.clear()
+
+    # --- 4715131526: Partial write + OSError cleanup and unremovable partial-file byte accounting ---
+    r_spawn = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r_spawn.status_code == 201
+    sid_att = r_spawn.json()["id"]
+    ws_att = session_manager._sessions[sid_att].workspace_path
+    att_dir = os.path.join(ws_att, "attachments")
+
+    real_open = builtins.open
+
+    class _PartialFailWriter:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def write(self, data):
+            self._fh.write(data[:11])
+            self._fh.flush()
+            raise OSError(errno.ENOSPC, "Simulated disk full after 11-byte partial write")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._fh.close()
+            return False
+
+    def _patched_open(file, mode="r", *args, **kwargs):
+        fh = real_open(file, mode, *args, **kwargs)
+        if "w" in mode and "b" in mode and str(file).startswith(att_dir):
+            return _PartialFailWriter(fh)
+        return fh
+
+    monkeypatch.setattr(_att_mod, "open", _patched_open, raising=False)
+    payload_32 = base64.b64encode(b"A" * 32).decode("ascii")
+
+    # Case A: unlink succeeds -> partial file removed and total_attachment_bytes stays 0
+    r_part_clean = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Try partial write A",
+            "attachments": [{"filename": "partial_clean.bin", "content_b64": payload_32}],
+        },
+    )
+    assert r_part_clean.status_code == 500
+    assert os.listdir(att_dir) == []
+    s_after_a = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_after_a["status"] == "idle"
+    assert s_after_a["total_attachment_bytes"] == 0
+
+    # Case B: unlink ALSO fails -> unremovable 11-byte partial file is counted in total_attachment_bytes
+    real_unlink = os.unlink
+
+    def _deny_unlink_unremovable(path, *args, **kwargs):
+        if os.path.basename(str(path)).startswith("unremovable"):
+            raise PermissionError("Simulated unremovable partial file")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(_att_mod.os, "unlink", _deny_unlink_unremovable)
+    r_part_stuck = http_client.post(
+        f"/v1/sessions/{sid_att}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={
+            "prompt": "Try partial write B",
+            "attachments": [{"filename": "unremovable.bin", "content_b64": payload_32}],
+        },
+    )
+    assert r_part_stuck.status_code == 500
+    monkeypatch.setattr(_att_mod.os, "unlink", real_unlink)
+    monkeypatch.delattr(_att_mod, "open", raising=False)
+
+    s_after_b = http_client.get(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"}).json()
+    assert s_after_b["status"] == "idle"
+    assert s_after_b["total_attachment_bytes"] == 11
+    http_client.delete(f"/v1/sessions/{sid_att}", headers={"X-API-Key": "key-alice"})
+
+    # --- 4715131535: DB unavailable during BOTH atomic commit and fallback writes, reconciled live without restart ---
+    r_db_spawn = http_client.post(
+        "/v1/sessions",
+        headers={"X-API-Key": "key-alice"},
+        json={"agent": "mock_agy_session"},
+    )
+    assert r_db_spawn.status_code == 201
+    sid_db = r_db_spawn.json()["id"]
+
+    real_atomic = _sess_mod.complete_turn_and_update_session
+    real_finish_turn = _sess_mod.finish_session_turn
+    real_close_row = _sess_mod.close_session_row
+
+    def _db_down(*args, **kwargs):
+        raise sqlite3.OperationalError("Simulated database outage during turn completion and fallback")
+
+    monkeypatch.setattr(_sess_mod, "complete_turn_and_update_session", _db_down)
+    monkeypatch.setattr(_sess_mod, "finish_session_turn", _db_down)
+    monkeypatch.setattr(_sess_mod, "close_session_row", _db_down)
+
+    r_db_turn = http_client.post(
+        f"/v1/sessions/{sid_db}/messages",
+        headers={"X-API-Key": "key-alice"},
+        json={"prompt": "Single prompt before DB failure"},
+    )
+    assert r_db_turn.status_code == 500
+    assert not session_manager.is_session_active(sid_db)
+
+    # While DB writes are still blocked, rows are not yet reconciled
+    pre_rec = http_client.get(f"/v1/sessions/{sid_db}?include_turns=true", headers={"X-API-Key": "key-alice"}).json()
+    assert pre_rec["status"] == "busy"
+    assert len(pre_rec["turns"]) == 1
+    assert pre_rec["turns"][0]["status"] == "running"
+
+    # Restore DB access WITHOUT restarting the server; _idle_reaper_loop reconciles both terminal statuses
+    monkeypatch.setattr(_sess_mod, "complete_turn_and_update_session", real_atomic)
+    monkeypatch.setattr(_sess_mod, "finish_session_turn", real_finish_turn)
+    monkeypatch.setattr(_sess_mod, "close_session_row", real_close_row)
+
+    deadline = time.time() + 3.0
+    post_rec = None
+    while time.time() < deadline:
+        cand = http_client.get(f"/v1/sessions/{sid_db}?include_turns=true", headers={"X-API-Key": "key-alice"}).json()
+        if cand["status"] == "failed" and cand["turns"] and cand["turns"][0]["status"] == "failed":
+            post_rec = cand
+            break
+        time.sleep(0.1)
+
+    assert post_rec is not None, f"Expected live DB reconciliation to failed; got {cand}"
+    assert len(post_rec["turns"]) == 1  # Prompt was never resent
+    assert post_rec["turn_count"] == 0

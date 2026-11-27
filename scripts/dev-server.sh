@@ -54,19 +54,59 @@ esac
 
 validate_port "$PORT"
 
-STATE_DIR="/tmp/agent-api-dev-${PORT}"
-LOCK_FILE="${STATE_DIR}/.lock"
+STATE_ROOT="${DEV_SERVER_STATE_ROOT:-/tmp}"
+STATE_DIR="${STATE_ROOT}/agent-api-dev-${PORT}"
+LOCK_FILE="${STATE_ROOT}/.agent-api-dev-${PORT}.lock"
 PID_FILE="${STATE_DIR}/uvicorn.pid"
 LOG_FILE="${STATE_DIR}/uvicorn.log"
 TARGET_URL="http://127.0.0.1:${PORT}"
 
-# Validate STATE_DIR / PID_FILE / LOG_FILE / LOCK_FILE WITHOUT truncating live PID or log files.
+# Acquire a stable per-port lock outside STATE_DIR so start and stop are serialized
+# even before STATE_DIR exists and across STATE_DIR removal.
+acquire_port_lock() {
+  python3 - "$STATE_ROOT" "$LOCK_FILE" <<'PY'
+import os, stat, sys
+
+state_root, lock_file = sys.argv[1:3]
+uid = os.getuid()
+
+rst = os.lstat(state_root)
+if stat.S_ISLNK(rst.st_mode) or not stat.S_ISDIR(rst.st_mode):
+    sys.exit(f"error: refusing unsafe state root {state_root} (symlink or non-directory)")
+if state_root != "/tmp" and (rst.st_uid != uid or (rst.st_mode & 0o077) != 0):
+    sys.exit(f"error: refusing unsafe custom state root {state_root}")
+
+try:
+    lst = os.lstat(lock_file)
+    if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
+        sys.exit(f"error: refusing unsafe lock file {lock_file} (symlink or non-regular)")
+    if lst.st_uid != uid:
+        sys.exit(f"error: refusing lock file {lock_file} owned by uid {lst.st_uid} (expected {uid})")
+    if (lst.st_mode & 0o077) != 0:
+        sys.exit(f"error: refusing lock file {lock_file} with group/world permissions ({oct(lst.st_mode & 0o777)})")
+except FileNotFoundError:
+    pass
+
+lfd = os.open(lock_file, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+try:
+    st = os.fstat(lfd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+        sys.exit(f"error: refusing lock file {lock_file} after open")
+    os.fchmod(lfd, 0o600)
+finally:
+    os.close(lfd)
+PY
+  exec 9<>"$LOCK_FILE"
+  flock -x 9
+}
+
+# Validate STATE_DIR / PID_FILE / LOG_FILE WITHOUT truncating live PID or log files.
 validate_state_dir() {
   local create_mode="${1:-0}"
-  python3 - "$STATE_DIR" "$LOG_FILE" "$PID_FILE" "$LOCK_FILE" "$create_mode" <<'PY'
+  python3 - "$STATE_DIR" "$LOG_FILE" "$PID_FILE" "$create_mode" <<'PY'
 import errno, os, stat, sys
 
-state_dir, log_file, pid_file, lock_file, create_mode = sys.argv[1:6]
+state_dir, log_file, pid_file, create_mode = sys.argv[1:5]
 create_b = create_mode == "1"
 uid = os.getuid()
 
@@ -89,7 +129,7 @@ if st.st_uid != uid:
 if (st.st_mode & 0o077) != 0:
     sys.exit(f"error: refusing state directory {state_dir} with group/world permissions ({oct(st.st_mode & 0o777)})")
 
-for existing in (pid_file, log_file, lock_file):
+for existing in (pid_file, log_file):
     try:
         fst = os.lstat(existing)
     except FileNotFoundError:
@@ -114,16 +154,10 @@ if create_b:
         if stat.S_ISLNK(sub_st.st_mode) or not stat.S_ISDIR(sub_st.st_mode) or sub_st.st_uid != uid:
             sys.exit(f"error: refusing unsafe subdirectory {p}")
         os.chmod(p, 0o700)
-
-    lfd = os.open(lock_file, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    try:
-        os.fchmod(lfd, 0o600)
-    finally:
-        os.close(lfd)
 PY
 }
 
-# Read verified PID (matches stored /proc/<pid>/stat starttime if recorded) and confirm process is alive.
+# Read verified PID (requires valid <pid>:<starttime> matching /proc/<pid>/stat) and confirm process is alive.
 read_verified_live_pid() {
   python3 - "$PID_FILE" <<'PY'
 import os, stat, sys
@@ -146,13 +180,11 @@ try:
 finally:
     os.close(fd)
 
-if not raw:
-    sys.exit(1)
 parts = raw.split(":", 1)
-if not parts[0].isdigit():
+if len(parts) != 2 or not parts[0].isdigit() or not parts[1].strip().isdigit():
     sys.exit(1)
 pid = int(parts[0])
-expected_start = parts[1].strip() if len(parts) > 1 else None
+expected_start = parts[1].strip()
 
 try:
     os.kill(pid, 0)
@@ -160,7 +192,7 @@ try:
 except OSError:
     sys.exit(1)
 
-if expected_start and actual_start != expected_start:
+if actual_start != expected_start:
     sys.exit(1)
 
 print(pid)
@@ -171,7 +203,13 @@ is_running() {
   read_verified_live_pid >/dev/null 2>&1
 }
 
-# Identity-safe termination using os.pidfd_open + /proc/<pid>/stat starttime verification.
+# Identity-safe termination using os.pidfd_open + signal.pidfd_send_signal + /proc/<pid>/stat starttime verification.
+# Exit codes:
+#   0 = verified live process terminated
+#   1 = no PID file, process already exited, or mismatched starttime (stale PID)
+#   2 = verified process survived SIGKILL
+#   3 = pidfd signaling unavailable (refuses unsafe os.kill fallback)
+#   4 = malformed / legacy PID-only record lacking starttime
 terminate_verified_pid_record() {
   python3 - "$PID_FILE" <<'PY'
 import os, signal, stat, sys, time
@@ -183,47 +221,50 @@ def proc_starttime(pid: int) -> str:
 p = sys.argv[1]
 try:
     fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-except OSError:
+except FileNotFoundError:
     sys.exit(1)
+except OSError:
+    sys.exit(4)
 try:
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or (st.st_mode & 0o077) != 0:
-        sys.exit(1)
+        sys.exit(4)
     raw = os.read(fd, 128).decode("utf-8", errors="replace").strip()
 finally:
     os.close(fd)
 
 parts = raw.split(":", 1)
-if not parts or not parts[0].isdigit():
-    sys.exit(1)
+if len(parts) != 2 or not parts[0].isdigit() or not parts[1].strip().isdigit():
+    sys.stderr.write(f"error: refusing PID record without valid '<pid>:<starttime>' format in {p}\n")
+    sys.exit(4)
+
+if not (hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")):
+    sys.stderr.write("error: pidfd signaling (os.pidfd_open / signal.pidfd_send_signal) is unavailable; refusing unsafe PID signal\n")
+    sys.exit(3)
+
 pid = int(parts[0])
-expected_start = parts[1].strip() if len(parts) > 1 else None
+expected_start = parts[1].strip()
 
 pidfd = None
 try:
-    if hasattr(os, "pidfd_open"):
-        pidfd = os.pidfd_open(pid, 0)
+    pidfd = os.pidfd_open(pid, 0)
     actual_start = proc_starttime(pid)
 except OSError:
     if pidfd is not None:
         os.close(pidfd)
     sys.exit(1)
 
-if expected_start and actual_start != expected_start:
-    if pidfd is not None:
-        os.close(pidfd)
+if actual_start != expected_start:
+    os.close(pidfd)
     sys.exit(1)
 
 def send_sig(sig: int) -> None:
-    if pidfd is not None and hasattr(signal, "pidfd_send_signal"):
-        signal.pidfd_send_signal(pidfd, sig)
-    else:
-        os.kill(pid, sig)
+    signal.pidfd_send_signal(pidfd, sig)
 
 def still_alive() -> bool:
     try:
         send_sig(0)
-        return os.path.exists(f"/proc/{pid}/stat") and (not expected_start or proc_starttime(pid) == expected_start)
+        return os.path.exists(f"/proc/{pid}/stat") and proc_starttime(pid) == expected_start
     except OSError:
         return False
 
@@ -242,11 +283,11 @@ try:
                 sys.exit(0)
             time.sleep(0.1)
     if still_alive():
+        sys.stderr.write(f"error: dev-server PID {pid} survived SIGKILL\n")
         sys.exit(2)
     print(pid)
 finally:
-    if pidfd is not None:
-        os.close(pidfd)
+    os.close(pidfd)
 PY
 }
 
@@ -257,11 +298,8 @@ case "$ACTION" in
       exit 1
     fi
 
+    acquire_port_lock
     validate_state_dir 1
-
-    # Acquire exclusive flock on STATE_DIR/.lock for the entire start sequence
-    exec 9<>"$LOCK_FILE"
-    flock -x 9
 
     if is_running; then
       echo "dev-server already running on ${TARGET_URL} (PID $(read_verified_live_pid))"
@@ -415,11 +453,8 @@ if os.path.exists(p):
 
   stop)
     validate_state_dir 0
-    if [ -d "$STATE_DIR" ]; then
-      validate_state_dir 1
-      exec 9<>"$LOCK_FILE"
-      flock -x 9
-    fi
+    acquire_port_lock
+    validate_state_dir 0
 
     if [ -x "$SESSION_CLI" ] && [ -f "$HOME/.cache/agent-api/session-cli.json" ]; then
       current_url="$(python3 -c 'import json, os; p=os.path.expanduser("~/.cache/agent-api/session-cli.json"); print(json.load(open(p)).get("url",""))' 2>/dev/null || true)"
@@ -430,10 +465,14 @@ if os.path.exists(p):
     fi
 
     stopped_pid=""
-    if stopped_pid="$(terminate_verified_pid_record 2>/dev/null)"; then
+    term_rc=0
+    stopped_pid="$(terminate_verified_pid_record)" || term_rc=$?
+    if [ "$term_rc" -eq 0 ]; then
       echo "Stopped dev-server PID ${stopped_pid} on ${TARGET_URL}"
-    else
+    elif [ "$term_rc" -eq 1 ]; then
       echo "No running verified dev-server PID for port ${PORT}"
+    else
+      exit 1
     fi
 
     if [ ! -L "$STATE_DIR" ] && [ -d "$STATE_DIR" ] && [ -O "$STATE_DIR" ]; then
